@@ -1,0 +1,26 @@
+package quartz:component@0.1.0;
+
+world module {
+  /// Set a fiber-owned context cell. Returns zero or a Quartz status code.
+  import set-state: func(key: u64, value: u64) -> s32;
+
+  /// Publish one declared coeffect slot. Returns zero or a Quartz status code.
+  import publish: func(slot: u64, value: u64) -> s32;
+
+  /// Resolve one declared coeffect slot through the committed provider view.
+  /// Non-negative values are coeffect values; negative values are Quartz status codes.
+  import resolve: func(slot: u64) -> s64;
+
+  /// Register one child from the committed declarative child list.
+  import register-child: func(index: u32) -> s32;
+
+  /// Create activation-local state. This call must not mutate the context.
+  export start: func(config: u64) -> u64;
+
+  /// Run one atomic activation iteration: zero continues, one completes, and a
+  /// negative Quartz status fails activation.
+  export step: func(instance: u64) -> s32;
+
+  /// Release activation-local guest state after all effects recover.
+  export drop: func(instance: u64);
+}

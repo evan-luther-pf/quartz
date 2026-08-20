@@ -1,0 +1,16 @@
+{
+  "abi": 1,
+  "module": "quartz.slice0.provider-b",
+  "version": "0.1.0",
+  "execution_mode": "wasm-component",
+  "requested_host_capabilities": ["publish", "set-state"],
+  "component": {
+    "id": "provider-b",
+    "config_schema": "u64",
+    "max_activation_steps": 2,
+    "inject": [],
+    "provide": [
+      {"slot": 1, "namespace": "quartz.slice0", "interface": "value", "revision": 1}
+    ]
+  }
+}

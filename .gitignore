@@ -1,0 +1,5 @@
+/target/
+/.quartz/
+.DS_Store
+*.swp
+*.tmp

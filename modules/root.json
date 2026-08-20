@@ -1,0 +1,14 @@
+{
+  "abi": 1,
+  "module": "quartz.slice0.root",
+  "version": "0.1.0",
+  "execution_mode": "wasm-component",
+  "requested_host_capabilities": ["register-child"],
+  "component": {
+    "id": "root",
+    "config_schema": "u64",
+    "max_activation_steps": 128,
+    "inject": [],
+    "provide": []
+  }
+}
