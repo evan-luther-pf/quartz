@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::PathBuf,
     rc::{Rc, Weak},
     sync::Arc,
@@ -12,7 +12,7 @@ use wasmtime::{
 };
 
 use crate::{
-    Error, HostCapability, InterfaceId, Result,
+    BindingKind, Error, HostCapability, InterfaceId, Result,
     module::{Artifact, ModuleLoader},
 };
 
@@ -22,6 +22,9 @@ const STATUS_UNSATISFIED: i32 = 3;
 const STATUS_INVALID: i32 = 4;
 const STATUS_LIMIT: i32 = 5;
 const STATUS_COLLISION: i32 = 6;
+const STATUS_DENIED: i32 = 7;
+const STATUS_STALE: i32 = 8;
+const STATUS_BUSY: i32 = 9;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FiberId(pub u64);
@@ -32,6 +35,7 @@ pub struct ComponentSpec {
     pub artifact: PathBuf,
     pub config: u64,
     pub children: Vec<ComponentSpec>,
+    pub patches: Vec<CompositionPatch>,
 }
 
 impl ComponentSpec {
@@ -41,6 +45,7 @@ impl ComponentSpec {
             artifact: artifact.into(),
             config: 0,
             children: Vec::new(),
+            patches: Vec::new(),
         }
     }
 
@@ -52,6 +57,46 @@ impl ComponentSpec {
     pub fn with_children(mut self, children: Vec<ComponentSpec>) -> Self {
         self.children = children;
         self
+    }
+
+    pub fn with_patches(mut self, patches: Vec<CompositionPatch>) -> Self {
+        self.patches = patches;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CompositionPatch {
+    AddRoot {
+        root: Box<ComponentSpec>,
+    },
+    RemoveRoot {
+        entry: String,
+    },
+    Replace {
+        path: String,
+        replacement: Box<ComponentSpec>,
+    },
+}
+
+impl CompositionPatch {
+    pub fn add_root(root: ComponentSpec) -> Self {
+        Self::AddRoot {
+            root: Box::new(root),
+        }
+    }
+
+    pub fn remove_root(entry: impl Into<String>) -> Self {
+        Self::RemoveRoot {
+            entry: entry.into(),
+        }
+    }
+
+    pub fn replace(path: impl Into<String>, replacement: ComponentSpec) -> Self {
+        Self::Replace {
+            path: path.into(),
+            replacement: Box::new(replacement),
+        }
     }
 }
 
@@ -150,6 +195,16 @@ pub enum TraceEvent {
         rejected: FiberId,
         path: String,
     },
+    PatchCommitted {
+        actor: FiberId,
+        target: String,
+        revision: u64,
+    },
+    PatchRejected {
+        actor: FiberId,
+        target: String,
+        error: String,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -160,6 +215,8 @@ pub struct ContextObservation {
     pub fibers: usize,
     pub roots: usize,
     pub live_artifacts: usize,
+    pub composition_effects: usize,
+    pub pending_patches: usize,
 }
 
 pub struct Runtime {
@@ -175,6 +232,48 @@ struct PreparedSpec {
     artifact: Arc<Artifact>,
     config: u64,
     children: Vec<PreparedSpec>,
+    patches: Vec<PreparedPatch>,
+}
+
+#[derive(Clone)]
+enum PreparedPatch {
+    AddRoot {
+        root: PreparedSpec,
+    },
+    RemoveRoot {
+        entry: String,
+    },
+    Replace {
+        path: String,
+        replacement: PreparedSpec,
+    },
+}
+
+#[derive(Clone)]
+enum PatchUndo {
+    RemoveRoot {
+        entry: String,
+    },
+    AddRoot {
+        root: PreparedSpec,
+    },
+    Replace {
+        path: String,
+        replacement: PreparedSpec,
+    },
+}
+
+struct PendingPatch {
+    actor: FiberId,
+    index: usize,
+    base_revision: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PatchAuthorization {
+    provider: FiberId,
+    index: usize,
+    base_revision: u64,
 }
 
 struct Core {
@@ -182,11 +281,15 @@ struct Core {
     next_fiber: u64,
     next_effect: u64,
     next_registration: u64,
+    composition_revision: u64,
     fibers: BTreeMap<FiberId, Fiber>,
     roots: BTreeMap<String, FiberId>,
     registrations: BTreeMap<u64, Registration>,
     state_cells: BTreeMap<(FiberId, u64), u64>,
     bindings: BTreeMap<InterfaceId, ProviderBinding>,
+    patch_owners: BTreeMap<String, FiberId>,
+    pending_patches: VecDeque<PendingPatch>,
+    blocked_recovery: BTreeSet<FiberId>,
     trace: Vec<TraceEvent>,
 }
 
@@ -203,6 +306,7 @@ struct Fiber {
     instance: Option<GuestInstance>,
     activation_steps: u32,
     outcome: Option<String>,
+    patch_authorization: Option<PatchAuthorization>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -225,7 +329,8 @@ struct CommittedProvider {
 #[derive(Clone)]
 struct ProviderBinding {
     fiber: FiberId,
-    value: u64,
+    kind: BindingKind,
+    value: Option<u64>,
 }
 
 struct Registration {
@@ -248,6 +353,11 @@ enum Inverse {
         effect: u64,
         registration: u64,
     },
+    RestoreComposition {
+        effect: u64,
+        target: String,
+        undo: PatchUndo,
+    },
 }
 
 impl Inverse {
@@ -255,7 +365,8 @@ impl Inverse {
         match self {
             Self::RestoreState { effect, .. }
             | Self::RemoveBinding { effect, .. }
-            | Self::RetireChild { effect, .. } => *effect,
+            | Self::RetireChild { effect, .. }
+            | Self::RestoreComposition { effect, .. } => *effect,
         }
     }
 
@@ -264,6 +375,7 @@ impl Inverse {
             Self::RestoreState { .. } => "state",
             Self::RemoveBinding { .. } => "coeffect",
             Self::RetireChild { .. } => "component-registration",
+            Self::RestoreComposition { .. } => "composition",
         }
     }
 }
@@ -279,6 +391,7 @@ struct GuestInstance {
     instance_id: u64,
     step: TypedFunc<(u64,), (i32,)>,
     drop_fn: TypedFunc<(u64,), ()>,
+    invoke: TypedFunc<(u64, u64, u64, u64), (i64,)>,
 }
 
 impl Runtime {
@@ -293,8 +406,33 @@ impl Runtime {
         })
     }
 
+    pub fn composition_revision(&self) -> u64 {
+        self.core.borrow().composition_revision
+    }
+
     pub fn declare_tree(&mut self, tree: ComponentTree) -> Result<()> {
         let prepared = self.prepare_tree(tree)?;
+        {
+            let core = self.core.borrow();
+            for (target, actor) in &core.patch_owners {
+                let target_root = target.split('/').next().unwrap_or_default();
+                let target_changes =
+                    self.desired.contains_key(target_root) != prepared.contains_key(target_root);
+                if !target_changes {
+                    continue;
+                }
+                let actor_path = core
+                    .fibers
+                    .get(actor)
+                    .map(|fiber| fiber.path.as_str())
+                    .ok_or_else(|| Error::Invariant("patch owner disappeared".into()))?;
+                let actor_root = actor_path.split('/').next().unwrap_or_default();
+                if prepared.contains_key(actor_root) {
+                    return Err(Error::PatchTargetOwned(target.clone()));
+                }
+            }
+        }
+        let changed = !same_tree(&self.desired, &prepared);
         let old_entries: BTreeSet<_> = self.desired.keys().cloned().collect();
         let new_entries: BTreeSet<_> = prepared.keys().cloned().collect();
 
@@ -366,6 +504,9 @@ impl Runtime {
             }
         }
         self.desired = prepared;
+        if changed {
+            self.core.borrow_mut().composition_revision += 1;
+        }
         Ok(())
     }
 
@@ -375,6 +516,9 @@ impl Runtime {
     }
 
     pub fn step(&mut self) -> Result<bool> {
+        if self.process_pending_patch()? {
+            return Ok(true);
+        }
         if self.refresh_one()? {
             return Ok(true);
         }
@@ -405,6 +549,15 @@ impl Runtime {
     }
 
     pub fn replace_entry(&mut self, path: &str, spec: ComponentSpec) -> Result<()> {
+        if self
+            .core
+            .borrow()
+            .patch_owners
+            .keys()
+            .any(|target| paths_overlap(target, path))
+        {
+            return Err(Error::PatchTargetOwned(path.into()));
+        }
         let old_id = self
             .core
             .borrow()
@@ -507,6 +660,7 @@ impl Runtime {
         }
         replace_desired(&mut self.desired, path, desired_candidate)?;
         self.sync_live_specs();
+        self.core.borrow_mut().composition_revision += 1;
         Ok(())
     }
 
@@ -558,6 +712,8 @@ impl Runtime {
             fibers: core.fibers.len(),
             roots: core.roots.len(),
             live_artifacts: self.loader.live_artifact_count(),
+            composition_effects: core.patch_owners.len(),
+            pending_patches: core.pending_patches.len(),
         }
     }
 
@@ -621,12 +777,65 @@ impl Runtime {
             let child_path = format!("{path}/{}", child.entry);
             children.push(self.prepare_spec(child, &child_path, depth + 1, count)?);
         }
+        let mut patches = Vec::with_capacity(spec.patches.len());
+        for patch in spec.patches {
+            patches.push(self.prepare_patch(patch, path)?);
+        }
         Ok(PreparedSpec {
             entry: spec.entry,
             artifact,
             config: spec.config,
             children,
+            patches,
         })
+    }
+
+    fn prepare_patch(&self, patch: CompositionPatch, actor_path: &str) -> Result<PreparedPatch> {
+        match patch {
+            CompositionPatch::AddRoot { root } => {
+                if root.entry.is_empty() || root.entry.contains('/') {
+                    return Err(Error::InvalidPatch(
+                        "added root entry must be one non-empty path segment".into(),
+                    ));
+                }
+                let root_path = root.entry.clone();
+                let mut count = 0;
+                let root = self.prepare_spec(*root, &root_path, 1, &mut count)?;
+                self.validate_graph(std::iter::once(&root))?;
+                Ok(PreparedPatch::AddRoot { root })
+            }
+            CompositionPatch::RemoveRoot { entry } => {
+                if entry.is_empty() || entry.contains('/') {
+                    return Err(Error::InvalidPatch(
+                        "removed root entry must be one non-empty path segment".into(),
+                    ));
+                }
+                if is_same_or_ancestor(&entry, actor_path) {
+                    return Err(Error::InvalidPatch(
+                        "a component cannot remove itself or an ancestor".into(),
+                    ));
+                }
+                Ok(PreparedPatch::RemoveRoot { entry })
+            }
+            CompositionPatch::Replace { path, replacement } => {
+                validate_patch_path(&path)?;
+                if replacement.entry != path.rsplit('/').next().unwrap_or_default() {
+                    return Err(Error::InvalidPatch(format!(
+                        "replacement entry `{}` does not match target `{path}`",
+                        replacement.entry
+                    )));
+                }
+                if is_same_or_ancestor(&path, actor_path) {
+                    return Err(Error::InvalidPatch(
+                        "a component cannot replace itself or an ancestor".into(),
+                    ));
+                }
+                let depth = path.split('/').count();
+                let mut count = 0;
+                let replacement = self.prepare_spec(*replacement, &path, depth, &mut count)?;
+                Ok(PreparedPatch::Replace { path, replacement })
+            }
+        }
     }
 
     fn validate_graph<'a>(&self, roots: impl Iterator<Item = &'a PreparedSpec>) -> Result<()> {
@@ -635,6 +844,249 @@ impl Runtime {
             flatten_specs(root, &root.entry, &mut entries);
         }
         validate_entries(&entries)
+    }
+
+    fn process_pending_patch(&mut self) -> Result<bool> {
+        let Some(request) = self.core.borrow_mut().pending_patches.pop_front() else {
+            return Ok(false);
+        };
+        let cancelled_target = {
+            let core = self.core.borrow();
+            let Some(actor) = core.fibers.get(&request.actor) else {
+                return Ok(true);
+            };
+            (!matches!(
+                actor.state,
+                InternalState::Activating | InternalState::Active
+            ) || actor.outcome.is_some())
+            .then(|| {
+                actor
+                    .spec
+                    .patches
+                    .get(request.index)
+                    .map(|patch| patch.target().to_string())
+                    .unwrap_or_default()
+            })
+        };
+        if let Some(target) = cancelled_target {
+            self.core
+                .borrow_mut()
+                .trace
+                .push(TraceEvent::PatchRejected {
+                    actor: request.actor,
+                    target,
+                    error: "requester activation did not commit".into(),
+                });
+            return Ok(true);
+        }
+        let patch = {
+            let core = self.core.borrow();
+            let Some(actor) = core.fibers.get(&request.actor) else {
+                return Ok(true);
+            };
+            if request.base_revision != core.composition_revision {
+                None
+            } else {
+                actor.spec.patches.get(request.index).cloned()
+            }
+        };
+        let Some(patch) = patch else {
+            self.reject_patch(
+                request.actor,
+                String::new(),
+                "patch request became stale or unavailable".into(),
+            );
+            return Ok(true);
+        };
+        let target = patch.target().to_string();
+        match self.apply_prepared_patch(&patch) {
+            Ok(undo) => {
+                let mut core = self.core.borrow_mut();
+                let effect = core.allocate_effect();
+                core.patch_owners.insert(target.clone(), request.actor);
+                let Some(actor) = core.fibers.get_mut(&request.actor) else {
+                    return Err(Error::Invariant(
+                        "patch actor disappeared after commit".into(),
+                    ));
+                };
+                actor.accumulator.push(Inverse::RestoreComposition {
+                    effect,
+                    target: target.clone(),
+                    undo,
+                });
+                let revision = core.composition_revision;
+                core.trace.push(TraceEvent::EffectApplied {
+                    fiber: request.actor,
+                    effect,
+                    kind: "composition".into(),
+                });
+                core.trace.push(TraceEvent::PatchCommitted {
+                    actor: request.actor,
+                    target,
+                    revision,
+                });
+            }
+            Err(error) => {
+                self.reject_patch(request.actor, target, error.to_string());
+            }
+        }
+        Ok(true)
+    }
+
+    fn apply_prepared_patch(&mut self, patch: &PreparedPatch) -> Result<PatchUndo> {
+        match patch {
+            PreparedPatch::Replace { path, replacement } => {
+                let previous = desired_spec(&self.desired, path)
+                    .cloned()
+                    .ok_or_else(|| Error::UnknownEntry(path.clone()))?;
+                self.replace_entry(path, replacement.to_component_spec())
+                    .map_err(|error| match error {
+                        Error::ReplacementRolledBack(error) => Error::PatchRolledBack(error),
+                        error => error,
+                    })?;
+                Ok(PatchUndo::Replace {
+                    path: path.clone(),
+                    replacement: previous,
+                })
+            }
+            PreparedPatch::AddRoot { root } => {
+                if self.desired.contains_key(&root.entry) {
+                    return Err(Error::InvalidPatch(format!(
+                        "root `{}` already exists",
+                        root.entry
+                    )));
+                }
+                let previous = self.desired.clone();
+                let previous_revision = self.composition_revision();
+                let mut next = previous.clone();
+                next.insert(root.entry.clone(), root.clone());
+                self.apply_tree(tree_from_prepared(&next))?;
+                if let Some(FiberState::Failed(error)) = self.fiber_state(&root.entry) {
+                    self.apply_tree(tree_from_prepared(&previous))?;
+                    self.core.borrow_mut().composition_revision = previous_revision;
+                    return Err(Error::PatchRolledBack(error));
+                }
+                Ok(PatchUndo::RemoveRoot {
+                    entry: root.entry.clone(),
+                })
+            }
+            PreparedPatch::RemoveRoot { entry } => {
+                let previous = self
+                    .desired
+                    .get(entry)
+                    .cloned()
+                    .ok_or_else(|| Error::UnknownEntry(entry.clone()))?;
+                let mut next = self.desired.clone();
+                next.remove(entry);
+                self.apply_tree(tree_from_prepared(&next))?;
+                Ok(PatchUndo::AddRoot { root: previous })
+            }
+        }
+    }
+
+    fn reject_patch(&mut self, actor: FiberId, target: String, error: String) {
+        let mut core = self.core.borrow_mut();
+        let unavailable = core.fibers.get_mut(&actor).and_then(|fiber| {
+            fiber.outcome = Some(error.clone());
+            if matches!(
+                fiber.state,
+                InternalState::Activating | InternalState::Active
+            ) {
+                fiber.state = InternalState::Unloading;
+                Some(fiber.path.clone())
+            } else {
+                None
+            }
+        });
+        core.trace.push(TraceEvent::PatchRejected {
+            actor,
+            target,
+            error,
+        });
+        if let Some(path) = unavailable {
+            core.trace
+                .push(TraceEvent::FiberUnavailable { fiber: actor, path });
+        }
+    }
+
+    fn recover_composition(
+        &mut self,
+        actor: FiberId,
+        effect: u64,
+        target: String,
+        undo: PatchUndo,
+    ) -> Result<()> {
+        let actor_path = {
+            let mut core = self.core.borrow_mut();
+            if core.patch_owners.get(&target) != Some(&actor) {
+                return Err(Error::Invariant(
+                    "composition inverse does not own its target".into(),
+                ));
+            }
+            core.patch_owners.remove(&target);
+            core.blocked_recovery.insert(actor);
+            core.fibers
+                .get(&actor)
+                .map(|fiber| fiber.path.clone())
+                .ok_or_else(|| Error::Invariant("composition owner disappeared".into()))?
+        };
+
+        let actor_still_declared = desired_spec(&self.desired, &actor_path).is_some();
+        let result = if actor_still_declared {
+            match &undo {
+                PatchUndo::RemoveRoot { entry } => {
+                    if self.desired.contains_key(entry) {
+                        self.apply_prepared_patch(&PreparedPatch::RemoveRoot {
+                            entry: entry.clone(),
+                        })
+                        .map(|_| ())
+                    } else {
+                        Ok(())
+                    }
+                }
+                PatchUndo::AddRoot { root } => {
+                    if self.desired.contains_key(&root.entry) {
+                        Ok(())
+                    } else {
+                        self.apply_prepared_patch(&PreparedPatch::AddRoot { root: root.clone() })
+                            .map(|_| ())
+                    }
+                }
+                PatchUndo::Replace { path, replacement } => {
+                    if desired_spec(&self.desired, path).is_some() {
+                        self.apply_prepared_patch(&PreparedPatch::Replace {
+                            path: path.clone(),
+                            replacement: replacement.clone(),
+                        })
+                        .map(|_| ())
+                    } else {
+                        Ok(())
+                    }
+                }
+            }
+        } else {
+            Ok(())
+        };
+
+        let mut core = self.core.borrow_mut();
+        core.blocked_recovery.remove(&actor);
+        if let Err(error) = result {
+            core.patch_owners.insert(target.clone(), actor);
+            if let Some(fiber) = core.fibers.get_mut(&actor) {
+                fiber.accumulator.push(Inverse::RestoreComposition {
+                    effect,
+                    target,
+                    undo,
+                });
+            }
+            return Err(error);
+        }
+        core.trace.push(TraceEvent::EffectRecovered {
+            fiber: actor,
+            effect,
+            kind: "composition".into(),
+        });
+        Ok(())
     }
 
     fn validate_candidate(&self, old: FiberId, candidate: &PreparedSpec) -> Result<()> {
@@ -726,7 +1178,9 @@ impl Runtime {
                 .fibers
                 .iter()
                 .find(|(id, fiber)| {
-                    fiber.state == InternalState::Unloading && !core.is_relied_on(**id)
+                    fiber.state == InternalState::Unloading
+                        && !core.is_relied_on(**id)
+                        && !core.blocked_recovery.contains(id)
                 })
                 .map(|(id, _)| *id);
             let Some(id) = id else {
@@ -737,7 +1191,19 @@ impl Runtime {
                 .get_mut(&id)
                 .ok_or_else(|| Error::Invariant("unloading fiber disappeared".into()))?;
             if let Some(inverse) = fiber.accumulator.pop() {
-                RecoveryAction::Inverse { fiber: id, inverse }
+                match inverse {
+                    Inverse::RestoreComposition {
+                        effect,
+                        target,
+                        undo,
+                    } => RecoveryAction::Composition {
+                        fiber: id,
+                        effect,
+                        target,
+                        undo,
+                    },
+                    inverse => RecoveryAction::Inverse { fiber: id, inverse },
+                }
             } else {
                 RecoveryAction::Finish {
                     fiber: id,
@@ -750,6 +1216,14 @@ impl Runtime {
         match action {
             RecoveryAction::Inverse { fiber, inverse } => {
                 self.core.borrow_mut().apply_inverse(fiber, inverse)?;
+            }
+            RecoveryAction::Composition {
+                fiber,
+                effect,
+                target,
+                undo,
+            } => {
+                self.recover_composition(fiber, effect, target, undo)?;
             }
             RecoveryAction::Finish {
                 fiber,
@@ -965,6 +1439,9 @@ impl Runtime {
         let drop_fn = instance
             .get_typed_func::<(u64,), ()>(&mut store, "drop")
             .map_err(|error| Error::Link(error.to_string()))?;
+        let invoke = instance
+            .get_typed_func::<(u64, u64, u64, u64), (i64,)>(&mut store, "invoke")
+            .map_err(|error| Error::Link(error.to_string()))?;
         let instance_id = start
             .call(&mut store, (spec.config,))
             .map_err(|error| Error::Activation(format!("start trapped: {error}")))?
@@ -975,6 +1452,7 @@ impl Runtime {
             instance_id,
             step,
             drop_fn,
+            invoke,
         })
     }
 
@@ -1076,6 +1554,12 @@ enum RecoveryAction {
         fiber: FiberId,
         inverse: Inverse,
     },
+    Composition {
+        fiber: FiberId,
+        effect: u64,
+        target: String,
+        undo: PatchUndo,
+    },
     Finish {
         fiber: FiberId,
         instance: Option<GuestInstance>,
@@ -1090,11 +1574,15 @@ impl Core {
             next_fiber: 1,
             next_effect: 1,
             next_registration: 1,
+            composition_revision: 0,
             fibers: BTreeMap::new(),
+            blocked_recovery: BTreeSet::new(),
             roots: BTreeMap::new(),
             registrations: BTreeMap::new(),
             state_cells: BTreeMap::new(),
             bindings: BTreeMap::new(),
+            patch_owners: BTreeMap::new(),
+            pending_patches: VecDeque::new(),
             trace: Vec::new(),
         }
     }
@@ -1207,6 +1695,11 @@ impl Core {
                     path,
                 });
             }
+            Inverse::RestoreComposition { .. } => {
+                return Err(Error::Invariant(
+                    "composition inverse reached core recovery".into(),
+                ));
+            }
         }
         self.trace.push(TraceEvent::EffectRecovered {
             fiber: fiber_id,
@@ -1225,6 +1718,11 @@ impl Core {
             || fiber.instance.is_some()
             || self.state_cells.keys().any(|(owner, _)| *owner == id)
             || self.bindings.values().any(|binding| binding.fiber == id)
+            || self.patch_owners.values().any(|owner| *owner == id)
+            || self
+                .pending_patches
+                .iter()
+                .any(|request| request.actor == id)
         {
             return Err(Error::Invariant(
                 "removed fiber retained context effects".into(),
@@ -1333,11 +1831,20 @@ impl Core {
         else {
             return STATUS_UNDECLARED;
         };
+        if interface.kind != BindingKind::Value {
+            return STATUS_UNDECLARED;
+        }
         if self.bindings.contains_key(&interface) {
             return STATUS_COLLISION;
         }
-        self.bindings
-            .insert(interface.clone(), ProviderBinding { fiber, value });
+        self.bindings.insert(
+            interface.clone(),
+            ProviderBinding {
+                fiber,
+                kind: BindingKind::Value,
+                value: Some(value),
+            },
+        );
         let effect = self.allocate_effect();
         self.fibers
             .get_mut(&fiber)
@@ -1378,9 +1885,199 @@ impl Core {
         };
         self.bindings
             .get(&committed.interface)
-            .filter(|binding| binding.fiber == committed.fiber)
-            .map(|binding| binding.value as i64)
+            .filter(|binding| {
+                binding.fiber == committed.fiber && binding.kind == BindingKind::Value
+            })
+            .and_then(|binding| binding.value)
+            .map(|value| value as i64)
             .unwrap_or(-(STATUS_UNSATISFIED as i64))
+    }
+
+    fn host_publish_callable(&mut self, fiber: FiberId, slot: u64) -> i32 {
+        let Some(record) = self.fibers.get(&fiber) else {
+            return STATUS_INVALID;
+        };
+        if record.state != InternalState::Activating
+            || !record
+                .spec
+                .artifact
+                .manifest
+                .requests(HostCapability::PublishCallable)
+        {
+            return STATUS_UNDECLARED;
+        }
+        let Some(interface) = record
+            .spec
+            .artifact
+            .manifest
+            .provided_by_slot()
+            .get(&slot)
+            .filter(|interface| interface.kind == BindingKind::Callable)
+            .cloned()
+        else {
+            return STATUS_UNDECLARED;
+        };
+        if self.bindings.contains_key(&interface) {
+            return STATUS_COLLISION;
+        }
+        self.bindings.insert(
+            interface.clone(),
+            ProviderBinding {
+                fiber,
+                kind: BindingKind::Callable,
+                value: None,
+            },
+        );
+        let effect = self.allocate_effect();
+        self.fibers
+            .get_mut(&fiber)
+            .expect("fiber checked above")
+            .accumulator
+            .push(Inverse::RemoveBinding { effect, interface });
+        self.trace.push(TraceEvent::EffectApplied {
+            fiber,
+            effect,
+            kind: "callable-coeffect".into(),
+        });
+        STATUS_OK
+    }
+
+    fn host_invoke(
+        &mut self,
+        caller: FiberId,
+        slot: u64,
+        operation: u64,
+        arg0: u64,
+        arg1: u64,
+    ) -> i64 {
+        let Some(caller_record) = self.fibers.get(&caller) else {
+            return -(STATUS_INVALID as i64);
+        };
+        if caller_record.state != InternalState::Activating
+            || !caller_record
+                .spec
+                .artifact
+                .manifest
+                .requests(HostCapability::Invoke)
+        {
+            return -(STATUS_UNDECLARED as i64);
+        }
+        let Some(committed) = caller_record.committed.get(&slot).cloned() else {
+            return -(STATUS_UNSATISFIED as i64);
+        };
+        if committed.interface.kind != BindingKind::Callable {
+            return -(STATUS_UNDECLARED as i64);
+        }
+        let Some(binding) = self.bindings.get(&committed.interface) else {
+            return -(STATUS_UNSATISFIED as i64);
+        };
+        if binding.fiber != committed.fiber || binding.kind != BindingKind::Callable {
+            return -(STATUS_UNSATISFIED as i64);
+        }
+        let provider = committed.fiber;
+        let Some(mut instance) = self.fibers.get_mut(&provider).and_then(|record| {
+            (record.state == InternalState::Active)
+                .then(|| record.instance.take())
+                .flatten()
+        }) else {
+            return -(STATUS_UNSATISFIED as i64);
+        };
+        let result = instance
+            .invoke
+            .call(
+                &mut instance.store,
+                (instance.instance_id, operation, arg0, arg1),
+            )
+            .map(|result| result.0)
+            .unwrap_or(-(STATUS_INVALID as i64));
+        if let Some(record) = self.fibers.get_mut(&provider) {
+            record.instance = Some(instance);
+        } else {
+            return -(STATUS_INVALID as i64);
+        }
+        if result == 1
+            && operation == 1
+            && committed.interface.namespace == "quartz.composition"
+            && committed.interface.interface == "patch-authority"
+            && committed.interface.revision == 1
+        {
+            let Ok(index) = usize::try_from(arg0) else {
+                return -(STATUS_INVALID as i64);
+            };
+            if let Some(record) = self.fibers.get_mut(&caller) {
+                record.patch_authorization = Some(PatchAuthorization {
+                    provider,
+                    index,
+                    base_revision: arg1,
+                });
+            }
+        }
+        result
+    }
+
+    fn host_apply_patch(&mut self, actor: FiberId, index: u64, base_revision: u64) -> i32 {
+        let Ok(index) = usize::try_from(index) else {
+            return STATUS_INVALID;
+        };
+        let Some(record) = self.fibers.get(&actor) else {
+            return STATUS_INVALID;
+        };
+        if record.state != InternalState::Activating
+            || !record
+                .spec
+                .artifact
+                .manifest
+                .requests(HostCapability::ApplyPatch)
+        {
+            return STATUS_UNDECLARED;
+        }
+        if base_revision != self.composition_revision {
+            return STATUS_STALE;
+        }
+        let Some(patch) = record.spec.patches.get(index) else {
+            return STATUS_UNDECLARED;
+        };
+        let Some(authorization) = record.patch_authorization else {
+            return STATUS_DENIED;
+        };
+        if authorization.index != index
+            || authorization.base_revision != base_revision
+            || record
+                .committed
+                .values()
+                .all(|provider| provider.fiber != authorization.provider)
+        {
+            return STATUS_DENIED;
+        }
+        let target = patch.target();
+        if self
+            .patch_owners
+            .keys()
+            .any(|owned| paths_overlap(owned, target))
+            || self
+                .pending_patches
+                .iter()
+                .any(|request| request.actor == actor)
+        {
+            return STATUS_BUSY;
+        }
+        if record.committed.values().any(|provider| {
+            self.fibers
+                .get(&provider.fiber)
+                .is_some_and(|fiber| is_same_or_ancestor(target, &fiber.path))
+        }) {
+            return STATUS_DENIED;
+        }
+        self.fibers
+            .get_mut(&actor)
+            .expect("actor checked above")
+            .patch_authorization = None;
+        self.pending_patches.push_back(PendingPatch {
+            actor,
+            index,
+            base_revision,
+        });
+        STATUS_OK
     }
 
     fn host_register_child(&mut self, parent: FiberId, index: u32) -> i32 {
@@ -1466,6 +2163,7 @@ impl Fiber {
             instance: None,
             activation_steps: 0,
             outcome: None,
+            patch_authorization: None,
         }
     }
 
@@ -1521,6 +2219,40 @@ fn link_host(linker: &mut Linker<HostState>) -> Result<()> {
     linker
         .root()
         .func_wrap(
+            "publish-callable",
+            |store: StoreContextMut<'_, HostState>, (slot,): (u64,)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_publish_callable(fiber, slot)
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
+            "call-provider",
+            |store: StoreContextMut<'_, HostState>,
+             (slot, operation, arg0, arg1): (u64, u64, u64, u64)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_invoke(fiber, slot, operation, arg0, arg1)
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
+            "apply-patch",
+            |store: StoreContextMut<'_, HostState>, (index, revision): (u64, u64)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_apply_patch(fiber, index, revision)
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
             "register-child",
             |store: StoreContextMut<'_, HostState>, (index,): (u32,)| {
                 Ok((with_core(store, |core, fiber| {
@@ -1543,7 +2275,10 @@ where
     let Some(core) = store.data().core.upgrade() else {
         return T::host_failure();
     };
-    operation(&mut core.borrow_mut(), fiber)
+    let Ok(mut core) = core.try_borrow_mut() else {
+        return T::host_failure();
+    };
+    operation(&mut core, fiber)
 }
 
 trait HostFailure {
@@ -1659,6 +2394,12 @@ fn same_spec(left: &PreparedSpec, right: &PreparedSpec) -> bool {
             .iter()
             .zip(&right.children)
             .all(|(left, right)| same_spec(left, right))
+        && left.patches.len() == right.patches.len()
+        && left
+            .patches
+            .iter()
+            .zip(&right.patches)
+            .all(|(left, right)| same_patch(left, right))
 }
 
 fn replace_desired(
@@ -1715,4 +2456,105 @@ fn desired_spec<'a>(
             .find(|child| child.entry == segment)?;
     }
     Some(current)
+}
+
+fn same_tree(
+    left: &BTreeMap<String, PreparedSpec>,
+    right: &BTreeMap<String, PreparedSpec>,
+) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .all(|(entry, spec)| right.get(entry).is_some_and(|other| same_spec(spec, other)))
+}
+
+fn same_patch(left: &PreparedPatch, right: &PreparedPatch) -> bool {
+    match (left, right) {
+        (PreparedPatch::AddRoot { root: left }, PreparedPatch::AddRoot { root: right }) => {
+            same_spec(left, right)
+        }
+        (PreparedPatch::RemoveRoot { entry: left }, PreparedPatch::RemoveRoot { entry: right }) => {
+            left == right
+        }
+        (
+            PreparedPatch::Replace {
+                path: left_path,
+                replacement: left,
+            },
+            PreparedPatch::Replace {
+                path: right_path,
+                replacement: right,
+            },
+        ) => left_path == right_path && same_spec(left, right),
+        _ => false,
+    }
+}
+
+fn tree_from_prepared(roots: &BTreeMap<String, PreparedSpec>) -> ComponentTree {
+    ComponentTree {
+        roots: roots
+            .values()
+            .map(PreparedSpec::to_component_spec)
+            .collect(),
+    }
+}
+
+impl PreparedSpec {
+    fn to_component_spec(&self) -> ComponentSpec {
+        ComponentSpec {
+            entry: self.entry.clone(),
+            artifact: self.artifact.path.clone(),
+            config: self.config,
+            children: self
+                .children
+                .iter()
+                .map(PreparedSpec::to_component_spec)
+                .collect(),
+            patches: self
+                .patches
+                .iter()
+                .map(PreparedPatch::to_composition_patch)
+                .collect(),
+        }
+    }
+}
+
+impl PreparedPatch {
+    fn target(&self) -> &str {
+        match self {
+            Self::AddRoot { root } => &root.entry,
+            Self::RemoveRoot { entry } => entry,
+            Self::Replace { path, .. } => path,
+        }
+    }
+
+    fn to_composition_patch(&self) -> CompositionPatch {
+        match self {
+            Self::AddRoot { root } => CompositionPatch::add_root(root.to_component_spec()),
+            Self::RemoveRoot { entry } => CompositionPatch::remove_root(entry),
+            Self::Replace { path, replacement } => {
+                CompositionPatch::replace(path, replacement.to_component_spec())
+            }
+        }
+    }
+}
+
+fn paths_overlap(left: &str, right: &str) -> bool {
+    is_same_or_ancestor(left, right) || is_same_or_ancestor(right, left)
+}
+
+fn validate_patch_path(path: &str) -> Result<()> {
+    if path.is_empty() || path.split('/').any(|segment| segment.is_empty()) {
+        return Err(Error::InvalidPatch(
+            "patch target must contain non-empty path segments".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_same_or_ancestor(ancestor: &str, path: &str) -> bool {
+    path == ancestor
+        || path
+            .strip_prefix(ancestor)
+            .is_some_and(|remaining| remaining.starts_with('/'))
 }

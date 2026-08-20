@@ -1,4 +1,4 @@
-package quartz:component@0.1.0;
+package quartz:component@0.2.0;
 
 world module {
   /// Set a fiber-owned context cell. Returns zero or a Quartz status code.
@@ -11,6 +11,15 @@ world module {
   /// Non-negative values are coeffect values; negative values are Quartz status codes.
   import resolve: func(slot: u64) -> s64;
 
+  /// Publish one declared callable coeffect slot.
+  import publish-callable: func(slot: u64) -> s32;
+
+  /// Invoke one callable slot through the committed provider view.
+  import call-provider: func(slot: u64, operation: u64, arg0: u64, arg1: u64) -> s64;
+
+  /// Apply one host-admitted patch after callable authority approval.
+  import apply-patch: func(index: u64, base-revision: u64) -> s32;
+
   /// Register one child from the committed declarative child list.
   import register-child: func(index: u32) -> s32;
 
@@ -20,6 +29,9 @@ world module {
   /// Run one atomic activation iteration: zero continues, one completes, and a
   /// negative Quartz status fails activation.
   export step: func(instance: u64) -> s32;
+
+  /// Handle one synchronous callable-coeffect request without host reentry.
+  export invoke: func(instance: u64, operation: u64, arg0: u64, arg1: u64) -> s64;
 
   /// Release activation-local guest state after all effects recover.
   export drop: func(instance: u64);

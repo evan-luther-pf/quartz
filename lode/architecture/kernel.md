@@ -30,7 +30,7 @@ A component declares `inject`, `provide`, and `apply`.
 - A changed provider identity reloads the consumer even when the provided value compares equal.
 - Parent-owned component registrations are effects, so unloading a parent recursively withdraws its subtree.
 
-## Slice 0 public contract
+## Composition kernel public contract
 
 The runtime owns a declarative, keyed component tree. `declare_tree` admits a
 tree without driving it, `step` advances one lifecycle action, and `apply_tree`
@@ -72,7 +72,9 @@ A child registration belongs to the parent accumulator. Its inverse retires the
 logical child registration; retirement cascades through each child's own
 accumulator. Inactive retired fibers are removed only after their children are
 gone. A context is observationally clean when its state cells, bindings,
-registrations, desired roots, and fibers are all empty.
+registrations, desired roots, fibers, composition effects, pending patches, and
+live artifacts are all empty. Monotonic allocator and composition revision
+history is not observable context state.
 
 ## Replacement and failure
 
@@ -93,6 +95,33 @@ Component iteration, tree depth, fiber count, and total reconciliation steps are
 bounded. A limit breach is an activation or admission failure and follows the
 same recovery rules. Cancellation is retirement during activation: the landed
 partial iteration recovers before removal.
+
+## Governed composition effects
+
+Slice 1 introduces a monotonically increasing in-memory composition revision.
+A component specification may carry host-admitted patch grants; guest code sees
+only their numeric indices. A grant is exactly one of:
+
+- add a top-level root;
+- remove a top-level root;
+- replace an existing keyed entry.
+
+The patch authority is a normal callable provider. A requester must declare and
+commit that dependency, receive approval from its `invoke` export, request the
+patch host capability, present the current base revision, and select one of its
+admitted grants. Unknown indices, stale revisions, undeclared authority,
+out-of-scope paths, self/ancestor replacement, and replacement of the committed
+authority provider are rejected before mutation.
+
+An approved request is queued until the requester activation step lands. A
+failed or cancelled activation discards its queued request before mutation.
+Successful reconciliation appends a composition inverse to the requester
+accumulator and claims its target path against conflicting patches and direct
+replacement. Candidate failure restores the prior composition before the
+requester fails. Recovery performs the inverse before releasing the target
+claim. If an enclosing declaration has already removed both requester and
+target, recovery releases the claim without recreating state that the enclosing
+declaration removed.
 
 ## Self-modification
 

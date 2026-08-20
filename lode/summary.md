@@ -14,14 +14,20 @@ A component may change the desired component tree through the same context it us
 
 ## Implemented foundation
 
-Slice 0 is complete. Quartz has a Rust context kernel and loads every acceptance
-component as a Wasmtime component through the public WIT contract. The runtime
-tracks structural inverses, resolves dependencies by provider fiber identity,
-orders dependent recovery before provider recovery, owns child registrations in
-parent accumulators, reconciles declared trees to quiescence, and restores the
-prior generation after a failed replacement. Removing the declared root leaves
-no fibers, bindings, state cells, registrations, desired roots, or live module
-artifacts.
+Slices 0 and 1 are complete. Quartz has a Rust context kernel and loads every
+acceptance component as a Wasmtime component through the public WIT contract.
+The runtime tracks structural inverses, resolves scalar and callable
+dependencies by provider fiber identity, orders dependent recovery before
+provider recovery, owns child registrations in parent accumulators, and
+reconciles declared trees to quiescence.
+
+A sandboxed controller can now invoke a callable governor and select an explicit
+host-admitted add, remove, or replacement grant against a composition revision.
+Successful patches belong to the controller accumulator; denied, stale,
+malformed, cancelled, and failed requests leave or restore the prior
+composition. Removing the declared roots leaves no fibers, bindings, state
+cells, registrations, pending patches, composition effects, desired roots, or
+live module artifacts.
 
 ## Non-goals
 

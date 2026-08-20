@@ -35,6 +35,7 @@
         end
       end
       i32.const 1)
+    (func (export "invoke") (param i64 i64 i64 i64) (result i64) i64.const -4)
     (func (export "drop") (param i64)))
   (core instance $host (export "resolve" (func $resolve-core)))
   (core instance $instance (instantiate $module (with "host" (instance $host))))
@@ -42,5 +43,8 @@
     (canon lift (core func $instance "start")))
   (func (export "step") (param "instance" u64) (result s32)
     (canon lift (core func $instance "step")))
+  (func (export "invoke") (param "instance" u64) (param "operation" u64)
+    (param "arg0" u64) (param "arg1" u64) (result s64)
+    (canon lift (core func $instance "invoke")))
   (func (export "drop") (param "instance" u64)
     (canon lift (core func $instance "drop"))))

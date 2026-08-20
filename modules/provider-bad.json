@@ -1,5 +1,5 @@
 {
-  "abi": 1,
+  "abi": 2,
   "module": "quartz.slice0.provider-bad",
   "version": "0.1.0",
   "execution_mode": "wasm-component",
@@ -10,7 +10,7 @@
     "max_activation_steps": 2,
     "inject": [],
     "provide": [
-      {"slot": 1, "namespace": "quartz.slice0", "interface": "value", "revision": 1}
+      {"slot": 1, "kind": "value", "namespace": "quartz.slice0", "interface": "value", "revision": 1}
     ]
   }
 }

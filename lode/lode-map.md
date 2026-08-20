@@ -15,16 +15,15 @@
 
 - `capabilities/self-modification.md` — governed composition changes and recovery rules.
 
-
 ## Research
 
 - `research/spatiotemporal-composability.pdf` — primary architecture paper; hot module replacement is one application, not the core model.
 
 ## Implementation
 
-- `crates/quartz-kernel` — unified context, fibers, reconciliation, Wasmtime
-  loading, replacement, and rollback.
-- `crates/quartz` — Slice 0 executable scenario and contract tests.
+- `crates/quartz-kernel` — unified context, fibers, callable coeffects,
+  reconciliation, governed patches, Wasmtime loading, replacement, and rollback.
+- `crates/quartz` — Slice 0 and Slice 1 executable scenarios and contract tests.
 - `wit/quartz-component.wit` — public component/host boundary.
 - `modules` — real WebAssembly component sources and embedded manifests used by
-  the executable acceptance path.
+  the executable acceptance paths.

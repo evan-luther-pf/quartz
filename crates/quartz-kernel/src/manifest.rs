@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{Error, Result};
 
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 pub const MANIFEST_SECTION: &str = "quartz:manifest";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -31,6 +31,7 @@ pub struct ComponentDeclaration {
 #[serde(deny_unknown_fields)]
 pub struct RequiredBinding {
     pub slot: u64,
+    pub kind: BindingKind,
     pub namespace: String,
     pub interface: String,
     pub min_revision: u32,
@@ -41,15 +42,26 @@ pub struct RequiredBinding {
 #[serde(deny_unknown_fields)]
 pub struct ProvidedBinding {
     pub slot: u64,
+    pub kind: BindingKind,
     pub namespace: String,
     pub interface: String,
     pub revision: u32,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "kebab-case")]
+pub enum BindingKind {
+    Callable,
+    Value,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
 #[serde(rename_all = "kebab-case")]
 pub enum HostCapability {
+    ApplyPatch,
+    Invoke,
     Publish,
+    PublishCallable,
     RegisterChild,
     Resolve,
     SetState,
@@ -57,6 +69,7 @@ pub enum HostCapability {
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct InterfaceId {
+    pub kind: BindingKind,
     pub namespace: String,
     pub interface: String,
     pub revision: u32,
@@ -64,6 +77,7 @@ pub struct InterfaceId {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Requirement {
+    pub kind: BindingKind,
     pub namespace: String,
     pub interface: String,
     pub min_revision: u32,
@@ -90,7 +104,7 @@ impl Manifest {
         }
         if self.component.config_schema != "u64" {
             return Err(Error::Manifest(
-                "Slice 0 supports only the u64 config schema".into(),
+                "ABI 2 supports only the u64 config schema".into(),
             ));
         }
         if self.component.max_activation_steps == 0 {
@@ -161,6 +175,7 @@ impl Manifest {
 impl RequiredBinding {
     pub fn requirement(&self) -> Requirement {
         Requirement {
+            kind: self.kind,
             namespace: self.namespace.clone(),
             interface: self.interface.clone(),
             min_revision: self.min_revision,
@@ -172,6 +187,7 @@ impl RequiredBinding {
 impl ProvidedBinding {
     pub fn interface_id(&self) -> InterfaceId {
         InterfaceId {
+            kind: self.kind,
             namespace: self.namespace.clone(),
             interface: self.interface.clone(),
             revision: self.revision,
@@ -181,7 +197,8 @@ impl ProvidedBinding {
 
 impl Requirement {
     pub fn accepts(&self, provided: &InterfaceId) -> bool {
-        self.namespace == provided.namespace
+        self.kind == provided.kind
+            && self.namespace == provided.namespace
             && self.interface == provided.interface
             && (self.min_revision..=self.max_revision).contains(&provided.revision)
     }

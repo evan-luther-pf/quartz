@@ -9,25 +9,37 @@ A component is a unit of composition, not necessarily a process. The contract mu
 Each component artifact declares:
 
 - stable implementation identity and version;
-- required coeffect keys (`inject`);
-- keys it may install (`provide`);
-- configuration schema;
+- required bindings (`inject`) with slot, kind, namespaced interface, and revision range;
+- provided bindings (`provide`) with slot, kind, namespaced interface, and revision;
+- the `u64` configuration schema;
 - execution mode and requested host capabilities;
-- an `apply` entry point.
+- `start`, bounded `step`, synchronous `invoke`, and `drop` lifecycle exports.
 
 Admission validates identity, compatibility, declared authority, and configuration before code becomes active. A component receives only its derived context and declared dependencies.
 
 ## Effect contract
 
-`apply` performs mutations through context operations. Each atomic mutation supplies an inverse or uses a host operation whose inverse is structural. The runtime accumulates inverses in application order and runs them in reverse order during unload.
+`start` and `step` perform mutations through admitted context operations. Each
+atomic mutation supplies an inverse or uses a host operation whose inverse is
+structural. The runtime accumulates inverses in application order and runs them
+in reverse order during unload. `invoke` is synchronous and cannot mutate the
+host context; `drop` runs only after recovery.
 
-Component registration is itself an effect. A parent may use another component; withdrawing that registration retires the child and recursively recovers its subtree.
+Component registration is itself an effect. A parent may realize a declared
+child; withdrawing that registration retires the child and recursively recovers
+its subtree.
 
 ## Coeffect contract
 
-A provided value is stored under a key and realm. A consumer commits the provider identities resolved for its declared keys when activation begins. Context reads use that committed view, including during teardown. Undeclared access fails.
+A provided scalar value or callable interface is stored under its declared
+interface identity. A consumer commits the provider fiber identities resolved
+for its injected slots when activation begins. Scalar reads and callable
+invocations use that committed view, including during teardown. Undeclared
+access fails.
 
-Changing provider identity changes the consumer target and causes reactivation. Updating a value in place does not imply provider replacement; capabilities that need value-level reactivity define it explicitly.
+Changing provider identity changes the consumer target and causes reactivation.
+A published binding is immutable for that activation; a second installation
+with the same interface identity is a collision.
 
 ## Initial module format
 
@@ -45,21 +57,34 @@ so compiled code is retained only while a desired, staged, or live generation
 owns it. A process remains an optional isolation mode; it is not the composition
 model.
 
-The Slice 0 WIT contract exposes scalar lifecycle calls and four capability
+The ABI 2 WIT contract exposes four lifecycle calls and seven capability
 imports:
 
-- `start(config)`, `step(instance)`, and `drop(instance)` implement an inertial,
-  bounded activation iterator;
+- `start(config)`, `step(instance)`, `invoke(instance, operation, arg0, arg1)`,
+  and `drop(instance)` implement bounded activation, pure synchronous callable
+  dispatch, and disposal;
 - `set-state` performs an invertible fiber-owned context mutation;
-- `publish` installs a declared coeffect with a structural inverse;
-- `resolve` reads only the fiber's committed provider view and rejects undeclared
-  slots;
+- `publish` installs a declared scalar coeffect with a structural inverse;
+- `resolve` reads a scalar slot only through the fiber's committed provider view;
+- `publish-callable` installs a declared callable coeffect;
+- `call-provider` invokes a callable slot only through the committed view;
+- `apply-patch` queues one authority-approved, host-admitted composition patch;
 - `register-child` realizes a declared child entry as a parent-owned effect.
 
-All Slice 0 imports remain inside the system boundary and are invertible. The
-world exposes no filesystem, network, clock, randomness, process, environment,
-or credential import. External emissions are therefore absent rather than
-described as reverted.
+Every binding declares `value` or `callable` kind as part of its versioned
+identity. All context-changing imports remain inside the system boundary and
+tracked by structural inverses. Authorization calls are pure. The world exposes
+no filesystem, network, clock, randomness, process, environment, or credential
+import.
+
+### Slice 1 verification
+
+`cargo test -p quartz --test slice1` exercises seven contracts: authorized
+replacement, authority denial, stale revision, malformed-grant admission,
+candidate rollback, pending-request cancellation, committed-patch recovery, and
+reversible top-level add/remove operations. `cargo run --release -p quartz`
+executes the governed controller path, inverts its accepted provider patch when
+the controller unloads, then asserts a clean context.
 
 ### Decision evidence
 
@@ -152,6 +177,22 @@ The earlier 57.221 ns figure measures only a scalar Wasmtime canonical-ABI call.
 The 78.788 ns figure is the implemented Quartz path through a consumer import,
 committed provider identity lookup, and provider value return. Neither is
 reported as reconciliation latency.
+
+## Callable coeffects
+
+Slice 1 adds a callable binding kind beside scalar values. A callable provider
+publishes its declared interface and implements the revisioned `invoke`
+export. A consumer may invoke only a callable slot in its committed provider
+view and only while its own activation step is running. Calls are synchronous
+and inertial: provider identity cannot change during the call. The invoked
+export may update guest-local state but may not reenter context host operations;
+effects remain owned by ordinary component activation steps.
+
+The composition authority is the callable
+`quartz.composition/patch-authority@1` interface. Authorization is a pure call;
+the kernel separately validates and applies the selected host-admitted patch.
+This keeps policy in a replaceable component while the kernel retains structural
+authority over the component tree.
 
 ## Versioning
 

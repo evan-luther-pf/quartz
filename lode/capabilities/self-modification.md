@@ -2,36 +2,40 @@
 
 ## Implemented behavior
 
-Slice 0 separates safe composition change from authorship or policy. A Wasm
-component may register only entries in its host-admitted child list. The host
-may replace a registered artifact through `replace_entry`; the runtime stages
-the candidate, recovers affected fibers in dependency order, commits a working
-candidate, or restores the prior artifact and provider identity. There is no
-agent, policy engine, source mutation, durable event stream, or kernel handover
-in this slice.
+Slices 0 and 1 separate safe composition change from agent authorship. A Wasm
+component may register declared children, inject a callable composition
+authority, and select an explicit patch grant embedded in its host-admitted
+specification. The governor's `invoke` result supplies policy approval; the
+kernel independently enforces binding kind, committed provider identity, exact
+scope, composition revision, lifecycle safety, target ownership, admission, and
+rollback.
 
-## Product control path
+Accepted add, remove, and replacement patches are effects owned by the
+requesting fiber. Unloading that fiber recovers the patch unless an enclosing
+declaration already removed both requester and target. There is no ambient path
+or artifact access: guest code sees only grant indices. There is no agent,
+source mutation, durable event stream, package resolver, or kernel handover.
 
-The later governed self-modification capability must use this kernel path:
+## Remaining product integration
 
-1. A component proposes a typed composition patch.
-2. Policy validates authority, scope, compatibility, and irreversible effects.
-3. The loader stages new artifacts and configuration without disturbing active fibers.
-4. Reconciliation updates the desired tree.
-5. Reactive coeffects deactivate unsupported dependents before providers.
-6. Revertible effects recover removed contributions in LIFO order.
-7. New components activate when their declared dependencies are satisfied.
-8. The accepted declaration and lifecycle events become durable facts.
+An agent-authored change must later use this same path:
+
+1. A component authors a typed composition proposal.
+2. Production policy validates authority, scope, compatibility, and irreversible effects.
+3. The host converts accepted artifact references into explicit grants.
+4. The existing governor call and kernel patch transaction apply the grant.
+5. The accepted declaration and lifecycle events become durable facts.
 
 No future agent receives a hidden first-party mutation route.
 
 ## Failure rules
 
-- A rejected proposal changes nothing.
-- Staging or activation failure restores the prior artifact and desired tree.
+- Authority denial, a stale revision, or malformed scope changes nothing.
+- A requester activation that fails after queueing a patch cancels the request.
+- Staging or candidate activation failure restores the prior artifact and desired tree.
+- Self, ancestor, authority-provider, and overlapping-target changes are rejected.
 - External emissions are never described as reverted unless the owning capability provides a real inverse.
-- A component cannot replace the lifecycle mechanism currently executing its transition; kernel changes use supervised process handover.
-- A component replacing its own implementation completes or checkpoints its current turn before the old fiber unloads.
+- Kernel changes remain a supervised process-handover boundary.
 
 ## Slice 0 acceptance
 
@@ -47,3 +51,15 @@ The executable acceptance path proves:
    provider and the whole registered subtree.
 6. The final context equals a clean context under the runtime's observational
    equivalence.
+
+## Slice 1 acceptance
+
+The executable and contract tests prove that a sandboxed controller can use an
+explicit grant and callable authority to replace a provider through the Slice 0
+dependency order. Authority denial and stale revisions change nothing;
+malformed grants fail admission; queued requests disappear when requester
+activation fails; candidate failure restores the prior generation; and
+controller recovery inverts a committed patch. Add and remove grants are
+limited to top-level roots in this slice; replacement may address any existing
+keyed entry. Model calls, source editing, durable policy facts, package
+resolution, and agent behavior remain out of scope.

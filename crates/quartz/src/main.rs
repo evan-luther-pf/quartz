@@ -1,5 +1,5 @@
 use quartz_kernel::{
-    ComponentSpec, ComponentTree, Error, FiberState, InterfaceId, Limits, Runtime, TraceEvent,
+    ComponentSpec, ComponentTree, CompositionPatch, Error, FiberState, Limits, Runtime, TraceEvent,
 };
 use std::{
     path::{Path, PathBuf},
@@ -85,6 +85,7 @@ fn run_acceptance() -> Result<(), Box<dyn std::error::Error>> {
     );
     let scenario_total_ns = started.elapsed().as_nanos();
     let cross_component_resolve_ns = measure_cross_component_resolve(&fixtures, 1_000_000)?;
+    run_governed_acceptance(&fixtures)?;
     println!("root removed: subtree recovered to a clean context");
     println!("initial_composition_ns={initial_composition_ns}");
     println!("invalid_replacement_ns={invalid_replacement_ns}");
@@ -92,6 +93,50 @@ fn run_acceptance() -> Result<(), Box<dyn std::error::Error>> {
     println!("subtree_removal_ns={subtree_removal_ns}");
     println!("scenario_total_ns={scenario_total_ns}");
     println!("cross_component_resolve_ns_per={cross_component_resolve_ns:.3}");
+    Ok(())
+}
+
+fn run_governed_acceptance(fixtures: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut runtime = Runtime::new(Limits::default())?;
+    runtime.apply_tree(ComponentTree {
+        roots: vec![
+            ComponentSpec::new("root", artifact(fixtures, "root"))
+                .with_config(4)
+                .with_children(vec![
+                    ComponentSpec::new("governor", artifact(fixtures, "governor")),
+                    ComponentSpec::new("provider", artifact(fixtures, "provider-a")),
+                    ComponentSpec::new("consumer", artifact(fixtures, "consumer")),
+                    ComponentSpec::new("controller", artifact(fixtures, "controller"))
+                        .with_config(1_u64 << 32)
+                        .with_patches(vec![CompositionPatch::replace(
+                            "root/provider",
+                            ComponentSpec::new("provider", artifact(fixtures, "provider-b")),
+                        )]),
+                ]),
+        ],
+    })?;
+    assert_eq!(runtime.composition_revision(), 2);
+    assert_eq!(runtime.state_value("root/controller", 700), Some(0));
+    assert_eq!(runtime.state_value("root/provider", 10), Some(2));
+    assert_eq!(runtime.state_value("root/consumer", 900), Some(41));
+    println!("controller patch authorized: provider-b committed");
+
+    runtime.replace_entry(
+        "root/controller",
+        ComponentSpec::new("controller", artifact(fixtures, "root")),
+    )?;
+    assert_eq!(runtime.state_value("root/provider", 10), Some(1));
+    assert_eq!(runtime.state_value("root/consumer", 900), Some(41));
+    assert_eq!(runtime.observation().composition_effects, 0);
+    println!("controller recovered: accepted provider patch inverted");
+
+    runtime.apply_tree(ComponentTree::default())?;
+    assert!(
+        runtime.is_observationally_clean(),
+        "governed final context: {:?}",
+        runtime.observation()
+    );
+    println!("governed composition removed: context clean");
     Ok(())
 }
 
@@ -178,11 +223,4 @@ fn assert_replacement_order(
     }).expect("provider B activation trace");
     assert!(consumer_unavailable < old_recovery);
     assert!(old_recovery < new_activation);
-
-    let interface = InterfaceId {
-        namespace: "quartz.slice0".into(),
-        interface: "value".into(),
-        revision: 1,
-    };
-    let _ = interface;
 }

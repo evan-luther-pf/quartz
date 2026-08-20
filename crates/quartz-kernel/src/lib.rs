@@ -3,12 +3,12 @@ mod module;
 mod runtime;
 
 pub use manifest::{
-    ABI_VERSION, ComponentDeclaration, HostCapability, InterfaceId, Manifest, ProvidedBinding,
-    RequiredBinding, Requirement,
+    ABI_VERSION, BindingKind, ComponentDeclaration, HostCapability, InterfaceId, Manifest,
+    ProvidedBinding, RequiredBinding, Requirement,
 };
 pub use runtime::{
-    ComponentSpec, ComponentTree, ContextObservation, FiberId, FiberState, Limits, Runtime,
-    TraceEvent,
+    ComponentSpec, ComponentTree, CompositionPatch, ContextObservation, FiberId, FiberState,
+    Limits, Runtime, TraceEvent,
 };
 
 use std::path::PathBuf;
@@ -62,6 +62,12 @@ pub enum Error {
     Activation(String),
     #[error("replacement failed and the prior composition was restored: {0}")]
     ReplacementRolledBack(String),
+    #[error("invalid composition patch: {0}")]
+    InvalidPatch(String),
+    #[error("composition target `{0}` is owned by an unrecovered patch")]
+    PatchTargetOwned(String),
+    #[error("composition patch failed and the prior composition was restored: {0}")]
+    PatchRolledBack(String),
     #[error("runtime invariant violated: {0}")]
     Invariant(String),
 }
