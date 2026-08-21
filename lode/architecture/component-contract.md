@@ -57,7 +57,7 @@ so compiled code is retained only while a desired, staged, or live generation
 owns it. A process remains an optional isolation mode; it is not the composition
 model.
 
-The ABI 3 WIT contract exposes four lifecycle calls and eight capability
+The ABI 4 WIT contract exposes four lifecycle calls and twelve capability
 imports:
 
 - `start(config)`, `step(instance)`, `invoke(instance, operation, arg0, arg1)`,
@@ -70,13 +70,17 @@ imports:
 - `call-provider` invokes a callable slot only through the committed view;
 - `apply-patch` queues one authority-approved, host-admitted composition patch;
 - `register-child` realizes a declared child entry as a parent-owned effect;
-- `open-journal` registers one host-admitted journal path for durable
-  composition.
+- `open-journal` registers one host-admitted composition journal path;
+- `open-event-stream` registers one host-admitted durable event path;
+- `append-event` queues one granted typed fact until activation and composition
+  commit;
+- `event-count` and `read-event` expose bounded committed facts to an authorized
+  projection component.
 
 Every binding declares `value` or `callable` kind as part of its versioned
 identity. Context-changing imports remain tracked by structural inverses.
-Journal records are withheld external emissions and survive component recovery;
-the registration inverse closes access but does not claim to undo committed
+Journal and event records are withheld external emissions and survive component
+recovery; registration inverses close access but do not claim to undo committed
 facts. Authorization calls are pure. The world exposes no ambient filesystem,
 network, clock, randomness, process, environment, or credential import.
 
@@ -99,6 +103,19 @@ digest mismatch, journal-write failure before mutation, and clean empty restart.
 one journal: the first commits provider B and exits without recovery, the second
 reconstructs B and persists the controller inverse to provider A, and the third
 reconstructs A and performs a clean persistent shutdown.
+
+### Slice 3 verification
+
+`cargo test -p quartz --test slice3` exercises eight durable-event contracts:
+cold projection reconstruction, failed and denied append omission, event ID and
+sequence continuity, torn-tail repair, interior-corruption rejection, record
+count and payload bounds, idempotent recovered-outbox delivery, and clean
+capability recovery. `cargo run --release -p quartz` starts three executable
+generations against one composition journal and event stream: the first commits
+one typed fact and exits without recovery, the first restart installs a
+projection from that fact, the second reconstructs the persisted projection
+without duplication, and the final generation performs a clean persistent
+shutdown.
 
 ### Decision evidence
 

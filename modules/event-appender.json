@@ -1,0 +1,16 @@
+{
+  "abi": 4,
+  "module": "quartz.slice3.event-appender",
+  "version": "0.1.0",
+  "execution_mode": "wasm-component",
+  "requested_host_capabilities": ["append-event"],
+  "component": {
+    "id": "event-appender",
+    "config_schema": "u64",
+    "max_activation_steps": 1,
+    "inject": [
+      {"slot": 4, "kind": "callable", "namespace": "quartz.events", "interface": "stream", "min_revision": 1, "max_revision": 1}
+    ],
+    "provide": []
+  }
+}

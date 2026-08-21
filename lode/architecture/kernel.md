@@ -72,9 +72,10 @@ A child registration belongs to the parent accumulator. Its inverse retires the
 logical child registration; retirement cascades through each child's own
 accumulator. Inactive retired fibers are removed only after their children are
 gone. A context is observationally clean when its state cells, bindings,
-registrations, desired roots, fibers, composition effects, pending patches, and
-live artifacts are all empty. Monotonic allocator and composition revision
-history is not observable context state.
+registrations, desired roots, fibers, composition effects, pending patches,
+pending events, event outbox, journal registration, event-stream registration,
+and live artifacts are all empty. Monotonic allocators, composition revision
+history, and durable external records are not observable context state.
 
 ## Replacement and failure
 
@@ -141,6 +142,27 @@ Durable append is withheld until a candidate declaration is admitted and, for a
 replacement, proven activatable. An append failure restores the prior
 in-memory composition. Recovering a committed composition effect appends the
 inverse declaration before releasing its target claim.
+
+## Durable event boundary
+
+Slice 3 adds a second durable stream without adding a second framing convention.
+The persistence bootstrap component opens both host-admitted files. Composition
+snapshots retain the complete event outbox and next durable event identity;
+event frames use the same bounded sequence, length, checksum, torn-tail, and
+fail-closed rules as composition records.
+
+An appender selects one exact host-admitted event type and supplies a `u64`
+value during activation. The request becomes eligible only after that fiber is
+active and has committed the event-stream provider. Persistent reconciliation
+first synchronizes the outbox, then appends each event idempotently by durable
+ID, then synchronizes an empty outbox. Startup drains a recovered outbox before
+application fibers activate. Historical activation replay cannot enqueue an
+event.
+
+Event facts are irreversible external emissions, not context effects. Opening
+the stream is a reversible capability registration; recovery closes it but does
+not claim to erase committed facts. A projection component reads the bounded
+stream through its committed provider view and publishes ordinary coeffects.
 
 ## Self-modification
 

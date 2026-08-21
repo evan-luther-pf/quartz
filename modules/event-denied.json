@@ -1,13 +1,13 @@
 {
   "abi": 4,
-  "module": "quartz.slice0.root",
+  "module": "quartz.slice3.event-denied",
   "version": "0.1.0",
   "execution_mode": "wasm-component",
-  "requested_host_capabilities": ["register-child"],
+  "requested_host_capabilities": ["append-event"],
   "component": {
-    "id": "root",
+    "id": "event-denied",
     "config_schema": "u64",
-    "max_activation_steps": 128,
+    "max_activation_steps": 1,
     "inject": [],
     "provide": []
   }

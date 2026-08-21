@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{Error, Result};
 
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 pub const MANIFEST_SECTION: &str = "quartz:manifest";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -58,11 +58,15 @@ pub enum BindingKind {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HostCapability {
+    AppendEvent,
     ApplyPatch,
+    EventCount,
     Invoke,
+    OpenEventStream,
     OpenJournal,
     Publish,
     PublishCallable,
+    ReadEvent,
     RegisterChild,
     Resolve,
     SetState,
@@ -105,7 +109,7 @@ impl Manifest {
         }
         if self.component.config_schema != "u64" {
             return Err(Error::Manifest(
-                "ABI 3 supports only the u64 config schema".into(),
+                "ABI 4 supports only the u64 config schema".into(),
             ));
         }
         if self.component.max_activation_steps == 0 {

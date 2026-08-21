@@ -14,7 +14,9 @@ use wasmtime::{
 
 use crate::{
     BindingKind, Error, HostCapability, InterfaceId, Result,
-    journal::{Journal, JournalEffect, JournalSnapshot},
+    journal::{
+        EventFact, EventGrant, EventRecord, EventStream, Journal, JournalEffect, JournalSnapshot,
+    },
     module::{Artifact, ModuleLoader},
 };
 
@@ -41,6 +43,8 @@ pub struct ComponentSpec {
     pub children: Vec<ComponentSpec>,
     pub patches: Vec<CompositionPatch>,
     pub journal_paths: Vec<PathBuf>,
+    pub event_stream_paths: Vec<PathBuf>,
+    pub event_grants: Vec<EventGrant>,
 }
 
 impl ComponentSpec {
@@ -53,6 +57,8 @@ impl ComponentSpec {
             children: Vec::new(),
             patches: Vec::new(),
             journal_paths: Vec::new(),
+            event_stream_paths: Vec::new(),
+            event_grants: Vec::new(),
         }
     }
 
@@ -78,6 +84,16 @@ impl ComponentSpec {
 
     pub fn with_journal_paths(mut self, paths: Vec<PathBuf>) -> Self {
         self.journal_paths = paths;
+        self
+    }
+
+    pub fn with_event_stream_paths(mut self, paths: Vec<PathBuf>) -> Self {
+        self.event_stream_paths = paths;
+        self
+    }
+
+    pub fn with_event_grants(mut self, grants: Vec<EventGrant>) -> Self {
+        self.event_grants = grants;
         self
     }
 }
@@ -139,6 +155,8 @@ pub struct Limits {
     pub max_activation_steps: u32,
     pub max_reconciliation_steps: usize,
     pub max_journal_record_bytes: usize,
+    pub max_event_record_bytes: usize,
+    pub max_event_records: usize,
 }
 
 impl Default for Limits {
@@ -149,6 +167,8 @@ impl Default for Limits {
             max_activation_steps: 1024,
             max_reconciliation_steps: 100_000,
             max_journal_record_bytes: 1024 * 1024,
+            max_event_record_bytes: 64 * 1024,
+            max_event_records: 512,
         }
     }
 }
@@ -234,6 +254,19 @@ pub enum TraceEvent {
         target: String,
         error: String,
     },
+    EventQueued {
+        actor: FiberId,
+        id: u64,
+    },
+    EventCommitted {
+        actor_path: String,
+        id: u64,
+        sequence: u64,
+    },
+    EventRejected {
+        actor: FiberId,
+        error: String,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -247,6 +280,9 @@ pub struct ContextObservation {
     pub composition_effects: usize,
     pub pending_patches: usize,
     pub journal_registrations: usize,
+    pub pending_events: usize,
+    pub staged_events: usize,
+    pub event_stream_registrations: usize,
 }
 
 pub struct Runtime {
@@ -266,6 +302,8 @@ struct PreparedSpec {
     children: Vec<PreparedSpec>,
     patches: Vec<PreparedPatch>,
     journal_paths: Vec<PathBuf>,
+    event_stream_paths: Vec<PathBuf>,
+    event_grants: Vec<EventGrant>,
 }
 
 #[derive(Clone)]
@@ -302,6 +340,12 @@ struct PendingPatch {
     base_revision: u64,
 }
 
+struct PendingEvent {
+    actor: FiberId,
+    index: usize,
+    value: u64,
+}
+
 #[derive(Clone, Copy)]
 struct PatchAuthorization {
     provider: FiberId,
@@ -312,6 +356,16 @@ struct PatchAuthorization {
 struct JournalRegistration {
     owner: FiberId,
     journal: Journal,
+}
+
+struct EventStreamRegistration {
+    owner: FiberId,
+    stream: EventStream,
+}
+
+struct CommitFailure {
+    error: Error,
+    committed: bool,
 }
 
 struct Core {
@@ -328,9 +382,14 @@ struct Core {
     patch_owners: BTreeMap<String, FiberId>,
     pending_patches: VecDeque<PendingPatch>,
     blocked_recovery: BTreeSet<FiberId>,
+    pending_events: VecDeque<PendingEvent>,
+    event_outbox: Vec<EventFact>,
+    next_event_id: u64,
     trace: Vec<TraceEvent>,
     journal: Option<JournalRegistration>,
     journal_failure: Option<Error>,
+    event_stream: Option<EventStreamRegistration>,
+    event_failure: Option<Error>,
     replaying: bool,
 }
 
@@ -402,6 +461,9 @@ enum Inverse {
     CloseJournal {
         effect: u64,
     },
+    CloseEventStream {
+        effect: u64,
+    },
 }
 
 impl Inverse {
@@ -411,7 +473,8 @@ impl Inverse {
             | Self::RemoveBinding { effect, .. }
             | Self::RetireChild { effect, .. }
             | Self::RestoreComposition { effect, .. }
-            | Self::CloseJournal { effect } => *effect,
+            | Self::CloseJournal { effect }
+            | Self::CloseEventStream { effect } => *effect,
         }
     }
 
@@ -422,6 +485,7 @@ impl Inverse {
             Self::RetireChild { .. } => "component-registration",
             Self::RestoreComposition { .. } => "composition",
             Self::CloseJournal { .. } => "composition-journal",
+            Self::CloseEventStream { .. } => "event-stream",
         }
     }
 }
@@ -456,14 +520,17 @@ impl Runtime {
 
     pub fn open_persistent(limits: Limits, journal_component: ComponentSpec) -> Result<Self> {
         if journal_component.journal_paths.len() != 1
+            || journal_component.event_stream_paths.len() > 1
+            || !journal_component.event_grants.is_empty()
             || !journal_component.children.is_empty()
             || !journal_component.patches.is_empty()
         {
             return Err(Error::Persistence(
-                "journal bootstrap must admit exactly one path and no children or patches".into(),
+                "persistence bootstrap must admit one journal path, at most one event path, and no grants, children, or patches".into(),
             ));
         }
         let journal_root = journal_component.entry.clone();
+        let expects_events = !journal_component.event_stream_paths.is_empty();
         let mut runtime = Self::new(limits)?;
         runtime.persistent_root = Some(journal_root.clone());
         let bootstrap = runtime.prepare_tree(ComponentTree {
@@ -472,13 +539,29 @@ impl Runtime {
         runtime.declare_prepared(bootstrap, false)?;
         runtime.reconcile_to_quiescence()?;
         if runtime.core.borrow().journal.is_none() {
+            let failure = {
+                let mut core = runtime.core.borrow_mut();
+                core.event_failure
+                    .take()
+                    .or_else(|| core.journal_failure.take())
+                    .unwrap_or_else(|| {
+                        Error::Persistence(
+                            "persistence component did not register its journal".into(),
+                        )
+                    })
+            };
+            return Err(failure);
+        }
+        if expects_events && runtime.core.borrow().event_stream.is_none() {
             let failure = runtime
                 .core
                 .borrow_mut()
-                .journal_failure
+                .event_failure
                 .take()
                 .unwrap_or_else(|| {
-                    Error::Persistence("journal component did not register its path".into())
+                    Error::Persistence(
+                        "persistence component did not register its event stream".into(),
+                    )
                 });
             return Err(failure);
         }
@@ -497,18 +580,95 @@ impl Runtime {
                     "journal capability is not owned by the bootstrap root".into(),
                 ));
             }
+            if let Some(event_stream) = &core.event_stream
+                && event_stream.owner != registration.owner
+            {
+                return Err(Error::Persistence(
+                    "event stream and journal must have the same bootstrap owner".into(),
+                ));
+            }
             registration.journal.recovered()
         };
-        if let Some(snapshot) = recovered {
-            runtime.core.borrow_mut().composition_revision = snapshot.composition_revision;
-            let prepared = runtime.prepare_application_tree(snapshot.tree)?;
+        if let Some(mut snapshot) = recovered {
+            let prepared = runtime.prepare_application_tree(snapshot.tree.clone())?;
+            let outbox_next = snapshot
+                .event_outbox
+                .iter()
+                .map(|fact| fact.id)
+                .max()
+                .map_or(1, |id| id + 1);
+            if snapshot.next_event_id < outbox_next {
+                return Err(Error::JournalCorrupt(
+                    "next event id precedes the recovered outbox".into(),
+                ));
+            }
+            let stream_next = runtime
+                .core
+                .borrow()
+                .event_stream
+                .as_ref()
+                .map_or(1, |registration| registration.stream.next_id());
+            snapshot.next_event_id = snapshot.next_event_id.max(stream_next);
+            runtime.drain_recovered_event_outbox(&mut snapshot)?;
+            {
+                let mut core = runtime.core.borrow_mut();
+                core.composition_revision = snapshot.composition_revision;
+                core.next_event_id = snapshot.next_event_id;
+            }
             runtime.declare_prepared(prepared, false)?;
             runtime.core.borrow_mut().replaying = true;
-            runtime.reconcile_to_quiescence()?;
+            let replay = runtime.reconcile_to_quiescence();
             runtime.core.borrow_mut().replaying = false;
+            replay?;
             runtime.restore_composition_effects(snapshot.effects)?;
         }
         Ok(runtime)
+    }
+
+    fn drain_recovered_event_outbox(&mut self, snapshot: &mut JournalSnapshot) -> Result<()> {
+        if snapshot.event_outbox.is_empty() {
+            return Ok(());
+        }
+        {
+            let core = self.core.borrow();
+            core.event_stream
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::Persistence("recovered event outbox has no event stream provider".into())
+                })?
+                .stream
+                .validate(&snapshot.event_outbox)?;
+        }
+        for fact in &snapshot.event_outbox {
+            let sequence = {
+                let mut core = self.core.borrow_mut();
+                let stream = core
+                    .event_stream
+                    .as_mut()
+                    .ok_or_else(|| Error::Persistence("event stream became unavailable".into()))?;
+                stream.stream.append(fact)?;
+                stream.stream.sequence_for_id(fact.id).ok_or_else(|| {
+                    Error::Invariant("recovered event has no event-stream sequence".into())
+                })?
+            };
+            self.core
+                .borrow_mut()
+                .trace
+                .push(TraceEvent::EventCommitted {
+                    actor_path: fact.actor_path.clone(),
+                    id: fact.id,
+                    sequence,
+                });
+        }
+        snapshot.event_outbox.clear();
+        self.core
+            .borrow_mut()
+            .journal
+            .as_mut()
+            .ok_or_else(|| Error::Persistence("composition journal became unavailable".into()))?
+            .journal
+            .append(snapshot)?;
+        Ok(())
     }
 
     pub fn composition_revision(&self) -> u64 {
@@ -668,14 +828,109 @@ impl Runtime {
         Ok(changed)
     }
 
-    fn append_current_composition(&mut self) -> Result<()> {
-        let snapshot = self.current_journal_snapshot()?;
-        let mut core = self.core.borrow_mut();
-        let registration = core
-            .journal
-            .as_mut()
-            .ok_or_else(|| Error::Persistence("composition journal is unavailable".into()))?;
-        registration.journal.append(&snapshot)
+    fn append_current_composition(&mut self) -> std::result::Result<(), CommitFailure> {
+        let snapshot = self
+            .current_journal_snapshot()
+            .map_err(|error| CommitFailure {
+                error,
+                committed: false,
+            })?;
+        if snapshot.event_outbox.is_empty()
+            && self
+                .core
+                .borrow()
+                .journal
+                .as_ref()
+                .is_some_and(|registration| registration.journal.contains(&snapshot))
+        {
+            return Ok(());
+        }
+        if !snapshot.event_outbox.is_empty() {
+            let core = self.core.borrow();
+            let registration = core.event_stream.as_ref().ok_or_else(|| CommitFailure {
+                error: Error::Persistence(
+                    "event outbox exists without an event stream provider".into(),
+                ),
+                committed: false,
+            })?;
+            registration
+                .stream
+                .validate(&snapshot.event_outbox)
+                .map_err(|error| CommitFailure {
+                    error,
+                    committed: false,
+                })?;
+        }
+        {
+            let mut core = self.core.borrow_mut();
+            let registration = core.journal.as_mut().ok_or_else(|| CommitFailure {
+                error: Error::Persistence("composition journal is unavailable".into()),
+                committed: false,
+            })?;
+            registration
+                .journal
+                .append(&snapshot)
+                .map_err(|error| CommitFailure {
+                    error,
+                    committed: false,
+                })?;
+        }
+        if snapshot.event_outbox.is_empty() {
+            return Ok(());
+        }
+
+        for fact in &snapshot.event_outbox {
+            let sequence = {
+                let mut core = self.core.borrow_mut();
+                let registration = core.event_stream.as_mut().ok_or_else(|| CommitFailure {
+                    error: Error::Persistence("event stream became unavailable".into()),
+                    committed: true,
+                })?;
+                registration
+                    .stream
+                    .append(fact)
+                    .map_err(|error| CommitFailure {
+                        error,
+                        committed: true,
+                    })?;
+                registration
+                    .stream
+                    .sequence_for_id(fact.id)
+                    .ok_or_else(|| CommitFailure {
+                        error: Error::Invariant(
+                            "committed event has no event-stream sequence".into(),
+                        ),
+                        committed: true,
+                    })?
+            };
+            self.core
+                .borrow_mut()
+                .trace
+                .push(TraceEvent::EventCommitted {
+                    actor_path: fact.actor_path.clone(),
+                    id: fact.id,
+                    sequence,
+                });
+        }
+
+        let mut cleared = snapshot;
+        cleared.event_outbox.clear();
+        {
+            let mut core = self.core.borrow_mut();
+            let registration = core.journal.as_mut().ok_or_else(|| CommitFailure {
+                error: Error::Persistence("composition journal became unavailable".into()),
+                committed: true,
+            })?;
+            registration
+                .journal
+                .append(&cleared)
+                .map_err(|error| CommitFailure {
+                    error,
+                    committed: true,
+                })?;
+            core.event_outbox.clear();
+        }
+        Ok(())
     }
 
     fn current_journal_snapshot(&self) -> Result<JournalSnapshot> {
@@ -713,6 +968,8 @@ impl Runtime {
             composition_revision: core.composition_revision,
             tree,
             effects,
+            next_event_id: core.next_event_id,
+            event_outbox: core.event_outbox.clone(),
         })
     }
 
@@ -821,14 +1078,22 @@ impl Runtime {
             return Err(error);
         }
         self.defer_journal = false;
-        if let Err(error) = self.append_current_composition() {
-            self.restore_persistent_state(previous, previous_revision)?;
-            return Err(error);
+        if let Err(failure) = self.append_current_composition() {
+            if !failure.committed {
+                self.restore_persistent_state(previous, previous_revision)?;
+            }
+            return Err(failure.error);
         }
         Ok(())
     }
 
     pub fn step(&mut self) -> Result<bool> {
+        if self.retry_committed_event_outbox()? {
+            return Ok(true);
+        }
+        if self.process_pending_event()? {
+            return Ok(true);
+        }
         if self.process_pending_patch()? {
             return Ok(true);
         }
@@ -1025,6 +1290,23 @@ impl Runtime {
         self.core.borrow_mut().trace.clear();
     }
 
+    pub fn events(&self) -> Vec<EventRecord> {
+        self.core
+            .borrow()
+            .event_stream
+            .as_ref()
+            .map(|registration| registration.stream.records().to_vec())
+            .unwrap_or_default()
+    }
+
+    pub fn event_sequence(&self) -> Option<u64> {
+        self.core
+            .borrow()
+            .event_stream
+            .as_ref()
+            .map(|registration| registration.stream.sequence())
+    }
+
     pub fn observation(&self) -> ContextObservation {
         let core = self.core.borrow();
         ContextObservation {
@@ -1037,6 +1319,9 @@ impl Runtime {
             composition_effects: core.patch_owners.len(),
             pending_patches: core.pending_patches.len(),
             journal_registrations: usize::from(core.journal.is_some()),
+            pending_events: core.pending_events.len(),
+            staged_events: core.event_outbox.len(),
+            event_stream_registrations: usize::from(core.event_stream.is_some()),
         }
     }
 
@@ -1099,6 +1384,36 @@ impl Runtime {
                 "journal paths are reserved for the persistence bootstrap root".into(),
             ));
         }
+        let requests_event_stream = artifact.manifest.requests(HostCapability::OpenEventStream);
+        if requests_event_stream != !spec.event_stream_paths.is_empty() {
+            return Err(Error::Manifest(format!(
+                "component `{path}` must pair open-event-stream authority with an admitted path"
+            )));
+        }
+        if !spec.event_stream_paths.is_empty() && self.persistent_root.as_deref() != Some(path) {
+            return Err(Error::Persistence(
+                "event stream paths are reserved for the persistence bootstrap root".into(),
+            ));
+        }
+        let requests_append = artifact.manifest.requests(HostCapability::AppendEvent);
+        if requests_append != !spec.event_grants.is_empty() {
+            return Err(Error::Manifest(format!(
+                "component `{path}` must pair append-event authority with admitted event grants"
+            )));
+        }
+        let mut event_types = BTreeSet::new();
+        for grant in &spec.event_grants {
+            if grant.namespace.is_empty() || grant.name.is_empty() || grant.revision == 0 {
+                return Err(Error::Manifest(format!(
+                    "component `{path}` has an invalid event grant"
+                )));
+            }
+            if !event_types.insert(grant.clone()) {
+                return Err(Error::Manifest(format!(
+                    "component `{path}` has a duplicate event grant"
+                )));
+            }
+        }
         if artifact.manifest.component.max_activation_steps > self.limits.max_activation_steps {
             return Err(Error::ActivationLimit(
                 artifact.manifest.component.id.clone(),
@@ -1124,6 +1439,8 @@ impl Runtime {
             children,
             patches,
             journal_paths: spec.journal_paths,
+            event_stream_paths: spec.event_stream_paths,
+            event_grants: spec.event_grants,
         })
     }
 
@@ -1192,6 +1509,100 @@ impl Runtime {
         validate_entries(&entries)
     }
 
+    fn retry_committed_event_outbox(&mut self) -> Result<bool> {
+        if self.core.borrow().event_outbox.is_empty() {
+            return Ok(false);
+        }
+        self.append_current_composition()
+            .map_err(|failure| failure.error)?;
+        Ok(true)
+    }
+    fn process_pending_event(&mut self) -> Result<bool> {
+        let position = {
+            let core = self.core.borrow();
+            core.pending_events.iter().position(|request| {
+                core.fibers
+                    .get(&request.actor)
+                    .is_none_or(|fiber| fiber.state != InternalState::Activating)
+            })
+        };
+        let Some(position) = position else {
+            return Ok(false);
+        };
+        let request = self
+            .core
+            .borrow_mut()
+            .pending_events
+            .remove(position)
+            .ok_or_else(|| Error::Invariant("eligible event request disappeared".into()))?;
+        let candidate = {
+            let core = self.core.borrow();
+            let Some(actor) = core.fibers.get(&request.actor) else {
+                return Ok(true);
+            };
+            if actor.state != InternalState::Active || actor.outcome.is_some() {
+                None
+            } else {
+                let grant = actor
+                    .spec
+                    .event_grants
+                    .get(request.index)
+                    .cloned()
+                    .ok_or_else(|| Error::Invariant("committed event grant disappeared".into()))?;
+                Some((actor.path.clone(), grant))
+            }
+        };
+        let Some((actor_path, event)) = candidate else {
+            self.core
+                .borrow_mut()
+                .trace
+                .push(TraceEvent::EventRejected {
+                    actor: request.actor,
+                    error: "event requester activation did not commit".into(),
+                });
+            return Ok(true);
+        };
+        let mut core = self.core.borrow_mut();
+        let id = core.next_event_id;
+        let fact = EventFact {
+            id,
+            actor_path,
+            event,
+            value: request.value,
+        };
+        let mut staged = core.event_outbox.clone();
+        staged.push(fact.clone());
+        core.event_stream
+            .as_ref()
+            .ok_or_else(|| Error::Persistence("event stream is unavailable".into()))?
+            .stream
+            .validate(&staged)?;
+        core.next_event_id += 1;
+        core.event_outbox.push(fact);
+        core.trace.push(TraceEvent::EventQueued {
+            actor: request.actor,
+            id,
+        });
+        drop(core);
+        if let Err(failure) = self.append_current_composition() {
+            if !failure.committed {
+                let mut core = self.core.borrow_mut();
+                let removed = core
+                    .event_outbox
+                    .pop()
+                    .ok_or_else(|| Error::Invariant("failed event outbox disappeared".into()))?;
+                if removed.id != id {
+                    return Err(Error::Invariant(
+                        "failed event append did not own the outbox tail".into(),
+                    ));
+                }
+                core.next_event_id = id;
+            }
+            return Err(failure.error);
+        }
+        Ok(true)
+    }
+
     fn process_pending_patch(&mut self) -> Result<bool> {
         let Some(request) = self.core.borrow_mut().pending_patches.pop_front() else {
             return Ok(false);
@@ -1246,6 +1657,7 @@ impl Runtime {
         };
         let target = patch.target().to_string();
         let previous_revision = self.composition_revision();
+        let mut commit_error = None;
         match self.apply_prepared_patch(&patch) {
             Ok(undo) => {
                 let rollback = undo.clone();
@@ -1267,31 +1679,35 @@ impl Runtime {
                 };
                 if self.persistent_root.is_some()
                     && !self.defer_journal
-                    && let Err(error) = self.append_current_composition()
+                    && let Err(failure) = self.append_current_composition()
                 {
-                    {
-                        let mut core = self.core.borrow_mut();
-                        core.patch_owners.remove(&target);
-                        let actor = core.fibers.get_mut(&request.actor).ok_or_else(|| {
-                            Error::Invariant("patch actor disappeared during rollback".into())
-                        })?;
-                        let removed = actor.accumulator.pop().ok_or_else(|| {
-                            Error::Invariant("patch inverse disappeared during rollback".into())
-                        })?;
-                        if removed.effect() != effect {
-                            return Err(Error::Invariant(
-                                "patch inverse was not last during rollback".into(),
-                            ));
+                    if failure.committed {
+                        commit_error = Some(failure.error);
+                    } else {
+                        {
+                            let mut core = self.core.borrow_mut();
+                            core.patch_owners.remove(&target);
+                            let actor = core.fibers.get_mut(&request.actor).ok_or_else(|| {
+                                Error::Invariant("patch actor disappeared during rollback".into())
+                            })?;
+                            let removed = actor.accumulator.pop().ok_or_else(|| {
+                                Error::Invariant("patch inverse disappeared during rollback".into())
+                            })?;
+                            if removed.effect() != effect {
+                                return Err(Error::Invariant(
+                                    "patch inverse was not last during rollback".into(),
+                                ));
+                            }
                         }
+                        self.apply_patch_undo(&rollback)?.ok_or_else(|| {
+                            Error::Invariant(
+                                "journal failure rollback did not restore the patch target".into(),
+                            )
+                        })?;
+                        self.core.borrow_mut().composition_revision = previous_revision;
+                        self.reject_patch(request.actor, target, failure.error.to_string());
+                        return Ok(true);
                     }
-                    self.apply_patch_undo(&rollback)?.ok_or_else(|| {
-                        Error::Invariant(
-                            "journal failure rollback did not restore the patch target".into(),
-                        )
-                    })?;
-                    self.core.borrow_mut().composition_revision = previous_revision;
-                    self.reject_patch(request.actor, target, error.to_string());
-                    return Ok(true);
                 }
                 let mut core = self.core.borrow_mut();
                 let revision = core.composition_revision;
@@ -1309,6 +1725,9 @@ impl Runtime {
             Err(error) => {
                 self.reject_patch(request.actor, target, error.to_string());
             }
+        }
+        if let Some(error) = commit_error {
+            return Err(error);
         }
         Ok(true)
     }
@@ -1451,23 +1870,30 @@ impl Runtime {
         let actor_still_declared = desired_spec(&self.desired, &actor_path).is_some();
         let target_still_declared = desired_spec(&self.desired, &target).is_some();
         let previous_revision = self.composition_revision();
+        let mut committed_error = None;
         let result = if actor_still_declared || target_still_declared {
             match self.apply_patch_undo(&undo) {
                 Ok(reverse) => {
                     if reverse.is_some() && self.persistent_root.is_some() && !self.defer_journal {
-                        if let Err(error) = self.append_current_composition() {
-                            let reverse = reverse.ok_or_else(|| {
-                                Error::Invariant(
-                                    "journal failure recovery lost its reverse patch".into(),
-                                )
-                            })?;
-                            self.apply_patch_undo(&reverse)?.ok_or_else(|| {
-                                Error::Invariant(
-                                    "journal failure did not restore committed composition".into(),
-                                )
-                            })?;
-                            self.core.borrow_mut().composition_revision = previous_revision;
-                            Err(error)
+                        if let Err(failure) = self.append_current_composition() {
+                            if failure.committed {
+                                committed_error = Some(failure.error);
+                                Ok(())
+                            } else {
+                                let reverse = reverse.ok_or_else(|| {
+                                    Error::Invariant(
+                                        "journal failure recovery lost its reverse patch".into(),
+                                    )
+                                })?;
+                                self.apply_patch_undo(&reverse)?.ok_or_else(|| {
+                                    Error::Invariant(
+                                        "journal failure did not restore committed composition"
+                                            .into(),
+                                    )
+                                })?;
+                                self.core.borrow_mut().composition_revision = previous_revision;
+                                Err(failure.error)
+                            }
                         } else {
                             Ok(())
                         }
@@ -1499,6 +1925,9 @@ impl Runtime {
             effect,
             kind: "composition".into(),
         });
+        if let Some(error) = committed_error {
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -1996,9 +2425,14 @@ impl Core {
             bindings: BTreeMap::new(),
             patch_owners: BTreeMap::new(),
             pending_patches: VecDeque::new(),
+            pending_events: VecDeque::new(),
+            event_outbox: Vec::new(),
+            next_event_id: 1,
             trace: Vec::new(),
             journal: None,
             journal_failure: None,
+            event_stream: None,
+            event_failure: None,
             replaying: false,
         }
     }
@@ -2126,6 +2560,16 @@ impl Core {
                     ));
                 }
             }
+            Inverse::CloseEventStream { .. } => {
+                let registration = self.event_stream.take().ok_or_else(|| {
+                    Error::Invariant("event-stream inverse found no registered stream".into())
+                })?;
+                if registration.owner != fiber_id {
+                    return Err(Error::Invariant(
+                        "event-stream inverse targeted another provider".into(),
+                    ));
+                }
+            }
         }
         self.trace.push(TraceEvent::EffectRecovered {
             fiber: fiber_id,
@@ -2150,9 +2594,17 @@ impl Core {
                 .iter()
                 .any(|request| request.actor == id)
             || self
+                .pending_events
+                .iter()
+                .any(|request| request.actor == id)
+            || self
                 .journal
                 .as_ref()
                 .is_some_and(|journal| journal.owner == id)
+            || self
+                .event_stream
+                .as_ref()
+                .is_some_and(|stream| stream.owner == id)
         {
             return Err(Error::Invariant(
                 "removed fiber retained context effects".into(),
@@ -2639,6 +3091,196 @@ impl Core {
         });
         STATUS_OK
     }
+
+    fn host_open_event_stream(&mut self, fiber: FiberId, index: u64) -> i32 {
+        let Ok(index) = usize::try_from(index) else {
+            return STATUS_INVALID;
+        };
+        let path = {
+            let Some(record) = self.fibers.get(&fiber) else {
+                return STATUS_INVALID;
+            };
+            if record.state != InternalState::Activating
+                || !record
+                    .spec
+                    .artifact
+                    .manifest
+                    .requests(HostCapability::OpenEventStream)
+            {
+                return STATUS_UNDECLARED;
+            }
+            let Some(path) = record.spec.event_stream_paths.get(index) else {
+                return STATUS_UNDECLARED;
+            };
+            path.clone()
+        };
+        if self.event_stream.is_some() {
+            return STATUS_COLLISION;
+        }
+        let stream = match EventStream::open(
+            &path,
+            self.limits.max_event_record_bytes,
+            self.limits.max_event_records,
+        ) {
+            Ok(stream) => stream,
+            Err(error) => {
+                self.event_failure = Some(error);
+                return STATUS_INVALID;
+            }
+        };
+        self.next_event_id = self.next_event_id.max(stream.next_id());
+        let effect = self.allocate_effect();
+        self.event_stream = Some(EventStreamRegistration {
+            owner: fiber,
+            stream,
+        });
+        self.fibers
+            .get_mut(&fiber)
+            .expect("event-stream fiber checked above")
+            .accumulator
+            .push(Inverse::CloseEventStream { effect });
+        self.trace.push(TraceEvent::EffectApplied {
+            fiber,
+            effect,
+            kind: "event-stream".into(),
+        });
+        STATUS_OK
+    }
+
+    fn host_append_event(&mut self, fiber: FiberId, index: u64, value: u64) -> i32 {
+        if value > i64::MAX as u64 {
+            return STATUS_INVALID;
+        }
+        let Ok(index) = usize::try_from(index) else {
+            return STATUS_INVALID;
+        };
+        let (actor_path, grant) = {
+            let Some(record) = self.fibers.get(&fiber) else {
+                return STATUS_INVALID;
+            };
+            if record.state != InternalState::Activating
+                || !record
+                    .spec
+                    .artifact
+                    .manifest
+                    .requests(HostCapability::AppendEvent)
+            {
+                return STATUS_UNDECLARED;
+            }
+            let Some(grant) = record.spec.event_grants.get(index) else {
+                return STATUS_UNDECLARED;
+            };
+            let Some(stream) = self.event_stream.as_ref() else {
+                return STATUS_UNSATISFIED;
+            };
+            if record
+                .committed
+                .values()
+                .all(|provider| provider.fiber != stream.owner)
+            {
+                return STATUS_UNSATISFIED;
+            }
+            (record.path.clone(), grant.clone())
+        };
+        if self.replaying {
+            return STATUS_BUSY;
+        }
+
+        let mut staged = self.event_outbox.clone();
+        for (offset, pending) in self.pending_events.iter().enumerate() {
+            let Some(record) = self.fibers.get(&pending.actor) else {
+                return STATUS_INVALID;
+            };
+            let Some(event) = record.spec.event_grants.get(pending.index) else {
+                return STATUS_INVALID;
+            };
+            staged.push(EventFact {
+                id: self.next_event_id + offset as u64,
+                actor_path: record.path.clone(),
+                event: event.clone(),
+                value: pending.value,
+            });
+        }
+        staged.push(EventFact {
+            id: self.next_event_id + self.pending_events.len() as u64,
+            actor_path,
+            event: grant,
+            value,
+        });
+        let Some(stream) = self.event_stream.as_ref() else {
+            return STATUS_UNSATISFIED;
+        };
+        if let Err(error) = stream.stream.validate(&staged) {
+            return match error {
+                Error::EventRecordLimit { .. } | Error::EventRecordBytesLimit { .. } => {
+                    STATUS_LIMIT
+                }
+                error => {
+                    self.event_failure = Some(error);
+                    STATUS_INVALID
+                }
+            };
+        }
+        self.pending_events.push_back(PendingEvent {
+            actor: fiber,
+            index,
+            value,
+        });
+        STATUS_OK
+    }
+
+    fn host_event_count(&self, fiber: FiberId) -> i64 {
+        let Some(record) = self.fibers.get(&fiber) else {
+            return -(STATUS_INVALID as i64);
+        };
+        let Some(stream) = self.event_stream.as_ref() else {
+            return -(STATUS_UNSATISFIED as i64);
+        };
+        if record.state != InternalState::Activating
+            || !record
+                .spec
+                .artifact
+                .manifest
+                .requests(HostCapability::EventCount)
+            || record
+                .committed
+                .values()
+                .all(|provider| provider.fiber != stream.owner)
+        {
+            return -(STATUS_UNDECLARED as i64);
+        }
+        stream.stream.records().len() as i64
+    }
+
+    fn host_read_event(&self, fiber: FiberId, index: u64) -> i64 {
+        let Some(record) = self.fibers.get(&fiber) else {
+            return -(STATUS_INVALID as i64);
+        };
+        let Some(stream) = self.event_stream.as_ref() else {
+            return -(STATUS_UNSATISFIED as i64);
+        };
+        if record.state != InternalState::Activating
+            || !record
+                .spec
+                .artifact
+                .manifest
+                .requests(HostCapability::ReadEvent)
+            || record
+                .committed
+                .values()
+                .all(|provider| provider.fiber != stream.owner)
+        {
+            return -(STATUS_UNDECLARED as i64);
+        }
+        let Ok(index) = usize::try_from(index) else {
+            return -(STATUS_INVALID as i64);
+        };
+        stream
+            .stream
+            .records()
+            .get(index)
+            .map_or(-(STATUS_INVALID as i64), |event| event.value as i64)
+    }
 }
 
 impl Fiber {
@@ -2761,6 +3403,48 @@ fn link_host(linker: &mut Linker<HostState>) -> Result<()> {
             |store: StoreContextMut<'_, HostState>, (index,): (u64,)| {
                 Ok((with_core(store, |core, fiber| {
                     core.host_open_journal(fiber, index)
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
+            "open-event-stream",
+            |store: StoreContextMut<'_, HostState>, (index,): (u64,)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_open_event_stream(fiber, index)
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
+            "append-event",
+            |store: StoreContextMut<'_, HostState>, (index, value): (u64, u64)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_append_event(fiber, index, value)
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
+            "event-count",
+            |store: StoreContextMut<'_, HostState>, (): ()| {
+                Ok((with_core(store, |core, fiber| core.host_event_count(fiber)),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
+            "read-event",
+            |store: StoreContextMut<'_, HostState>, (index,): (u64,)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_read_event(fiber, index)
                 }),))
             },
         )
@@ -2894,6 +3578,8 @@ fn same_spec(left: &PreparedSpec, right: &PreparedSpec) -> bool {
         && left.artifact.digest == right.artifact.digest
         && left.config == right.config
         && left.journal_paths == right.journal_paths
+        && left.event_stream_paths == right.event_stream_paths
+        && left.event_grants == right.event_grants
         && left.children.len() == right.children.len()
         && left
             .children
@@ -3023,6 +3709,8 @@ impl PreparedSpec {
                 .map(PreparedPatch::to_composition_patch)
                 .collect(),
             journal_paths: self.journal_paths.clone(),
+            event_stream_paths: self.event_stream_paths.clone(),
+            event_grants: self.event_grants.clone(),
         }
     }
 }

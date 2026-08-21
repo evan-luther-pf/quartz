@@ -1,0 +1,17 @@
+{
+  "abi": 4,
+  "module": "quartz.slice3.event-store",
+  "version": "0.1.0",
+  "execution_mode": "wasm-component",
+  "requested_host_capabilities": ["open-event-stream", "open-journal", "publish-callable"],
+  "component": {
+    "id": "event-store",
+    "config_schema": "u64",
+    "max_activation_steps": 1,
+    "inject": [],
+    "provide": [
+      {"slot": 3, "kind": "callable", "namespace": "quartz.persistence", "interface": "composition-journal", "revision": 1},
+      {"slot": 4, "kind": "callable", "namespace": "quartz.events", "interface": "stream", "revision": 1}
+    ]
+  }
+}

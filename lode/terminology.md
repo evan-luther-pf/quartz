@@ -21,4 +21,6 @@
 - **Module artifact** — loadable code containing one or more component implementations.
 - **System boundary** — the set of locations Quartz can exclusively modify and restore; effects outside it require withholding, compensation, or explicit irreversibility.
 - **Handover** — replacement of the kernel process through state transfer and re-exec.
-- **Event stream** — ordered append-only facts from which durable and model-visible state can be reconstructed.
+- **Event grant** — one exact host-admitted event type identity exposed to guest code by index.
+- **Event stream** — the versioned append-only stream of typed durable facts from which model-visible state can be reconstructed.
+- **Transactional outbox** — event requests synchronized in the composition journal before idempotent event-stream delivery.

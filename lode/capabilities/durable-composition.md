@@ -32,9 +32,18 @@ A persistence component opens one host-admitted journal path through an explicit
 
 `Runtime::open_persistent` receives a host-built journal component specification containing one admitted journal path. It activates that component, reads the journal, verifies the recovered tree, and reconciles it. `declare_tree` and `apply_tree` treat their arguments as application roots and keep the bootstrap journal root outside persisted application state. `shutdown_persistent` commits an empty application tree, unloads the application, then unloads the journal component so observational cleanliness remains testable.
 
-The journal starts with the eight-byte magic `QUARTZJ1`. Each record contains a monotonically increasing `u64` sequence, a bounded `u32` payload length, UTF-8 JSON for schema version 1, and a SHA-256 checksum over the sequence, length, and payload. The payload contains the composition revision and complete application `ComponentTree`.
+The journal starts with the eight-byte magic `QUARTZJ2`. Each record contains a
+monotonically increasing `u64` sequence, a bounded `u32` payload length, UTF-8
+JSON for schema version 2, and a SHA-256 checksum over the sequence, length, and
+payload. The payload contains the composition revision, complete application
+`ComponentTree`, committed composition effects, next durable event ID, and
+transactional event outbox.
 
-Opening scans every frame. A truncated final header or payload is an uncommitted torn tail and is removed back to the last complete frame. Bad magic, sequence discontinuity, invalid JSON, an invalid checksum, or corruption before the final incomplete frame fails closed. Appends use one encoded frame followed by `sync_data` before the commit is reported.
+Opening scans every frame. A truncated final header or payload is an uncommitted
+torn tail and is removed back to the last complete frame. Bad magic, sequence
+discontinuity, invalid JSON, an invalid checksum, or corruption before the final
+incomplete frame fails closed. Appends use one encoded frame followed by
+`sync_data` before the commit is reported.
 
 ## Acceptance scenario
 

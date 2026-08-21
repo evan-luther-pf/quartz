@@ -3,6 +3,7 @@ mod manifest;
 mod module;
 mod runtime;
 
+pub use journal::{EventGrant, EventRecord};
 pub use manifest::{
     ABI_VERSION, BindingKind, ComponentDeclaration, HostCapability, InterfaceId, Manifest,
     ProvidedBinding, RequiredBinding, Requirement,
@@ -86,6 +87,19 @@ pub enum Error {
     JournalCorrupt(String),
     #[error("journal record size {actual} exceeds limit {limit}")]
     JournalRecordLimit { actual: usize, limit: usize },
+    #[error("event stream {operation} failed for {path}: {source}")]
+    EventIo {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("durable event stream is corrupt: {0}")]
+    EventCorrupt(String),
+    #[error("event record size {actual} exceeds limit {limit}")]
+    EventRecordBytesLimit { actual: usize, limit: usize },
+    #[error("event record count {actual} exceeds limit {limit}")]
+    EventRecordLimit { actual: usize, limit: usize },
     #[error("persistent composition error: {0}")]
     Persistence(String),
     #[error("runtime invariant violated: {0}")]

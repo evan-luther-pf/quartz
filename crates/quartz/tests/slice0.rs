@@ -102,7 +102,7 @@ fn provider_identity_change_reactivates_equal_value_consumer_in_order() {
             matches!(event, TraceEvent::FiberActivated { fiber, .. } if *fiber == consumer_a)
                 .then_some(index)
         })
-        .last()
+        .next_back()
         .unwrap();
     assert!(consumer_unavailable < consumer_inactive);
     assert!(consumer_inactive < provider_recovery);

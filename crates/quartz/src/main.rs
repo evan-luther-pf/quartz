@@ -1,5 +1,6 @@
 use quartz_kernel::{
-    ComponentSpec, ComponentTree, CompositionPatch, Error, FiberState, Limits, Runtime, TraceEvent,
+    ComponentSpec, ComponentTree, CompositionPatch, Error, EventGrant, FiberState, Limits, Runtime,
+    TraceEvent,
 };
 use std::{
     fs,
@@ -28,6 +29,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some("--durable-verify") => {
             run_durable_phase(&required_path(args.next())?, DurablePhase::Verify)?
+        }
+        Some("--events-write") => run_event_phase(&required_path(args.next())?, EventPhase::Write)?,
+        Some("--events-recover") => {
+            run_event_phase(&required_path(args.next())?, EventPhase::Recover)?
+        }
+        Some("--events-verify") => {
+            run_event_phase(&required_path(args.next())?, EventPhase::Verify)?
         }
         Some(argument) => return Err(format!("unknown argument `{argument}`").into()),
         None => run_acceptance()?,
@@ -98,6 +106,7 @@ fn run_acceptance() -> Result<(), Box<dyn std::error::Error>> {
     let cross_component_resolve_ns = measure_cross_component_resolve(&fixtures, 1_000_000)?;
     run_governed_acceptance(&fixtures)?;
     run_durable_acceptance(&fixtures)?;
+    run_event_acceptance(&fixtures)?;
     println!("root removed: subtree recovered to a clean context");
     println!("initial_composition_ns={initial_composition_ns}");
     println!("invalid_replacement_ns={invalid_replacement_ns}");
@@ -237,6 +246,87 @@ fn durable_tree(fixtures: &Path, controller: bool, provider: &str) -> ComponentT
                     ComponentSpec::new("provider", artifact(fixtures, "provider-b")),
                 )]),
         );
+    }
+    ComponentTree { roots }
+}
+
+#[derive(Clone, Copy)]
+enum EventPhase {
+    Write,
+    Recover,
+    Verify,
+}
+
+fn run_event_acceptance(fixtures: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let journal =
+        std::env::temp_dir().join(format!("quartz-slice3-smoke-{}.qj", std::process::id()));
+    let events = journal.with_extension("qe");
+    for path in [&journal, &events] {
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+    }
+    let executable = std::env::current_exe()?;
+    for argument in ["--events-write", "--events-recover", "--events-verify"] {
+        let status = Command::new(&executable)
+            .arg(argument)
+            .arg(&journal)
+            .status()?;
+        if !status.success() {
+            return Err(format!("event phase `{argument}` failed with {status}").into());
+        }
+    }
+    fs::remove_file(&journal)?;
+    fs::remove_file(&events)?;
+    assert!(fixtures.join("event-store.wasm").is_file());
+    Ok(())
+}
+
+fn run_event_phase(journal: &Path, phase: EventPhase) -> Result<(), Box<dyn std::error::Error>> {
+    let fixtures = PathBuf::from(env!("QUARTZ_FIXTURE_DIR"));
+    let events = journal.with_extension("qe");
+    let mut runtime = Runtime::open_persistent(
+        Limits::default(),
+        ComponentSpec::new("event-store", artifact(&fixtures, "event-store"))
+            .with_journal_paths(vec![journal.to_path_buf()])
+            .with_event_stream_paths(vec![events]),
+    )?;
+    match phase {
+        EventPhase::Write => {
+            runtime.apply_tree(event_tree(&fixtures, false))?;
+            assert_eq!(runtime.events().len(), 1);
+            assert_eq!(runtime.events()[0].value, 37);
+            println!("durable event commit: session fact synchronized before process exit");
+        }
+        EventPhase::Recover => {
+            assert_eq!(runtime.events().len(), 1);
+            assert_eq!(runtime.events()[0].value, 37);
+            runtime.apply_tree(event_tree(&fixtures, true))?;
+            assert_eq!(runtime.state_value("projection", 901), Some(37));
+            println!("event restart: projection reconstructed from one durable fact");
+        }
+        EventPhase::Verify => {
+            assert_eq!(runtime.events().len(), 1);
+            assert_eq!(runtime.state_value("projection", 901), Some(37));
+            runtime.shutdown_persistent()?;
+            assert!(runtime.is_observationally_clean());
+            println!("event second restart: projection reconstructed; shutdown clean");
+        }
+    }
+    Ok(())
+}
+
+fn event_tree(fixtures: &Path, projection: bool) -> ComponentTree {
+    let mut roots = vec![
+        ComponentSpec::new("append", artifact(fixtures, "event-appender"))
+            .with_config(37)
+            .with_event_grants(vec![EventGrant::new("quartz.session", "value", 1)]),
+    ];
+    if projection {
+        roots.push(ComponentSpec::new(
+            "projection",
+            artifact(fixtures, "event-projection"),
+        ));
     }
     ComponentTree { roots }
 }

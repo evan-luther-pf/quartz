@@ -14,7 +14,7 @@ A component may change the desired component tree through the same context it us
 
 ## Implemented foundation
 
-Slices 0 through 2 are complete. Quartz has a Rust context kernel and loads
+Slices 0 through 3 are complete. Quartz has a Rust context kernel and loads
 every acceptance component as a Wasmtime component through the public WIT
 contract. The runtime tracks structural inverses, resolves scalar and callable
 dependencies by provider fiber identity, orders dependent recovery before
@@ -27,15 +27,22 @@ Successful patches belong to the controller accumulator; denied, stale,
 malformed, cancelled, and failed requests leave or restore the prior
 composition.
 
-A sandboxed persistence component can register one host-admitted journal path.
-Committed desired-tree snapshots carry canonical artifact paths, SHA-256
-digests, composition revisions, sequence numbers, and checksums. Restart
-verifies the latest complete record, creates fresh fibers from that declaration,
-and preserves committed patch inverses without replaying historical lifecycle
-effects. Torn final writes are removed; interior corruption fails closed.
-Removing the application and journal roots leaves no fibers, bindings, state
-cells, registrations, pending patches, composition effects, desired roots,
-journal registrations, or live module artifacts.
+A sandboxed persistence component can register one host-admitted composition
+journal and one host-admitted event stream. Committed desired-tree snapshots
+carry canonical artifact paths, SHA-256 digests, composition revisions,
+committed patch inverses, next event identity, and the transactional event
+outbox. Restart verifies the latest complete records, drains recovered event
+requests idempotently, creates fresh fibers from the declaration, and preserves
+committed patch inverses without replaying historical lifecycle emissions.
+Authorized appenders emit typed scalar facts only after activation commit;
+projections reconstruct model-visible state through their committed storage
+provider view. Torn final writes are removed and interior corruption fails
+closed.
+
+Removing the application and persistence roots leaves no fibers, bindings,
+state cells, child registrations, pending patches or events, composition
+effects, desired roots, journal or event registrations, outbox entries, or live
+module artifacts. Durable journal and event records remain honestly external.
 
 ## Non-goals
 

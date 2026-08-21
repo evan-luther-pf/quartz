@@ -1,4 +1,4 @@
-package quartz:component@0.3.0;
+package quartz:component@0.4.0;
 
 world module {
   /// Set a fiber-owned context cell. Returns zero or a Quartz status code.
@@ -25,6 +25,17 @@ world module {
 
   /// Register one host-admitted composition journal path.
   import open-journal: func(index: u64) -> s32;
+
+  /// Register one host-admitted durable event-stream path.
+  import open-event-stream: func(index: u64) -> s32;
+
+  /// Queue one host-admitted typed value in 0..=s64::MAX until activation commits.
+  import append-event: func(index: u64, value: u64) -> s32;
+  /// Return the bounded committed event count, or a negative Quartz status.
+  import event-count: func() -> s64;
+
+  /// Read one non-negative committed event value, or a negative Quartz status.
+  import read-event: func(index: u64) -> s64;
 
   /// Create activation-local state. This call must not mutate the context.
   export start: func(config: u64) -> u64;
