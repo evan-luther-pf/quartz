@@ -37,6 +37,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("--events-verify") => {
             run_event_phase(&required_path(args.next())?, EventPhase::Verify)?
         }
+        Some("--agent-start") => run_agent_phase(&required_path(args.next())?, AgentPhase::Start)?,
+        Some("--agent-resume") => {
+            let expected = args
+                .next()
+                .ok_or("agent resume requires an expected event count")?
+                .parse()?;
+            run_agent_phase(&required_path(args.next())?, AgentPhase::Resume(expected))?
+        }
+        Some("--agent-replace") => {
+            run_agent_phase(&required_path(args.next())?, AgentPhase::Replace)?
+        }
+        Some("--agent-verify") => {
+            run_agent_phase(&required_path(args.next())?, AgentPhase::Verify)?
+        }
         Some(argument) => return Err(format!("unknown argument `{argument}`").into()),
         None => run_acceptance()?,
     }
@@ -107,6 +121,7 @@ fn run_acceptance() -> Result<(), Box<dyn std::error::Error>> {
     run_governed_acceptance(&fixtures)?;
     run_durable_acceptance(&fixtures)?;
     run_event_acceptance(&fixtures)?;
+    run_agent_acceptance(&fixtures)?;
     println!("root removed: subtree recovered to a clean context");
     println!("initial_composition_ns={initial_composition_ns}");
     println!("invalid_replacement_ns={invalid_replacement_ns}");
@@ -329,6 +344,180 @@ fn event_tree(fixtures: &Path, projection: bool) -> ComponentTree {
         ));
     }
     ComponentTree { roots }
+}
+
+#[derive(Clone, Copy)]
+enum AgentPhase {
+    Start,
+    Resume(usize),
+    Replace,
+    Verify,
+}
+
+fn run_agent_acceptance(fixtures: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let journal =
+        std::env::temp_dir().join(format!("quartz-slice4-smoke-{}.qj", std::process::id()));
+    let events = journal.with_extension("qe");
+    for path in [&journal, &events] {
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+    }
+    let executable = std::env::current_exe()?;
+    run_agent_process(&executable, "--agent-start", None, &journal)?;
+    for count in 2..=8 {
+        run_agent_process(&executable, "--agent-resume", Some(count), &journal)?;
+    }
+    run_agent_process(&executable, "--agent-replace", None, &journal)?;
+    for count in 10..=16 {
+        run_agent_process(&executable, "--agent-resume", Some(count), &journal)?;
+    }
+    run_agent_process(&executable, "--agent-verify", None, &journal)?;
+    fs::remove_file(&journal)?;
+    fs::remove_file(&events)?;
+    assert!(fixtures.join("agent-loop.wasm").is_file());
+    Ok(())
+}
+
+fn run_agent_process(
+    executable: &Path,
+    argument: &str,
+    expected: Option<usize>,
+    journal: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut command = Command::new(executable);
+    command.arg(argument);
+    if let Some(expected) = expected {
+        command.arg(expected.to_string());
+    }
+    let status = command.arg(journal).status()?;
+    if !status.success() {
+        return Err(format!("agent phase `{argument}` failed with {status}").into());
+    }
+    Ok(())
+}
+
+fn run_agent_phase(journal: &Path, phase: AgentPhase) -> Result<(), Box<dyn std::error::Error>> {
+    let fixtures = PathBuf::from(env!("QUARTZ_FIXTURE_DIR"));
+    let events = journal.with_extension("qe");
+    let mut runtime = Runtime::open_persistent(
+        Limits::default(),
+        ComponentSpec::new("event-store", artifact(&fixtures, "event-store"))
+            .with_journal_paths(vec![journal.to_path_buf()])
+            .with_event_stream_paths(vec![events]),
+    )?;
+    match phase {
+        AgentPhase::Start => {
+            assert!(runtime.events().is_empty());
+            runtime.apply_tree(agent_tree(&fixtures, "agent-tool-a"))?;
+            assert_eq!(runtime.events().len(), 1);
+            println!("agent boundary 1: public prompt committed");
+        }
+        AgentPhase::Resume(expected) => {
+            assert_eq!(runtime.events().len(), expected);
+            let value = runtime.events().last().expect("resumed event").value;
+            println!(
+                "agent boundary {expected}: fact kind {} turn {} reconstructed",
+                value >> 56,
+                (value >> 48) & 0xff
+            );
+        }
+        AgentPhase::Replace => {
+            assert_eq!(runtime.events().len(), 8);
+            let base_revision = runtime.composition_revision();
+            let controller_config = (base_revision + 1) << 32;
+            runtime.apply_tree(agent_tool_replacement_tree(&fixtures, controller_config))?;
+            assert_eq!(runtime.events().len(), 8);
+            assert_eq!(runtime.state_value("y-controller", 700), Some(0));
+            runtime.apply_tree(agent_second_prompt_tree(&fixtures, controller_config))?;
+            assert_eq!(runtime.events().len(), 9);
+            println!("agent boundary 9: tool generation B active; second prompt committed");
+        }
+        AgentPhase::Verify => {
+            let actual = runtime
+                .events()
+                .iter()
+                .map(|event| event.value)
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected_agent_facts());
+            assert_eq!(runtime.state_value("a-loop", 912), Some(202));
+            assert_eq!(runtime.state_value("a-loop", 913), Some(2002));
+            runtime.shutdown_persistent()?;
+            assert!(runtime.is_observationally_clean());
+            println!("agent restart: two exact transcripts reconstructed; shutdown clean");
+        }
+    }
+    Ok(())
+}
+
+fn agent_tree(fixtures: &Path, tool: &str) -> ComponentTree {
+    let event_grant = || EventGrant::new("quartz.agent", "turn", 1);
+    ComponentTree {
+        roots: vec![
+            ComponentSpec::new("a-loop", artifact(fixtures, "agent-loop"))
+                .with_event_grants(vec![event_grant()]),
+            ComponentSpec::new("b-gateway", artifact(fixtures, "agent-gateway")),
+            ComponentSpec::new("c-provider", artifact(fixtures, "agent-provider")).with_config(1),
+            ComponentSpec::new("d-tool", artifact(fixtures, tool))
+                .with_config(if tool.ends_with('a') { 1 } else { 2 }),
+            ComponentSpec::new("e-governor", artifact(fixtures, "governor")).with_config(0),
+            ComponentSpec::new("z-client", artifact(fixtures, "agent-client"))
+                .with_config(1)
+                .with_event_grants(vec![event_grant()]),
+        ],
+    }
+}
+
+fn agent_tool_replacement_tree(fixtures: &Path, controller_config: u64) -> ComponentTree {
+    let mut tree = agent_tree(fixtures, "agent-tool-a");
+    tree.roots
+        .push(agent_replacement_controller(fixtures, controller_config));
+    tree
+}
+
+fn agent_second_prompt_tree(fixtures: &Path, controller_config: u64) -> ComponentTree {
+    let mut tree = agent_tree(fixtures, "agent-tool-b");
+    tree.roots
+        .push(agent_replacement_controller(fixtures, controller_config));
+    tree.roots.push(
+        ComponentSpec::new("zz-client", artifact(fixtures, "agent-client"))
+            .with_config(2)
+            .with_event_grants(vec![EventGrant::new("quartz.agent", "turn", 1)]),
+    );
+    tree
+}
+
+fn agent_replacement_controller(fixtures: &Path, config: u64) -> ComponentSpec {
+    ComponentSpec::new("y-controller", artifact(fixtures, "durable-controller"))
+        .with_config(config)
+        .with_patches(vec![CompositionPatch::replace(
+            "d-tool",
+            ComponentSpec::new("d-tool", artifact(fixtures, "agent-tool-b")).with_config(2),
+        )])
+}
+
+fn expected_agent_facts() -> Vec<u64> {
+    [
+        (1, 1, 0, 1),
+        (2, 1, 17, 1),
+        (3, 1, 18, 1),
+        (4, 1, 18, 101),
+        (2, 1, 19, 2),
+        (5, 1, 19, 1001),
+        (6, 1, 19, 7),
+        (7, 1, 0, 1),
+        (1, 2, 0, 2),
+        (2, 2, 33, 1),
+        (3, 2, 34, 1),
+        (4, 2, 34, 202),
+        (2, 2, 35, 2),
+        (5, 2, 35, 2002),
+        (6, 2, 35, 7),
+        (7, 2, 0, 1),
+    ]
+    .into_iter()
+    .map(|(kind, turn, invocation, data)| (kind << 56) | (turn << 48) | (invocation << 32) | data)
+    .collect()
 }
 
 fn required_path(value: Option<String>) -> Result<PathBuf, Box<dyn std::error::Error>> {

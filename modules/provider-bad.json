@@ -1,5 +1,5 @@
 {
-  "abi": 4,
+  "abi": 5,
   "module": "quartz.slice0.provider-bad",
   "version": "0.1.0",
   "execution_mode": "wasm-component",

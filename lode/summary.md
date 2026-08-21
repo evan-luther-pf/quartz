@@ -14,7 +14,7 @@ A component may change the desired component tree through the same context it us
 
 ## Implemented foundation
 
-Slices 0 through 3 are complete. Quartz has a Rust context kernel and loads
+Slices 0 through 4 are complete. Quartz has a Rust context kernel and loads
 every acceptance component as a Wasmtime component through the public WIT
 contract. The runtime tracks structural inverses, resolves scalar and callable
 dependencies by provider fiber identity, orders dependent recovery before
@@ -39,6 +39,14 @@ projections reconstruct model-visible state through their committed storage
 provider view. Torn final writes are removed and interior corruption fails
 closed.
 
+A replaceable agent gateway, loop, deterministic provider, and read-only fixture
+tool now complete a closed turn protocol from committed facts. Each restart
+projects the exact transcript, derives one owed action, and commits at most one
+new fact with a stable invocation identity. Provider failure preserves the
+request for retry; an ambiguous non-idempotent call becomes
+`interrupted/unknown`. A governed tool replacement changes the second turn
+without rewriting the first.
+
 Removing the application and persistence roots leaves no fibers, bindings,
 state cells, child registrations, pending patches or events, composition
 effects, desired roots, journal or event registrations, outbox entries, or live
@@ -48,7 +56,7 @@ module artifacts. Durable journal and event records remain honestly external.
 
 - Production model access.
 - Repository mutation.
-- Conversation and model-visible session persistence.
+- Production or unbounded conversation/session payloads.
 - TUI.
 - Package installation or remote transport.
 - Compatibility with the existing Quartz repository.

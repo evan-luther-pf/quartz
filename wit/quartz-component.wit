@@ -1,4 +1,4 @@
-package quartz:component@0.4.0;
+package quartz:component@0.5.0;
 
 world module {
   /// Set a fiber-owned context cell. Returns zero or a Quartz status code.
@@ -31,6 +31,9 @@ world module {
 
   /// Queue one host-admitted typed value in 0..=s64::MAX until activation commits.
   import append-event: func(index: u64, value: u64) -> s32;
+
+  /// Queue one host-admitted typed value after replay-aware event projection.
+  import resume-event: func(index: u64, value: u64) -> s32;
   /// Return the bounded committed event count, or a negative Quartz status.
   import event-count: func() -> s64;
 

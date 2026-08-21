@@ -159,6 +159,14 @@ ID, then synchronizes an empty outbox. Startup drains a recovered outbox before
 application fibers activate. Historical activation replay cannot enqueue an
 event.
 
+ABI 5 separates ordinary event production from replay-aware resumption.
+`append-event` remains unavailable while historical composition is activating.
+A component admitted for `resume-event` first projects committed facts, then
+may queue one missing fact through the same event grant and transactional
+outbox. A manifest cannot request both authorities. This preserves replay
+silence for ordinary components without making a durable workflow inert after
+restart.
+
 Event facts are irreversible external emissions, not context effects. Opening
 the stream is a reversible capability registration; recovery closes it but does
 not claim to erase committed facts. A projection component reads the bounded

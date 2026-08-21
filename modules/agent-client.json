@@ -1,0 +1,17 @@
+{
+  "abi": 5,
+  "module": "quartz.slice4.agent-client",
+  "version": "0.1.0",
+  "execution_mode": "wasm-component",
+  "requested_host_capabilities": ["event-count", "invoke", "read-event", "resume-event"],
+  "component": {
+    "id": "agent-client",
+    "config_schema": "u64",
+    "max_activation_steps": 1,
+    "inject": [
+      {"slot": 4, "kind": "callable", "namespace": "quartz.events", "interface": "stream", "min_revision": 1, "max_revision": 1},
+      {"slot": 12, "kind": "callable", "namespace": "quartz.agent", "interface": "submit", "min_revision": 1, "max_revision": 1}
+    ],
+    "provide": []
+  }
+}

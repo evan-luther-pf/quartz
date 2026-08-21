@@ -1396,9 +1396,15 @@ impl Runtime {
             ));
         }
         let requests_append = artifact.manifest.requests(HostCapability::AppendEvent);
-        if requests_append != !spec.event_grants.is_empty() {
+        let requests_resume = artifact.manifest.requests(HostCapability::ResumeEvent);
+        if requests_append && requests_resume {
             return Err(Error::Manifest(format!(
-                "component `{path}` must pair append-event authority with admitted event grants"
+                "component `{path}` cannot request both append-event and resume-event"
+            )));
+        }
+        if (requests_append || requests_resume) != !spec.event_grants.is_empty() {
+            return Err(Error::Manifest(format!(
+                "component `{path}` must pair event append authority with admitted event grants"
             )));
         }
         let mut event_types = BTreeSet::new();
@@ -3147,7 +3153,13 @@ impl Core {
         STATUS_OK
     }
 
-    fn host_append_event(&mut self, fiber: FiberId, index: u64, value: u64) -> i32 {
+    fn host_append_event(
+        &mut self,
+        fiber: FiberId,
+        index: u64,
+        value: u64,
+        resumable: bool,
+    ) -> i32 {
         if value > i64::MAX as u64 {
             return STATUS_INVALID;
         }
@@ -3158,12 +3170,13 @@ impl Core {
             let Some(record) = self.fibers.get(&fiber) else {
                 return STATUS_INVALID;
             };
+            let capability = if resumable {
+                HostCapability::ResumeEvent
+            } else {
+                HostCapability::AppendEvent
+            };
             if record.state != InternalState::Activating
-                || !record
-                    .spec
-                    .artifact
-                    .manifest
-                    .requests(HostCapability::AppendEvent)
+                || !record.spec.artifact.manifest.requests(capability)
             {
                 return STATUS_UNDECLARED;
             }
@@ -3182,7 +3195,7 @@ impl Core {
             }
             (record.path.clone(), grant.clone())
         };
-        if self.replaying {
+        if self.replaying && !resumable {
             return STATUS_BUSY;
         }
 
@@ -3424,7 +3437,18 @@ fn link_host(linker: &mut Linker<HostState>) -> Result<()> {
             "append-event",
             |store: StoreContextMut<'_, HostState>, (index, value): (u64, u64)| {
                 Ok((with_core(store, |core, fiber| {
-                    core.host_append_event(fiber, index, value)
+                    core.host_append_event(fiber, index, value, false)
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
+            "resume-event",
+            |store: StoreContextMut<'_, HostState>, (index, value): (u64, u64)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_append_event(fiber, index, value, true)
                 }),))
             },
         )

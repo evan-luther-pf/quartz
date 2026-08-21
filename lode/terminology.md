@@ -24,3 +24,7 @@
 - **Event grant** — one exact host-admitted event type identity exposed to guest code by index.
 - **Event stream** — the versioned append-only stream of typed durable facts from which model-visible state can be reconstructed.
 - **Transactional outbox** — event requests synchronized in the composition journal before idempotent event-stream delivery.
+- **Turn fact** — one closed Slice 4 agent-protocol event carrying fact kind, turn identity, stable invocation identity, and fixture payload identity.
+- **Owed work** — the unique next action derived from committed turn facts when no terminal fact exists.
+- **Stable invocation identity** — a turn-derived provider or tool call identity preserved across process and component generations.
+- **Interrupted/unknown** — an explicit terminal result for an ambiguous non-idempotent operation that Quartz must not retry.

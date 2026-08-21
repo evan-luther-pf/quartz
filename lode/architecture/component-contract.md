@@ -57,7 +57,7 @@ so compiled code is retained only while a desired, staged, or live generation
 owns it. A process remains an optional isolation mode; it is not the composition
 model.
 
-The ABI 4 WIT contract exposes four lifecycle calls and twelve capability
+The ABI 5 WIT contract exposes four lifecycle calls and thirteen capability
 imports:
 
 - `start(config)`, `step(instance)`, `invoke(instance, operation, arg0, arg1)`,
@@ -76,6 +76,9 @@ imports:
   commit;
 - `event-count` and `read-event` expose bounded committed facts to an authorized
   projection component.
+- `resume-event` has the same grant, outbox, and commit enforcement as
+  `append-event`, but may append the unique owed fact after historical event
+  projection during restart.
 
 Every binding declares `value` or `callable` kind as part of its versioned
 identity. Context-changing imports remain tracked by structural inverses.
@@ -115,6 +118,17 @@ generations against one composition journal and event stream: the first commits
 one typed fact and exits without recovery, the first restart installs a
 projection from that fact, the second reconstructs the persisted projection
 without duplication, and the final generation performs a clean persistent
+shutdown.
+
+### Slice 4 verification
+
+`cargo test -p quartz --test slice4` exercises three deterministic-turn
+contracts: exact two-turn restart reconstruction with governed tool replacement,
+provider failure followed by stable-request retry, and explicit interruption of
+an ambiguous non-idempotent tool call. `cargo run --release -p quartz` starts a
+fresh executable generation after every turn fact, reconstructs the unique owed
+action from the committed event stream, switches fixture tool generations
+between turns, verifies both exact transcripts, and performs a clean persistent
 shutdown.
 
 ### Decision evidence
