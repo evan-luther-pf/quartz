@@ -40,12 +40,6 @@ Commands:
   --reviewed-edit <directory>
   --promote-edit <directory>
   --production-model <model> <prompt> <journal>
-  --propose <model> <task> <session-dir> <source> <source> [source ...]
-  --resume-proposals <session-dir>
-  --revise-proposal <model> <session-dir> <index> <feedback>
-  --promote-proposal <session-dir> <index>
-  --run-approved-command <session-dir> -- <executable> [arg ...]
-  --continue-task <model> <session-dir>
   task <model> <task> <session-dir> <source> <source> [source ...] -- <executable> [arg ...]
 ";
 
@@ -72,31 +66,6 @@ enum CliCommand {
         model: String,
         prompt: PathBuf,
         journal: PathBuf,
-    },
-    Propose {
-        model: String,
-        task: PathBuf,
-        session: PathBuf,
-        sources: Vec<PathBuf>,
-    },
-    ResumeProposals(PathBuf),
-    ReviseProposal {
-        model: String,
-        session: PathBuf,
-        index: usize,
-        feedback: PathBuf,
-    },
-    PromoteProposal {
-        session: PathBuf,
-        index: usize,
-    },
-    RunApprovedCommand {
-        session: PathBuf,
-        argv: Vec<String>,
-    },
-    ContinueTask {
-        model: String,
-        session: PathBuf,
     },
     Task {
         model: String,
@@ -152,26 +121,6 @@ fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), Box<dyn std::er
             prompt,
             journal,
         } => run_production_model(&model, &prompt, &journal)?,
-        CliCommand::Propose {
-            model,
-            task,
-            session,
-            sources,
-        } => run_multi_proposal(&model, &task, &session, &sources)?,
-        CliCommand::ReviseProposal {
-            model,
-            session,
-            index,
-            feedback,
-        } => run_proposal_revision(&model, &session, index, &feedback)?,
-        CliCommand::ResumeProposals(session) => {
-            let session = fs::canonicalize(session)?;
-            let state = reconstruct_proposal_session(&session)?;
-            display_proposals(&session, &state)?;
-        }
-        CliCommand::PromoteProposal { session, index } => run_proposal_promotion(&session, index)?,
-        CliCommand::RunApprovedCommand { session, argv } => run_approved_command(&session, argv)?,
-        CliCommand::ContinueTask { model, session } => run_proposal_continuation(&model, &session)?,
         CliCommand::Task {
             model,
             task,
@@ -246,89 +195,6 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CliCommand, Stri
             prompt: path_arg(&mut args, command, "<model> <prompt> <journal>")?,
             journal: path_arg(&mut args, command, "<model> <prompt> <journal>")?,
         },
-        "--propose" => {
-            let model = required_arg(
-                &mut args,
-                command,
-                "<model> <task> <session> <source> <source> [source ...]",
-            )?;
-            let task = path_arg(
-                &mut args,
-                command,
-                "<model> <task> <session> <source> <source> [source ...]",
-            )?;
-            let session = path_arg(
-                &mut args,
-                command,
-                "<model> <task> <session> <source> <source> [source ...]",
-            )?;
-            let sources: Vec<PathBuf> = args.by_ref().map(PathBuf::from).collect();
-            if sources.len() < 2 || sources.iter().any(|path| path.as_os_str().is_empty()) {
-                return Err(
-                    "`--propose` requires at least two non-empty <source> paths; try `quartz --help`"
-                        .into(),
-                );
-            }
-            CliCommand::Propose {
-                model,
-                task,
-                session,
-                sources,
-            }
-        }
-        "--revise-proposal" => {
-            let expected = "<model> <session> <index> <feedback>";
-            let model = required_arg(&mut args, command, expected)?;
-            let session = path_arg(&mut args, command, expected)?;
-            let value = required_arg(&mut args, command, expected)?;
-            let index = value
-                .parse()
-                .map_err(|_| format!("invalid proposal index: `{value}`"))?;
-            let feedback = path_arg(&mut args, command, expected)?;
-            CliCommand::ReviseProposal {
-                model,
-                session,
-                index,
-                feedback,
-            }
-        }
-        "--resume-proposals" => {
-            CliCommand::ResumeProposals(path_arg(&mut args, command, "<session>")?)
-        }
-        "--promote-proposal" => {
-            let session = path_arg(&mut args, command, "<session> <index>")?;
-            let value = required_arg(&mut args, command, "<session> <index>")?;
-            let index = value
-                .parse()
-                .map_err(|_| format!("invalid proposal index: `{value}`"))?;
-            CliCommand::PromoteProposal { session, index }
-        }
-        "--run-approved-command" => {
-            let expected = "<session> -- <executable> [arg ...]";
-            let session = path_arg(&mut args, command, expected)?;
-            let separator = required_arg(&mut args, command, expected)?;
-            if separator != "--" {
-                return Err(
-                    "`--run-approved-command` requires `--` before the exact argv; try `quartz --help`"
-                        .into(),
-                );
-            }
-            let argv = args.by_ref().collect::<Vec<_>>();
-            if argv.first().is_none_or(String::is_empty) {
-                return Err(
-                    "`--run-approved-command` requires a non-empty executable after `--`; try `quartz --help`"
-                        .into(),
-                );
-            }
-            CliCommand::RunApprovedCommand { session, argv }
-        }
-        "--continue-task" => {
-            let expected = "<model> <session>";
-            CliCommand::ContinueTask {
-                model: required_arg(&mut args, command, expected)?,
-                session: path_arg(&mut args, command, expected)?,
-            }
-        }
         "task" => {
             let expected =
                 "<model> <task> <session> <source> <source> [source ...] -- <executable> [arg ...]";
@@ -1423,8 +1289,8 @@ fn run_multi_proposal(
     let journal = session.join("turn.qj");
     fs::write(&prompt, &prompt_bytes)?;
 
-    let api_key =
-        std::env::var("OPENAI_API_KEY").map_err(|_| "OPENAI_API_KEY is required for --propose")?;
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .map_err(|_| "OPENAI_API_KEY is required for `quartz task`")?;
     let adapter = Arc::new(openai::OpenAiResponses::new(api_key, model.to_owned())?);
     let mut session_log = session::SessionLog::open(&session)?;
     if !session_log.facts().is_empty() {
@@ -1454,6 +1320,7 @@ fn run_multi_proposal(
     Ok(())
 }
 
+#[cfg(test)]
 fn run_proposal_revision(
     model: &str,
     session: &Path,
@@ -1517,7 +1384,7 @@ fn run_proposal_revision_bytes(
     let journal = proposals::revision_journal_path(&session, &expected)?;
 
     let api_key = std::env::var("OPENAI_API_KEY")
-        .map_err(|_| "OPENAI_API_KEY is required to start or resume --revise-proposal")?;
+        .map_err(|_| "OPENAI_API_KEY is required for `quartz task`")?;
     let adapter = Arc::new(openai::OpenAiResponses::new(api_key, model.to_owned())?);
     let mut session_log = session::SessionLog::open(&session)?;
     if append_rejection {
@@ -2568,7 +2435,7 @@ fn run_proposal_continuation(
     let state = reconstruct_proposal_session(&session)?;
     validate_continuation_start(model, &state)?;
     let api_key = std::env::var("OPENAI_API_KEY")
-        .map_err(|_| "OPENAI_API_KEY is required to start or resume --continue-task")?;
+        .map_err(|_| "OPENAI_API_KEY is required for `quartz task`")?;
     run_proposal_continuation_with_adapter(
         model,
         &session,
@@ -3291,15 +3158,24 @@ mod cli_tests {
             "--reviewed-edit",
             "--promote-edit",
             "--production-model",
+            "task",
+        ] {
+            assert!(USAGE.contains(command), "usage omitted {command}");
+        }
+
+        for command in [
             "--propose",
             "--resume-proposals",
             "--revise-proposal",
             "--promote-proposal",
             "--run-approved-command",
             "--continue-task",
-            "task",
         ] {
-            assert!(USAGE.contains(command), "usage omitted {command}");
+            assert!(!USAGE.contains(command), "usage retained {command}");
+            assert!(
+                parse(&[command]).unwrap_err().contains("unknown command"),
+                "parser retained {command}"
+            );
         }
     }
 
@@ -3348,70 +3224,6 @@ mod cli_tests {
         );
         assert_eq!(
             parse(&[
-                "--propose",
-                "model",
-                "task",
-                "session",
-                "README.md",
-                "lode/summary.md",
-                "lode/terminology.md",
-                "lode/practices.md",
-            ]),
-            Ok(CliCommand::Propose {
-                model: "model".into(),
-                task: PathBuf::from("task"),
-                session: PathBuf::from("session"),
-                sources: vec![
-                    PathBuf::from("README.md"),
-                    PathBuf::from("lode/summary.md"),
-                    PathBuf::from("lode/terminology.md"),
-                    PathBuf::from("lode/practices.md"),
-                ],
-            })
-        );
-        assert_eq!(
-            parse(&["--revise-proposal", "model", "session", "1", "feedback.txt",]),
-            Ok(CliCommand::ReviseProposal {
-                model: "model".into(),
-                session: PathBuf::from("session"),
-                index: 1,
-                feedback: PathBuf::from("feedback.txt"),
-            })
-        );
-        assert_eq!(
-            parse(&["--resume-proposals", "session"]),
-            Ok(CliCommand::ResumeProposals(PathBuf::from("session")))
-        );
-        assert_eq!(
-            parse(&["--promote-proposal", "session", "1"]),
-            Ok(CliCommand::PromoteProposal {
-                session: PathBuf::from("session"),
-                index: 1,
-            })
-        );
-        assert_eq!(
-            parse(&[
-                "--run-approved-command",
-                "session",
-                "--",
-                "cargo",
-                "test",
-                "--workspace",
-            ]),
-            Ok(CliCommand::RunApprovedCommand {
-                session: PathBuf::from("session"),
-                argv: vec!["cargo".into(), "test".into(), "--workspace".into()],
-            })
-        );
-        assert_eq!(
-            parse(&["--continue-task", "model", "session"]),
-            Ok(CliCommand::ContinueTask {
-                model: "model".into(),
-                session: PathBuf::from("session"),
-            })
-        );
-        assert_eq!(
-            parse(&[
                 "task",
                 "model",
                 "task.txt",
@@ -3447,38 +3259,6 @@ mod cli_tests {
             (
                 &["--production-model", "model", "prompt"][..],
                 "requires <model> <prompt> <journal>",
-            ),
-            (
-                &["--propose", "model", "task", "session", "one"][..],
-                "requires at least two",
-            ),
-            (
-                &["--revise-proposal", "model", "session", "bad", "feedback"][..],
-                "invalid proposal index",
-            ),
-            (
-                &["--revise-proposal", "model", "session", "0"][..],
-                "requires <model> <session> <index> <feedback>",
-            ),
-            (
-                &["--promote-proposal", "session", "bad"][..],
-                "invalid proposal index",
-            ),
-            (
-                &["--resume-proposals", "session", "extra"][..],
-                "unexpected trailing argument",
-            ),
-            (
-                &["--run-approved-command", "session", "cargo", "test"][..],
-                "requires `--`",
-            ),
-            (
-                &["--run-approved-command", "session", "--"][..],
-                "requires a non-empty executable",
-            ),
-            (
-                &["--continue-task", "model"][..],
-                "requires <model> <session>",
             ),
             (&["--idle", "bad"][..], "invalid milliseconds"),
             (&["--help", "extra"][..], "unexpected trailing argument"),

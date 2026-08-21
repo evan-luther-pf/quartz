@@ -23,3 +23,7 @@ Every change must answer:
 ## Performance
 
 Measure startup time, idle resident memory, binary sizes, invocation overhead, and swap latency separately. IPC is acceptable only at replaceable boundaries. Do not add a daemon, database, scheduler, or generic framework before a slice requires it.
+
+## Credentialed cutover
+
+Before deleting superseded procedural CLI routes, complete a credentialed supervised-task run with one approval-boundary restart.

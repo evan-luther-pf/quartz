@@ -11,85 +11,21 @@ resident in the native executable rather than a component.
 ## Observable behavior
 
 `quartz task <model> <task-path> <session-dir> <source> <source> [source ...]
--- <executable> [arg ...]` is a thin terminal coordinator over the same public
-workflow. An empty session runs the existing proposal operation; a retained
-session reconstructs facts without repeating completed or interrupted
-emissions. The coordinator displays current diffs, requests `approve` or
-`reject` for each unpromoted generation, accepts one bounded UTF-8 feedback
-line for rejection, and invokes the existing revision or promotion operation.
-Once every current generation is promoted, it displays the exact argument
-vector as JSON and requires a fresh `approve` before invoking the existing
-command operation. It then invokes the existing continuation operation and
-repeats review, promotion, command approval, and continuation until `COMPLETE`,
-whose bounded summary is printed. `stop` or terminal EOF exits without adding a
-fact. Invalid, stale, pending, or interrupted state fails closed at the same
-underlying operation boundary.
+-- <executable> [arg ...]` is the sole public coordinator for this workflow. An
+empty session runs the proposal operation; a retained session reconstructs facts
+without repeating completed or interrupted emissions. The coordinator displays
+current diffs, requests `approve` or `reject` for each unpromoted generation,
+accepts one bounded UTF-8 feedback line for rejection, and invokes revision or
+promotion. Once every current generation is promoted, it displays the exact
+argument vector as JSON and requires a fresh `approve` before invoking the
+command operation. It then invokes continuation and repeats review, promotion,
+command approval, and continuation until `COMPLETE`, whose bounded summary is
+printed. `stop` or terminal EOF exits without adding a fact. Invalid, stale,
+pending, or interrupted state fails closed at the underlying operation boundary.
 
-`quartz --propose <model> <task-path> <session-dir> <source> <source>
-[source ...]` admits at least two exact UTF-8 repository files and one bounded
-task. The host canonicalizes the sources beneath the repository root, records
-their relative paths, SHA-256 identities, and bytes, and submits one bounded
-immutable prompt through the existing production exchange. Prompt schema 2
-requires one strict JSON object containing at least two unique, path-bound
-ranged edits. Each edit names only the admitted source SHA-256, a half-open
-UTF-8 byte range, and exact replacement bytes. The host materializes each result
-and computes its SHA-256; proposal production never mutates the repository.
-
-`quartz --resume-proposals <session-dir>` reconstructs proposal state from the
-ordered facts in `<session-dir>/session.qe` without credentials or another
-exchange. It renders every candidate as an exact diff and identifies current,
-superseded, rejected, interrupted, and completed state.
-
-`quartz --revise-proposal <model> <session-dir> <index> <feedback-path>` records
-one explicit bounded rejection of the selected current unpromoted generation
-and may emit one correction exchange. The correction revision is exactly the
-rejected revision plus one and is bound to that generation's index, admitted
-path, model, source bytes and digest, ranged edit, replacement and result
-identities, and feedback. Initial, corrected, and continuation-produced
-generations use the same path. Only one revision turn may be pending; an
-interrupted exchange remains interrupted/unknown, is never retried, and blocks
-later actions.
-
-`quartz --promote-proposal <session-dir> <index>` is the user's exact approval of
-the displayed current candidate. It publishes and retains that candidate through
-the existing ABI 10 workspace, mutation-authority, and promotion-authority
-contracts. Each file is an independent operation; Quartz claims no multi-file
-transaction. Superseded, rejected, stale, or already consumed generations cannot
-pass the promotion gate.
-
-`quartz --run-approved-command <session-dir> -- <executable> [arg ...]` treats
-the exact UTF-8 argument vector as a renewed user approval. Every current
-candidate must already be promoted. Quartz synchronizes `CommandStarted` before
-spawning the vector once in the canonical repository root, drains both pipes,
-and synchronizes one bounded terminal result. A started-only attempt reconstructs
-as interrupted/unknown, is never run again, and blocks all later session facts.
-A later command is legal only after a completed nonterminal continuation and
-requires another explicit approval with another monotonic attempt identity.
-
-`quartz --continue-task <model> <session-dir>` consumes the latest unconsumed
-finished command in sequence order and performs one bounded production exchange.
-The exact response grammar is:
-
-```text
-PROPOSE <admitted-path-index>
-{"source_sha256":"<post-command source SHA-256>","byte_start":<inclusive UTF-8 byte offset>,"byte_end":<exclusive UTF-8 byte offset>,"replacement":"<exact UTF-8 replacement>"}
-```
-
-or:
-
-```text
-COMPLETE
-<bounded final summary>
-```
-
-`PROPOSE` creates the next generation for one admitted source. The reducer keeps
-one ordered generation history and projects the newest completed generation for
-review, rejection, approval, promotion, and continuation. After separate review
-and promotion, the user may approve another command. `COMPLETE` is legal only
-after a successful command and closes the session. Pending or interrupted
-revision or continuation state, explicit completion, a finished command awaiting
-continuation, or an unpromoted current proposal blocks actions that would skip
-that state.
+Proposal, reconstruction, revision, promotion, approved-command, and
+continuation operations remain internal implementation boundaries used by the
+coordinator; they are not separate CLI routes.
 
 ## Native residency violation — Slice D
 

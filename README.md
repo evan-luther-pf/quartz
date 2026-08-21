@@ -75,62 +75,21 @@ fresh runtime state, recovers live authority, and leaves the `.qj`, `.qe`, and
 `.qx` durable records for inspection. OpenAI temporarily stores background
 response data for asynchronous execution and polling.
 
-Multi-proposal production turn:
+Supervised repository task:
 
 ```sh
 OPENAI_API_KEY="$OPENAI_API_KEY" cargo run --release -p quartz -- \
-  --propose gpt-5.4 /path/to/task.txt /path/to/session \
-  path/to/source-a path/to/source-b
-cargo run --release -p quartz -- \
-  --resume-proposals /path/to/session
-printf 'Replace the rejected wording with a precise alternative.' > /tmp/quartz-feedback.txt
-OPENAI_API_KEY="$OPENAI_API_KEY" cargo run --release -p quartz -- \
-  --revise-proposal gpt-5.4 /path/to/session 0 /tmp/quartz-feedback.txt
-cargo run --release -p quartz -- \
-  --promote-proposal /path/to/session 0
-cargo run --release -p quartz -- \
-  --run-approved-command /path/to/session -- cargo test -p quartz --bin quartz
-OPENAI_API_KEY="$OPENAI_API_KEY" cargo run --release -p quartz -- \
-  --continue-task gpt-5.4 /path/to/session
-# If the continuation returned PROPOSE:
-cargo run --release -p quartz -- \
-  --promote-proposal /path/to/session 0
-cargo run --release -p quartz -- \
-  --run-approved-command /path/to/session -- cargo test -p quartz --bin quartz
-OPENAI_API_KEY="$OPENAI_API_KEY" cargo run --release -p quartz -- \
-  --continue-task gpt-5.4 /path/to/session
+  task gpt-5.4 /path/to/task.txt /path/to/session \
+  path/to/source-a path/to/source-b -- cargo test --workspace --all-targets
 ```
 
-The session directory contains one authoritative task history, `session.qe`.
-Resume derives proposal generations, decisions, promotions, command attempts,
-continuations, and completion only from its ordered checksummed facts.
+Quartz reviews current candidate diffs interactively. Proposal publication and
+the exact command argument vector require separate `approve` decisions; `reject`
+accepts one feedback line and requests a corrected candidate. Stop at any
+approval boundary and run the same command again to reconstruct the session from
+`session.qe` without repeating completed or interrupted external operations.
+The loop ends only when a post-command model turn returns explicit `COMPLETE`.
+
 Neighboring prompt, response, exchange, promotion, and mutation files are
 operation evidence or disposable render caches; they cannot supply missing
 session history or authorize an action.
-
-The proposal command admits at least two exact UTF-8 files, commits one bounded
-production turn, validates multiple digest-anchored ranged edits, materializes
-each candidate from its admitted source, and leaves every source unchanged.
-Resume reconstructs all generations and renders exact diffs without credentials
-or another exchange. Revision records one
-explicit bounded rejection, preserves the original admission and response, and
-runs at most one correction turn for the selected path. Promotion resolves only
-the current candidate generation through the existing workspace, mutation, and
-retention authorities; it verifies committed bytes after restart before
-recovering all live authority.
-
-The approved-command invocation is the user's exact argv approval; `--` is
-mandatory. Quartz synchronizes a durable start fact, executes that argv once in
-the repository root with a 120-second timeout and 32 KiB stdout/stderr bounds,
-then commits the terminal status and output. A start without a finish
-reconstructs as interrupted/unknown, is never run during resume, and blocks
-later session facts. After a completed nonterminal continuation, another command
-requires a separate renewed approval.
-
-A finished command is consumed by a sequence-numbered continuation that returns
-`PROPOSE <admitted-path-index>` followed by one strict digest-anchored ranged
-edit, or `COMPLETE` followed by a bounded summary. A correction must be
-separately promoted before
-another exact argv can run. Command success alone never completes the task;
-explicit `COMPLETE` closes the session against later commands, continuations,
-revisions, and promotions.
