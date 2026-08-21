@@ -1,18 +1,26 @@
+mod component;
+mod composition;
+mod events;
+mod exchange;
+mod fiber;
 mod journal;
 mod manifest;
 mod module;
+mod repository;
 mod runtime;
+mod wasm_host;
 
+pub use component::{
+    ComponentSpec, ComponentTree, ContextObservation, FiberId, FiberState, Limits, TraceEvent,
+};
+pub use composition::CompositionPatch;
+pub use exchange::{ExchangeAdapter, ExchangeFailure, ExchangeGrant, ExchangeResponse};
 pub use journal::{DurablePayload, EventGrant, EventRecord, SnapshotGrant};
 pub use manifest::{
     ABI_VERSION, BindingKind, ComponentDeclaration, HostCapability, InterfaceId, Manifest,
     ProvidedBinding, RequiredBinding, Requirement,
 };
-pub use runtime::{
-    ComponentSpec, ComponentTree, CompositionPatch, ContextObservation, ExchangeAdapter,
-    ExchangeFailure, ExchangeGrant, ExchangeResponse, FiberId, FiberState, Limits, Runtime,
-    TraceEvent,
-};
+pub use runtime::Runtime;
 
 use std::path::PathBuf;
 use thiserror::Error;

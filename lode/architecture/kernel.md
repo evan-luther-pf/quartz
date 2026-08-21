@@ -18,6 +18,46 @@ Quartz implements the paper's context paradigm as its irreducible kernel:
 
 The kernel contains no agent loop, provider, tool, prompt assembly, storage policy, approval policy, or interface implementation.
 
+## Internal ownership
+
+The kernel remains one crate and one public `Runtime` contract, but its source
+ownership follows the runtime concepts rather than accumulating in the facade:
+
+- `component.rs` owns component specifications, trees, limits, public fiber
+  state, observations, and trace types;
+- `fiber.rs` owns fibers, provider views and bindings, effect inverses, and
+  recovery state;
+- `composition.rs` owns prepared declarations, governed patches and undo,
+  desired-tree operations, and dependency validation;
+- `repository.rs` owns admitted immutable snapshots and snapshot host
+  operations;
+- `events.rs` owns event registrations, pending events, projection reads, and
+  transactional-outbox mechanics;
+- `exchange.rs` owns exchange grants and adapters, registration and worker
+  lifetime, durable outcome handling, and exchange host operations;
+- `wasm_host.rs` owns component instantiation support, WIT linking, host
+  dispatch, and status translation;
+- `runtime.rs` retains the public facade, persistent bootstrap, reconciliation,
+  activation, replacement, and orchestration across those owned boundaries;
+- `journal.rs` remains the single framing and durable-log implementation.
+
+This decomposition changes no public item, re-export, serialized declaration,
+ABI, WIT import, status code, journal frame, lifecycle ordering, or algorithm.
+Cross-boundary implementation state is `pub(crate)` only. Extraction does not
+introduce generalized traits or a second runtime convention.
+
+The behavior-preserving extraction is validated by 48 unchanged workspace tests,
+Clippy with warnings denied, and `cargo run --release -p quartz`. On the same
+Apple M5 Max release build, the pre/post measurements were:
+
+- release binary: 19,028,128 / 19,046,304 bytes (`+0.10%`);
+- `quartz --idle 2000` readiness, 20-run median: 3.833 / 3.753 ms;
+- executable `scenario_total_ns`, 20-run median: 4.036 / 3.804 ms.
+
+The credentialed OpenAI smoke remains an explicit open gate when
+`OPENAI_API_KEY` is unavailable; it is not replaced by the deterministic
+release reconstruction smoke.
+
 ## Lifecycle
 
 A component declares `inject`, `provide`, and `apply`.
