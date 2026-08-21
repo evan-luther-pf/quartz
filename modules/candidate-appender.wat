@@ -5,11 +5,20 @@
   (core func $resume-snapshot-core (canon lower (func $resume-snapshot)))
   (core module $module
     (import "host" "resume-snapshot" (func $resume-snapshot (param i64 i64 i64) (result i32)))
-    (func (export "start") (param i64) (result i64) i64.const 1)
+    (global $event-value (mut i64) (i64.const 360569445166350336))
+    (func (export "start") (param $config i64) (result i64)
+      local.get $config
+      i64.eqz
+      if
+      else
+        local.get $config
+        global.set $event-value
+      end
+      i64.const 1)
     (func (export "step") (param i64) (result i32)
       i64.const 0
       i64.const 0
-      i64.const 360569445166350336
+      global.get $event-value
       call $resume-snapshot
       i32.eqz
       if (result i32)

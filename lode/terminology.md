@@ -38,6 +38,12 @@
   generation completes.
 - **Proposal generation** — one exact original or corrected candidate for an
   admitted path; only the latest completed generation remains promotable.
+- **Approved command attempt** — one exact user-approved argv with a synchronized
+  start fact and at most one terminal fact; a started-only attempt is
+  interrupted/unknown and never implicitly retried.
+- **Task continuation** — one bounded model decision bound to terminal approved
+  command evidence and exact post-command admitted sources; it yields one
+  corrected proposal generation or explicit completion.
 - **Workspace grant** — one exact host-admitted source file, mutation identity, byte bound, before/result digests, and durable ledger exposed to guest code by index.
 - **Mutation authority** — the committed callable provider whose exact approval is required before a workspace publication.
 - **Mutation ledger** — the checksummed append-only record used to prevent duplicate publication and classify incomplete or unsafe repository mutations.

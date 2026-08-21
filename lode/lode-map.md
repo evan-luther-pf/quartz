@@ -28,8 +28,8 @@
 - `capabilities/durable-edit-promotion.md` — separate durable retention
   authority, restoration ownership transfer, and restart-safe promoted bytes.
 - `capabilities/dogfood-repository-task.md` — end-to-end credentialed edits,
-  resumable multi-proposal and correction sessions, explicit review and
-  promotion, and approved post-edit command evidence.
+  resumable proposal correction, explicit review and promotion, exact
+  host-approved command evidence, and bounded correction or completion.
 
 ## Research
 
@@ -37,14 +37,16 @@
 
 ## Implementation
 
-Slices 0 through 9 are implemented as one Rust workspace:
+Slices 0 through 9 and the bounded production repository loop are implemented
+as one Rust workspace:
 
 - `crates/quartz-kernel` — unified context, fibers, callable coeffects,
   composition, durable journal/event/exchange/mutation records, immutable
   snapshots, bounded payload reads and workspaces, host exchange, publication,
   and promotion authority, Wasmtime loading, replacement, and rollback.
-- `crates/quartz` — Slice 0 through Slice 9 executable scenarios, contract
-  tests, and bounded dogfood orchestration.
+- `crates/quartz` — Slice 0 through Slice 9 executable scenarios, contract tests,
+  and bounded proposal, correction, approved-command, and continuation
+  orchestration.
 - `wit/quartz-component.wit` — public component/host boundary.
 - `modules` — real WebAssembly component sources and embedded manifests used by
   the executable acceptance paths.

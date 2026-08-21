@@ -357,3 +357,128 @@ candidate path and otherwise remains unchanged.
   derived generation metadata and candidates, and promotion ledgers remain
   under `.quartz/dogfood-proposal-correction/`. No kernel, WIT, component
   manifest, or package dependency changed.
+
+## Bounded production agent loop
+
+### Problem
+
+Proposal sessions can reconstruct model-authored edits and human correction, but
+the host still ends the production task after promotion. Command evidence is not
+bound to the session, and a model cannot decide from that evidence whether to
+correct one admitted file or explicitly complete the task.
+
+### Observable behavior
+
+`quartz --run-approved-command <session-dir> -- <executable> [arg ...]` treats
+that exact UTF-8 argv as the user's approval. It requires every current proposal
+to have been promoted, commits `CommandStarted` before spawning once in the
+canonical repository root, and then commits `CommandFinished` with bounded
+output. The executable, arguments, working directory, inherited host
+environment, timeout, and retry decision never come from the model.
+
+`quartz --continue-task <model> <session-dir>` reconstructs the same proposal
+session and the latest terminal approved-command attempt, then runs one bounded
+model continuation. The response is exactly one of:
+
+```text
+PROPOSE <admitted-path-index>
+<exact complete-file candidate bytes>
+```
+
+```text
+COMPLETE
+<bounded final summary>
+```
+
+`PROPOSE` binds the candidate to the selected admitted path and the exact
+post-command source bytes. It creates revision 2 for that path and supersedes
+the prior current generation. `COMPLETE` is accepted only after a successful
+command. Command success never completes a task without that explicit response.
+
+### Non-goals
+
+- A command-runner component, validation ledger, kernel capability, WIT or ABI
+  revision.
+- Model-selected executable, argv, working directory, environment, timeout,
+  retry, path outside the original admission, or automatic approval.
+- A general conversation format, open-ended autonomous loop, model-selected
+  tools, concurrent commands, background processes, or shell-string parsing.
+
+### Invariants
+
+- The CLI host alone spawns the exact approved argv. The fixed working directory
+  is the canonical repository root, the fixed deadline is 120 seconds, and
+  retained stdout and stderr are independently capped at 32 KiB while pipes are
+  fully drained.
+- `CommandStarted` is a synchronized payload event before spawn.
+  `CommandFinished` binds its exact start digest and records the attempt, argv,
+  canonical repository identity, exit code or signal, timeout or spawn failure,
+  exact bounded output encoding, truncation flags, duration, and post-command
+  admitted-file identities.
+- A start with no matching finish reconstructs as `interrupted/unknown`.
+  Restart, resume, and model continuation never spawn it. A later explicit
+  `--run-approved-command` invocation is a new user-approved attempt and remains
+  separately visible.
+- Command facts use the existing transactional event stream. The composition
+  journal, event stream, and reconstructible payload caches live in the proposal
+  session; no second durability mechanism or validation ledger is introduced.
+- A continuation prompt binds the requested model, original task and admitted
+  path indices, current proposal generations, exact command facts and output,
+  and exact post-command admitted bytes. Drift before the exchange fails closed.
+- A completed or interrupted continuation never emits another exchange.
+  Response, completion summary, and revision-2 candidate caches are rebuilt from
+  durable prompt and assistant payload facts.
+- Revision-2 publication uses generation-specific promotion and mutation
+  ledgers. `--promote-proposal` resolves only the reconstructed current
+  generation, so an earlier candidate cannot be promoted after correction.
+- Command and model facts are irreversible external evidence. Runtime recovery
+  closes their live component authority without deleting committed history.
+
+### Public contract
+
+No kernel, WIT, or ABI changes. One existing snapshot-payload event appender is
+generalized to accept its host-selected event value. The command event stream
+uses `quartz.command/approved@1`; the continuation reuses the existing bounded
+production exchange and `quartz.agent/repository-turn@2` contracts.
+
+The argv separator is mandatory and at least one non-empty executable argument
+is required. Each argument is capped at 4 KiB and total argv bytes at 32 KiB.
+The completion summary is UTF-8 and capped at 4 KiB; a proposed file remains
+UTF-8 and capped at 32 KiB.
+
+### Acceptance scenario
+
+1. Reconstruct a proposal session whose current candidates were separately
+   reviewed and promoted.
+2. Approve one exact argv; reconstruct its synchronized start, execute it once,
+   and commit its terminal result and bounded output.
+3. Terminate after the terminal command fact, then restart without executing the
+   command again.
+4. Continue the same durable task through one model exchange.
+5. Accept either one revision-2 proposal for an admitted path or an explicit
+   completion summary.
+6. For a proposal, render and separately approve only the current generation;
+   reject promotion through any stale generation evidence.
+
+### Verification
+
+Focused contracts cover failed-command correction, successful-command
+completion, restart after both command facts, non-retry of interrupted commands,
+and stale-generation promotion denial. The live acceptance path runs one real
+approved command, restarts after its result, and feeds that exact evidence into
+the same credentialed task.
+
+- In `.quartz/dogfood-proposal-correction/`, the user approved exact argv
+  `["cargo", "test", "-p", "quartz", "--bin", "quartz"]`. Attempt 1
+  synchronized its start before spawn and finished once with exit code 0 in
+  1,923 ms; retained output reports 26 passing focused contracts.
+- A fresh credential-free process reconstructed that terminal attempt and its
+  exact bounded output without spawning it again.
+- One bounded `gpt-5.4` continuation consumed the reconstructed command facts
+  and exact post-command admitted sources, then returned explicit `COMPLETE`
+  stating that both descriptions were updated and all 26 focused tests passed.
+- A later credential-free process reconstructed that completion summary and the
+  terminal command attempt without another exchange or command execution.
+- `cargo test -p quartz --bin quartz` passed 26 focused contracts.
+  `cargo test --workspace --all-targets` passed 85 tests across 12 suites.
+  Kernel source, WIT, and ABI remained unchanged.

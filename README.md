@@ -88,6 +88,10 @@ OPENAI_API_KEY="$OPENAI_API_KEY" cargo run --release -p quartz -- \
   --revise-proposal gpt-5.4 /path/to/session 0 /tmp/quartz-feedback.txt
 cargo run --release -p quartz -- \
   --promote-proposal /path/to/session 0
+cargo run --release -p quartz -- \
+  --run-approved-command /path/to/session -- cargo test -p quartz --bin quartz
+OPENAI_API_KEY="$OPENAI_API_KEY" cargo run --release -p quartz -- \
+  --continue-task gpt-5.4 /path/to/session
 ```
 
 The proposal command admits two or three exact UTF-8 files, commits one bounded
@@ -99,3 +103,16 @@ runs at most one correction turn for the selected path. Promotion resolves only
 the current candidate generation through the existing workspace, mutation, and
 retention authorities; it verifies committed bytes after restart before
 recovering all live authority.
+
+The approved-command invocation is the user's exact argv approval; `--` is
+mandatory. Quartz synchronizes a durable start fact, executes that argv once in
+the repository root with a 120-second timeout and 32 KiB stdout/stderr bounds,
+then commits the terminal status and output. A start without a finish
+reconstructs as interrupted/unknown and never runs during resume. A later
+invocation is a separate renewed approval.
+
+Continuation binds the exact command facts and post-command admitted sources
+into one durable model turn. Its strict response is either `PROPOSE
+<admitted-path-index>` followed by complete replacement bytes, or `COMPLETE`
+followed by a bounded summary. Command success alone never completes the task,
+and promotion after a correction resolves only revision 2.

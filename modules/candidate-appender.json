@@ -1,7 +1,7 @@
 {
   "abi": 10,
   "module": "quartz.slice8.candidate-appender",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "execution_mode": "wasm-component",
   "requested_host_capabilities": [
     "resume-snapshot"

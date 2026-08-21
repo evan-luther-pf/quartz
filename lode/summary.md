@@ -164,14 +164,33 @@ and unaffected sibling; ABI 10 promotion retained both exact digests after
 restart and recovered cleanly. The workspace test command passed 78 tests
 across 12 suites. No kernel, WIT, or dependency change was required.
 
+Proposal sessions now extend through one bounded host-approved command and one
+model continuation. The CLI synchronizes exact `CommandStarted` evidence before
+spawning the user-approved argv once, then commits terminal status, bounded
+stdout and stderr, timing, repository identity, and post-command admitted-file
+identity as `CommandFinished`. Restart reconstructs started-only attempts as
+interrupted/unknown and never reruns them. A continuation binds the terminal
+command facts and current source bytes, then accepts only one path-indexed
+complete-file correction or an explicit bounded completion summary. Command
+success alone does not complete the task, and stale proposal generations remain
+non-promotable.
+
+The live correction session then ran the exact user-approved argv `cargo test -p
+quartz --bin quartz` once and committed its successful 26-test output. After a
+process restart, one `gpt-5.4` continuation received those exact facts and
+returned explicit `COMPLETE` with a bounded summary. A later credential-free
+process reconstructed the command and completion without rerunning either
+external operation. The final workspace command passed 85 tests across 12
+suites; kernel source, WIT, and ABI remained unchanged.
+
 ## Next boundary
 
-The correction boundary accepts explicit human feedback but not execution
-evidence. The next production gap is one host-approved, bounded command result
-committed into a subsequent model turn without automatic retry, ambient shell
-authority, or an open-ended tool loop. That boundary should reuse the existing
-explicit argv approval and durable exchange contracts before model-selected
-tools or another kernel capability.
+The bounded production loop deliberately stops after one host-approved command
+and one model decision. Quartz still has no model-selected tools, ambient shell
+authority, autonomous retry, or general multi-turn conversation. Any broader
+agent loop must preserve exact user authority, durable owed-work reconstruction,
+and interrupted/unknown handling rather than bypassing them with an in-process
+tool router.
 
 ## Non-goals
 

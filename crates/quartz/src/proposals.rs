@@ -1,3 +1,4 @@
+use crate::commands::{CommandFinished, RepositoryIdentity};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -12,10 +13,14 @@ pub(crate) const MAX_PROMPT_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_FEEDBACK_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_REVISION_PROMPT_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_CONTINUATION_PROMPT_BYTES: usize = 384 * 1024;
+pub(crate) const MAX_COMPLETION_SUMMARY_BYTES: usize = 4 * 1024;
 
 const REVISION_INSTRUCTIONS: &str = "Revise only the rejected proposal identified below. Return only the required JSON object. The proposal must use the rejected admitted path and matching original before_sha256, and content must be the complete replacement file. Address the exact feedback and change the rejected content. Do not use Markdown fences or commentary.";
 
 const INSTRUCTIONS: &str = "Edit only the admitted files needed for the task. Return only the required JSON object. Every proposal must use one admitted path and matching before_sha256, and content must be the complete replacement file. Return at least two proposals. Do not use Markdown fences or commentary.";
+
+const CONTINUATION_INSTRUCTIONS: &str = "Continue the same repository task from the exact approved-command evidence. Return exactly `PROPOSE <admitted-path-index>\\n<exact complete-file candidate bytes>` or `COMPLETE\\n<bounded final summary>`. PROPOSE may select only an admitted path index and must change the exact post-command source. COMPLETE is valid only when the command succeeded. Do not use Markdown fences or commentary outside the selected grammar.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Admission {
@@ -46,6 +51,33 @@ pub(crate) struct Revision {
     pub(crate) feedback: String,
     pub(crate) admission: Admission,
     pub(crate) rejected: Proposal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProposalGeneration {
+    pub(crate) proposal_index: usize,
+    pub(crate) admitted_path_index: usize,
+    pub(crate) revision: u32,
+    pub(crate) proposal: Proposal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Continuation {
+    pub(crate) model: String,
+    pub(crate) admission: Admission,
+    pub(crate) current: Vec<ProposalGeneration>,
+    pub(crate) command: CommandFinished,
+    pub(crate) sources: Vec<AdmittedFile>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ContinuationResponse {
+    Proposal {
+        admitted_path_index: usize,
+        proposal_index: usize,
+        proposal: Proposal,
+    },
+    Complete(String),
 }
 
 impl Admission {
@@ -423,6 +455,362 @@ impl Revision {
     }
 }
 
+impl Continuation {
+    pub(crate) fn new(
+        model: &str,
+        admission: &Admission,
+        current: &[ProposalGeneration],
+        command: &CommandFinished,
+        repository_root: &Path,
+    ) -> Result<Self, String> {
+        validate_model(model)?;
+        validate_current_generations(admission, current)?;
+        let paths = admission
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        let repository_after = RepositoryIdentity::capture(repository_root, &paths)?;
+        repository_after.require_regular()?;
+        if repository_after != command.repository_after {
+            return Err("repository changed after the approved command finished".into());
+        }
+        let mut sources = Vec::with_capacity(admission.files.len());
+        for admitted in &admission.files {
+            let source = resolve_source(repository_root, &admitted.path)?;
+            let content = fs::read(&source).map_err(|error| {
+                format!("read post-command source `{}`: {error}", admitted.path)
+            })?;
+            validate_source_bytes(&admitted.path, &content)?;
+            sources.push(AdmittedFile {
+                path: admitted.path.clone(),
+                before_sha256: sha256(&content),
+                content,
+            });
+        }
+        let continuation = Self {
+            model: model.to_owned(),
+            admission: admission.clone(),
+            current: current.to_vec(),
+            command: command.clone(),
+            sources,
+        };
+        continuation.prompt_bytes()?;
+        Ok(continuation)
+    }
+
+    pub(crate) fn prompt_bytes(&self) -> Result<Vec<u8>, String> {
+        validate_model(&self.model)?;
+        validate_current_generations(&self.admission, &self.current)?;
+        validate_continuation_sources(&self.admission, &self.command, &self.sources)?;
+        let admitted_sources = self
+            .sources
+            .iter()
+            .enumerate()
+            .map(|(index, source)| {
+                json!({
+                    "admitted_path_index": index,
+                    "path": source.path,
+                    "sha256": source.before_sha256,
+                    "content": std::str::from_utf8(&source.content)
+                        .expect("validated continuation source must remain UTF-8"),
+                })
+            })
+            .collect::<Vec<_>>();
+        let prompt = json!({
+            "schema": 1,
+            "instructions": CONTINUATION_INSTRUCTIONS,
+            "model": self.model,
+            "task": self.admission.task,
+            "admitted_sources": admitted_sources,
+            "current_proposals": continuation_generations(&self.current),
+            "command_finished": self.command.to_value(),
+            "required_response": [
+                "PROPOSE <admitted-path-index>\\n<exact complete-file candidate bytes>",
+                "COMPLETE\\n<bounded final summary>",
+            ],
+        });
+        let bytes = serde_json::to_vec_pretty(&prompt)
+            .map_err(|error| format!("serialize continuation prompt: {error}"))?;
+        if bytes.is_empty() || bytes.len() > MAX_CONTINUATION_PROMPT_BYTES {
+            return Err(format!(
+                "generated continuation prompt must contain 1..={MAX_CONTINUATION_PROMPT_BYTES} bytes"
+            ));
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn from_prompt(
+        prompt: &[u8],
+        admission: &Admission,
+        current: &[ProposalGeneration],
+        command: &CommandFinished,
+    ) -> Result<Self, String> {
+        if prompt.is_empty() || prompt.len() > MAX_CONTINUATION_PROMPT_BYTES {
+            return Err(format!(
+                "durable continuation prompt must contain 1..={MAX_CONTINUATION_PROMPT_BYTES} bytes"
+            ));
+        }
+        let wire: Value = serde_json::from_slice(prompt)
+            .map_err(|error| format!("invalid durable continuation prompt: {error}"))?;
+        let object = exact_object(
+            &wire,
+            &[
+                "schema",
+                "instructions",
+                "model",
+                "task",
+                "admitted_sources",
+                "current_proposals",
+                "command_finished",
+                "required_response",
+            ],
+            "continuation prompt",
+        )?;
+        let required_response = json!([
+            "PROPOSE <admitted-path-index>\\n<exact complete-file candidate bytes>",
+            "COMPLETE\\n<bounded final summary>",
+        ]);
+        if object.get("schema").and_then(Value::as_u64) != Some(1)
+            || string_field(object, "instructions", "continuation prompt")?
+                != CONTINUATION_INSTRUCTIONS
+            || string_field(object, "task", "continuation prompt")? != admission.task
+            || object.get("required_response") != Some(&required_response)
+            || object.get("command_finished") != Some(&command.to_value())
+        {
+            return Err("durable continuation prompt contract changed".into());
+        }
+        let model = string_field(object, "model", "continuation prompt")?.to_owned();
+        validate_model(&model)?;
+        validate_current_generations(admission, current)?;
+        let expected_generations = Value::Array(continuation_generations(current));
+        if object.get("current_proposals") != Some(&expected_generations) {
+            return Err("durable continuation current proposals changed".into());
+        }
+        let admitted_sources = object
+            .get("admitted_sources")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "continuation prompt admitted_sources must be an array".to_owned())?;
+        if admitted_sources.len() != admission.files.len() {
+            return Err("durable continuation admitted source count changed".into());
+        }
+        let mut sources = Vec::with_capacity(admitted_sources.len());
+        for (index, (source_value, admitted)) in
+            admitted_sources.iter().zip(&admission.files).enumerate()
+        {
+            let source = exact_object(
+                source_value,
+                &["admitted_path_index", "path", "sha256", "content"],
+                "continuation admitted source",
+            )?;
+            let admitted_path_index = source
+                .get("admitted_path_index")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| {
+                    "continuation admitted source index must be a non-negative integer".to_owned()
+                })?;
+            let path = string_field(source, "path", "continuation admitted source")?.to_owned();
+            let source_sha256 =
+                string_field(source, "sha256", "continuation admitted source")?.to_owned();
+            let content = string_field(source, "content", "continuation admitted source")?
+                .as_bytes()
+                .to_vec();
+            if admitted_path_index != index
+                || path != admitted.path
+                || source_sha256 != sha256(&content)
+            {
+                return Err("durable continuation admitted source changed".into());
+            }
+            validate_source_bytes(&path, &content)?;
+            sources.push(AdmittedFile {
+                path,
+                before_sha256: source_sha256,
+                content,
+            });
+        }
+        validate_continuation_sources(admission, command, &sources)?;
+        Ok(Self {
+            model,
+            admission: admission.clone(),
+            current: current.to_vec(),
+            command: command.clone(),
+            sources,
+        })
+    }
+}
+
+pub(crate) fn parse_continuation_response(
+    response: &[u8],
+    continuation: &Continuation,
+) -> Result<ContinuationResponse, String> {
+    if response.is_empty() || response.len() > MAX_RESPONSE_BYTES {
+        return Err(format!(
+            "continuation response must contain 1..={MAX_RESPONSE_BYTES} bytes"
+        ));
+    }
+    if let Some(summary) = response.strip_prefix(b"COMPLETE\n") {
+        if !continuation.command.succeeded() {
+            return Err("COMPLETE requires a successful approved command".into());
+        }
+        if summary.is_empty() || summary.len() > MAX_COMPLETION_SUMMARY_BYTES {
+            return Err(format!(
+                "completion summary must contain 1..={MAX_COMPLETION_SUMMARY_BYTES} bytes"
+            ));
+        }
+        let summary = std::str::from_utf8(summary)
+            .map_err(|_| "completion summary is not UTF-8")?
+            .to_owned();
+        if summary.trim().is_empty() {
+            return Err("completion summary cannot be blank".into());
+        }
+        return Ok(ContinuationResponse::Complete(summary));
+    }
+    let remainder = response.strip_prefix(b"PROPOSE ").ok_or_else(|| {
+        "continuation response must start with `PROPOSE ` or `COMPLETE\\n`".to_owned()
+    })?;
+    let newline = remainder
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .ok_or_else(|| "PROPOSE response has no candidate bytes".to_owned())?;
+    let index_bytes = &remainder[..newline];
+    let index_text =
+        std::str::from_utf8(index_bytes).map_err(|_| "PROPOSE path index is not ASCII")?;
+    let admitted_path_index: usize = index_text
+        .parse()
+        .map_err(|_| format!("invalid admitted path index `{index_text}`"))?;
+    if admitted_path_index.to_string() != index_text {
+        return Err("PROPOSE path index is not canonical decimal".into());
+    }
+    let source = continuation
+        .sources
+        .get(admitted_path_index)
+        .ok_or_else(|| format!("admitted path index {admitted_path_index} is absent"))?;
+    let content = remainder[newline + 1..].to_vec();
+    validate_source_bytes(&source.path, &content)?;
+    if content == source.content {
+        return Err(format!(
+            "continued proposal for `{}` does not change the post-command source",
+            source.path
+        ));
+    }
+    let proposal_index = continuation
+        .current
+        .iter()
+        .find(|generation| generation.admitted_path_index == admitted_path_index)
+        .map(|generation| generation.proposal_index)
+        .unwrap_or_else(|| {
+            continuation
+                .current
+                .iter()
+                .map(|generation| generation.proposal_index)
+                .max()
+                .map_or(0, |index| index + 1)
+        });
+    Ok(ContinuationResponse::Proposal {
+        admitted_path_index,
+        proposal_index,
+        proposal: Proposal {
+            path: source.path.clone(),
+            before_sha256: source.before_sha256.clone(),
+            result_sha256: sha256(&content),
+            before: source.content.clone(),
+            content,
+        },
+    })
+}
+
+fn continuation_generations(current: &[ProposalGeneration]) -> Vec<Value> {
+    current
+        .iter()
+        .map(|generation| {
+            json!({
+                "proposal_index": generation.proposal_index,
+                "admitted_path_index": generation.admitted_path_index,
+                "revision": generation.revision,
+                "path": generation.proposal.path,
+                "before_sha256": generation.proposal.before_sha256,
+                "result_sha256": generation.proposal.result_sha256,
+                "content": std::str::from_utf8(&generation.proposal.content)
+                    .expect("validated proposal content must remain UTF-8"),
+            })
+        })
+        .collect()
+}
+
+fn validate_current_generations(
+    admission: &Admission,
+    current: &[ProposalGeneration],
+) -> Result<(), String> {
+    if current.is_empty() {
+        return Err("continuation requires at least one current proposal".into());
+    }
+    let mut proposal_indices = BTreeSet::new();
+    let mut admitted_indices = BTreeSet::new();
+    for generation in current {
+        let admitted = admission
+            .files
+            .get(generation.admitted_path_index)
+            .ok_or_else(|| {
+                format!(
+                    "current proposal {} has an absent admitted path index",
+                    generation.proposal_index
+                )
+            })?;
+        if !proposal_indices.insert(generation.proposal_index)
+            || !admitted_indices.insert(generation.admitted_path_index)
+            || admitted.path != generation.proposal.path
+            || generation.revision > 1
+            || generation.proposal.result_sha256 != sha256(&generation.proposal.content)
+            || generation.proposal.before_sha256 != sha256(&generation.proposal.before)
+        {
+            return Err("current proposal generation identity is invalid".into());
+        }
+        validate_source_bytes(&generation.proposal.path, &generation.proposal.before)?;
+        validate_source_bytes(&generation.proposal.path, &generation.proposal.content)?;
+    }
+    Ok(())
+}
+
+fn validate_continuation_sources(
+    admission: &Admission,
+    command: &CommandFinished,
+    sources: &[AdmittedFile],
+) -> Result<(), String> {
+    if sources.len() != admission.files.len()
+        || command.repository_after.files.len() != admission.files.len()
+    {
+        return Err("continuation admitted source count changed".into());
+    }
+    for ((source, admitted), identity) in sources
+        .iter()
+        .zip(&admission.files)
+        .zip(&command.repository_after.files)
+    {
+        if source.path != admitted.path
+            || source.before_sha256 != sha256(&source.content)
+            || identity.path != source.path
+            || identity.status != "regular"
+            || identity.sha256.as_deref() != Some(&source.before_sha256)
+            || identity.byte_len != u64::try_from(source.content.len()).ok()
+        {
+            return Err("continuation source does not match terminal command evidence".into());
+        }
+        validate_source_bytes(&source.path, &source.content)?;
+    }
+    Ok(())
+}
+
+fn validate_source_bytes(path: &str, content: &[u8]) -> Result<(), String> {
+    if content.is_empty() || content.len() > MAX_SOURCE_BYTES {
+        return Err(format!(
+            "source `{path}` must contain 1..={MAX_SOURCE_BYTES} bytes"
+        ));
+    }
+    std::str::from_utf8(content).map_err(|_| format!("source `{path}` is not UTF-8"))?;
+    Ok(())
+}
+
 fn admitted_files_json(files: &[AdmittedFile]) -> Vec<Value> {
     files
         .iter()
@@ -680,6 +1068,101 @@ pub(crate) fn materialize_revision(
     .map_err(|error| format!("serialize proposal revision metadata: {error}"))?;
     atomic_write(&session.join("revision-1.json"), &metadata)?;
     Ok(candidate)
+}
+
+pub(crate) fn continuation_prompt_path(session: &Path) -> PathBuf {
+    session.join("continuation-1.prompt")
+}
+
+pub(crate) fn continuation_journal_path(session: &Path) -> PathBuf {
+    session.join("continuation-1.qj")
+}
+
+pub(crate) fn continuation_candidate_path(session: &Path, proposal_index: usize) -> PathBuf {
+    session.join(format!("proposal-{proposal_index}.revision-2.candidate"))
+}
+
+pub(crate) fn completion_summary_path(session: &Path) -> PathBuf {
+    session.join("completion-1.txt")
+}
+
+pub(crate) fn materialize_continuation_prompt(
+    session: &Path,
+    prompt: &[u8],
+) -> Result<PathBuf, String> {
+    if prompt.is_empty() || prompt.len() > MAX_CONTINUATION_PROMPT_BYTES {
+        return Err(format!(
+            "continuation prompt must contain 1..={MAX_CONTINUATION_PROMPT_BYTES} bytes"
+        ));
+    }
+    let path = continuation_prompt_path(session);
+    atomic_write(&path, prompt)?;
+    Ok(path)
+}
+
+pub(crate) fn materialize_continuation_response(
+    session: &Path,
+    continuation: &Continuation,
+    response: &ContinuationResponse,
+) -> Result<(), String> {
+    let (metadata, obsolete) = match response {
+        ContinuationResponse::Proposal {
+            admitted_path_index,
+            proposal_index,
+            proposal,
+        } => {
+            let candidate = continuation_candidate_path(session, *proposal_index);
+            atomic_write(&candidate, &proposal.content)?;
+            (
+                json!({
+                    "schema": 1,
+                    "outcome": "proposal",
+                    "model": continuation.model,
+                    "command_attempt": continuation.command.attempt,
+                    "command_started_sha256": continuation.command.command_started_sha256,
+                    "admitted_path_index": admitted_path_index,
+                    "proposal_index": proposal_index,
+                    "revision": 2,
+                    "path": proposal.path,
+                    "before_sha256": proposal.before_sha256,
+                    "result_sha256": proposal.result_sha256,
+                    "candidate": candidate.file_name().expect("candidate file name").to_string_lossy(),
+                }),
+                completion_summary_path(session),
+            )
+        }
+        ContinuationResponse::Complete(summary) => {
+            let path = completion_summary_path(session);
+            atomic_write(&path, summary.as_bytes())?;
+            (
+                json!({
+                    "schema": 1,
+                    "outcome": "complete",
+                    "model": continuation.model,
+                    "command_attempt": continuation.command.attempt,
+                    "command_started_sha256": continuation.command.command_started_sha256,
+                    "summary_sha256": sha256(summary.as_bytes()),
+                    "summary": path.file_name().expect("summary file name").to_string_lossy(),
+                }),
+                continuation
+                    .current
+                    .iter()
+                    .map(|generation| {
+                        continuation_candidate_path(session, generation.proposal_index)
+                    })
+                    .find(|path| path.exists())
+                    .unwrap_or_else(|| session.join("no-continuation-candidate")),
+            )
+        }
+    };
+    if obsolete.exists() {
+        fs::remove_file(&obsolete)
+            .map_err(|error| format!("remove obsolete cache `{}`: {error}", obsolete.display()))?;
+    }
+    let metadata = serde_json::to_vec_pretty(&metadata)
+        .map_err(|error| format!("serialize continuation metadata: {error}"))?;
+    atomic_write(&session.join("continuation-1.json"), &metadata)?;
+    Ok(())
 }
 
 pub(crate) fn resolve_source(repository_root: &Path, path: &str) -> Result<PathBuf, String> {
@@ -986,6 +1469,99 @@ mod tests {
         );
         assert!(Admission::from_files(&repository, &task, &[source, outside]).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_command_accepts_only_a_corrected_proposal() {
+        let (root, continuation) = fixture_continuation(7);
+        let prompt = continuation.prompt_bytes().unwrap();
+        assert_eq!(
+            Continuation::from_prompt(
+                &prompt,
+                &continuation.admission,
+                &continuation.current,
+                &continuation.command,
+            )
+            .unwrap(),
+            continuation
+        );
+        assert!(parse_continuation_response(b"COMPLETE\nTests passed.", &continuation).is_err());
+        let response =
+            parse_continuation_response(b"PROPOSE 1\nbeta corrected\n", &continuation).unwrap();
+        let ContinuationResponse::Proposal {
+            admitted_path_index,
+            proposal_index,
+            proposal,
+        } = response
+        else {
+            panic!("expected corrected proposal");
+        };
+        assert_eq!(admitted_path_index, 1);
+        assert_eq!(proposal_index, 1);
+        assert_eq!(proposal.before, b"beta revised\n");
+        assert_eq!(proposal.content, b"beta corrected\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn successful_command_requires_explicit_strict_complete_grammar() {
+        let (root, continuation) = fixture_continuation(0);
+        assert_eq!(
+            parse_continuation_response(b"COMPLETE\nAll checks passed.", &continuation).unwrap(),
+            ContinuationResponse::Complete("All checks passed.".into())
+        );
+        for invalid in [
+            &b"COMPLETE"[..],
+            &b"complete\nAll checks passed."[..],
+            &b"COMPLETE\n   "[..],
+            &b"PROPOSE 01\nchanged\n"[..],
+            &b"PROPOSE 2\nchanged\n"[..],
+            &b"PROPOSE 0\nalpha revised\n"[..],
+        ] {
+            assert!(parse_continuation_response(invalid, &continuation).is_err());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn fixture_continuation(exit_code: i32) -> (PathBuf, Continuation) {
+        let root = temporary_directory("continuation");
+        fs::create_dir_all(root.join("lode")).unwrap();
+        fs::write(root.join("README.md"), b"alpha revised\n").unwrap();
+        fs::write(root.join("lode/summary.md"), b"beta revised\n").unwrap();
+        let admission = fixture_admission();
+        let proposals = fixture_proposals(&admission);
+        let current = proposals
+            .into_iter()
+            .enumerate()
+            .map(|(index, proposal)| ProposalGeneration {
+                proposal_index: index,
+                admitted_path_index: index,
+                revision: 0,
+                proposal,
+            })
+            .collect::<Vec<_>>();
+        let paths = admission
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        let started = crate::commands::CommandStarted::new(
+            1,
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("printf command-result; exit {exit_code}"),
+            ],
+            &root,
+            &paths,
+        )
+        .unwrap();
+        let execution = crate::commands::execute(&started);
+        let after = RepositoryIdentity::capture(&root, &paths).unwrap();
+        let command = CommandFinished::new(&started, execution, after).unwrap();
+        let continuation =
+            Continuation::new("test-model", &admission, &current, &command, &root).unwrap();
+        (root, continuation)
     }
 
     fn fixture_admission() -> Admission {
