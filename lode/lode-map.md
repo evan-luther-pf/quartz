@@ -27,6 +27,8 @@
   host-selected source.
 - `capabilities/durable-edit-promotion.md` — separate durable retention
   authority, restoration ownership transfer, and restart-safe promoted bytes.
+- `capabilities/dogfood-repository-task.md` — end-to-end credentialed edits,
+  explicit review and promotion, and approved post-edit command evidence.
 
 ## Research
 

@@ -113,13 +113,23 @@ workspace buffers or approvals, restoration or promoted-verification effects,
 or live payload-read authority or module artifacts. Durable journal, event,
 candidate, exchange, and mutation-ledger records remain honestly external.
 
+The first dogfood repository task now crosses those boundaries without ABI or
+kernel changes. Credentialed production turns inspected the two package
+manifests and produced exact candidates adding `publish = false`. Review
+rejected candidates that also removed a final newline; corrected candidates
+were separately approved and durably promoted through existing workspace
+grants. The approved argv `["cargo", "test", "--workspace", "--all-targets"]`
+then passed all 62 contracts from the repository root. Its bounded exact result
+became a durable production-turn prompt and the model classified it as passed.
+No command runner, validation ledger, recorder component, retry protocol, or
+security-sandbox claim was added.
+
 ## Next boundary
 
-Controlled validation of a reviewed candidate is next: host-admitted build and
-test commands produce bounded durable evidence without publishing source
-changes. Reviewable diff production follows that evidence boundary. Atomic
-multi-file repository transactions remain later work. The credentialed OpenAI
-smoke remains an explicit open gate when `OPENAI_API_KEY` is unavailable.
+The dogfood run exposed orchestration, not validation transactions, as the next
+product gap: a production agent component still cannot choose among admitted
+repository reads or return multiple path-bound proposals in one resumable turn.
+That path should be exercised before introducing another kernel capability.
 
 ## Non-goals
 
