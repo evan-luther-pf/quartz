@@ -193,6 +193,33 @@ Snapshot access and event-stream registration are reversible capabilities.
 Committed payload facts are withheld external emissions: recovery closes live
 authority and clears pending work but does not claim to erase durable evidence.
 
+## Bounded exchange boundary
+
+Slice 6 admits one explicit host exchange adapter without exposing ambient
+network, credentials, endpoints, or environment access to guest modules. An
+exchange grant binds the adapter identity, durable ledger path, request and
+response byte limits, and timeout. The provider opens that grant as a
+component-owned activation effect and can invoke it only while its callable
+export is running against a committed event payload.
+
+The exchange ledger uses Quartz's bounded, checksummed framing. It synchronizes
+the stable invocation and request digest before external emission. A synchronized
+success retains normalized response bytes, provenance, usage, and digest and can
+be replayed without another emission. A started-only record, timeout, or
+transport-ambiguous terminal is never retried. Invocation reuse with different
+request bytes fails closed.
+
+Provider callable dispatch remains synchronous. The dispatcher releases its core
+borrow, marks exactly one provider in flight, and permits only that provider's
+declared event-read and exchange imports; concurrent or nested invocation fails
+closed. Exchange output is staged on the active provider fiber, transferred to a
+consumer only through its committed callable view, and attached to a durable
+event through the existing transactional outbox. A host deadline records an
+ambiguous terminal result without waiting indefinitely; if the adapter worker
+is still finishing, exchange recovery joins it before reporting a clean
+context. Recovery closes the ledger and clears staged authority. Ledger records,
+transmitted input, remote compute, and billing remain honestly external.
+
 ## Self-modification
 
 The authoritative state is a declarative component tree. A running component—including the agent—may propose a tree patch through a governed composition capability. Reconciliation turns the accepted patch into fiber insertions, updates, disablement, and removal. Source changes become new module artifacts; the loader stages the artifact, reconstructs affected fibers, and rolls back to the previous artifact if activation fails.

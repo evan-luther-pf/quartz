@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -6,9 +7,8 @@ use std::{
     path::PathBuf,
     rc::{Rc, Weak},
     sync::Arc,
+    time::Duration,
 };
-
-use serde::{Deserialize, Serialize};
 use wasmtime::{
     Store, StoreContextMut,
     component::{Instance, Linker, TypedFunc},
@@ -17,8 +17,9 @@ use wasmtime::{
 use crate::{
     BindingKind, Error, HostCapability, InterfaceId, Result,
     journal::{
-        DurablePayload, EventFact, EventGrant, EventRecord, EventStream, Journal, JournalEffect,
-        JournalSnapshot, SnapshotGrant, sha256_hex,
+        DurablePayload, EventFact, EventGrant, EventRecord, EventStream, ExchangeLedger,
+        ExchangeLedgerFailure, ExchangeLedgerOutcome, Journal, JournalEffect, JournalSnapshot,
+        SnapshotGrant, sha256_hex,
     },
     module::{Artifact, ModuleLoader},
 };
@@ -32,6 +33,7 @@ const STATUS_COLLISION: i32 = 6;
 const STATUS_DENIED: i32 = 7;
 const STATUS_STALE: i32 = 8;
 const STATUS_BUSY: i32 = 9;
+const STATUS_AMBIGUOUS: i32 = 10;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FiberId(pub u64);
@@ -49,6 +51,59 @@ pub struct ComponentSpec {
     pub event_stream_paths: Vec<PathBuf>,
     pub event_grants: Vec<EventGrant>,
     pub snapshot_grants: Vec<SnapshotGrant>,
+    pub exchange_grants: Vec<ExchangeGrant>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExchangeGrant {
+    pub adapter: String,
+    pub ledger_path: PathBuf,
+    pub max_request_bytes: usize,
+    pub max_response_bytes: usize,
+    pub timeout_ms: u64,
+}
+
+impl ExchangeGrant {
+    pub fn new(
+        adapter: impl Into<String>,
+        ledger_path: impl Into<PathBuf>,
+        max_request_bytes: usize,
+        max_response_bytes: usize,
+        timeout_ms: u64,
+    ) -> Self {
+        Self {
+            adapter: adapter.into(),
+            ledger_path: ledger_path.into(),
+            max_request_bytes,
+            max_response_bytes,
+            timeout_ms,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExchangeResponse {
+    pub provenance: String,
+    pub bytes: Vec<u8>,
+    pub usage: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExchangeFailure {
+    Rejected,
+    Ambiguous,
+}
+
+pub trait ExchangeAdapter: Send + Sync {
+    fn identity(&self) -> &str;
+
+    fn exchange(
+        &self,
+        request: &[u8],
+        timeout: Duration,
+        max_response_bytes: usize,
+    ) -> std::result::Result<ExchangeResponse, ExchangeFailure>;
 }
 
 impl ComponentSpec {
@@ -64,6 +119,7 @@ impl ComponentSpec {
             event_stream_paths: Vec::new(),
             event_grants: Vec::new(),
             snapshot_grants: Vec::new(),
+            exchange_grants: Vec::new(),
         }
     }
 
@@ -104,6 +160,11 @@ impl ComponentSpec {
 
     pub fn with_snapshot_grants(mut self, grants: Vec<SnapshotGrant>) -> Self {
         self.snapshot_grants = grants;
+        self
+    }
+
+    pub fn with_exchange_grants(mut self, grants: Vec<ExchangeGrant>) -> Self {
+        self.exchange_grants = grants;
         self
     }
 }
@@ -172,6 +233,7 @@ pub struct Limits {
     pub max_payload_records: usize,
     pub max_payload_bytes: usize,
     pub max_payload_total_bytes: usize,
+    pub max_exchange_record_bytes: usize,
 }
 
 impl Default for Limits {
@@ -189,6 +251,7 @@ impl Default for Limits {
             max_payload_records: 64,
             max_payload_bytes: 64 * 1024,
             max_payload_total_bytes: 512 * 1024,
+            max_exchange_record_bytes: 128 * 1024,
         }
     }
 }
@@ -303,6 +366,8 @@ pub struct ContextObservation {
     pub pending_events: usize,
     pub staged_events: usize,
     pub event_stream_registrations: usize,
+    pub exchange_registrations: usize,
+    pub exchange_workers: usize,
 }
 
 pub struct Runtime {
@@ -325,6 +390,7 @@ struct PreparedSpec {
     event_stream_paths: Vec<PathBuf>,
     event_grants: Vec<EventGrant>,
     snapshots: Vec<PreparedSnapshot>,
+    exchange_grants: Vec<ExchangeGrant>,
 }
 
 #[derive(Clone)]
@@ -379,6 +445,13 @@ struct PatchAuthorization {
     base_revision: u64,
 }
 
+#[derive(Clone, Copy)]
+enum EventPayloadSource {
+    None,
+    Snapshot(u64),
+    Exchange,
+}
+
 struct JournalRegistration {
     owner: FiberId,
     journal: Journal,
@@ -387,6 +460,12 @@ struct JournalRegistration {
 struct EventStreamRegistration {
     owner: FiberId,
     stream: EventStream,
+}
+
+struct ExchangeRegistration {
+    owner: FiberId,
+    grant: ExchangeGrant,
+    ledger: ExchangeLedger,
 }
 
 struct CommitFailure {
@@ -408,6 +487,7 @@ struct Core {
     patch_owners: BTreeMap<String, FiberId>,
     pending_patches: VecDeque<PendingPatch>,
     blocked_recovery: BTreeSet<FiberId>,
+    invoking: BTreeSet<FiberId>,
     pending_events: VecDeque<PendingEvent>,
     event_outbox: Vec<EventFact>,
     next_event_id: u64,
@@ -416,6 +496,10 @@ struct Core {
     journal_failure: Option<Error>,
     event_stream: Option<EventStreamRegistration>,
     event_failure: Option<Error>,
+    exchange: Option<ExchangeRegistration>,
+    exchange_adapter: Option<Arc<dyn ExchangeAdapter>>,
+    exchange_failure: Option<Error>,
+    exchange_workers: Vec<std::thread::JoinHandle<()>>,
     replaying: bool,
 }
 
@@ -433,6 +517,9 @@ struct Fiber {
     activation_steps: u32,
     outcome: Option<String>,
     patch_authorization: Option<PatchAuthorization>,
+    staged_response: Option<DurablePayload>,
+    staged_usage: Option<u64>,
+    inbound_response: Option<DurablePayload>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -490,6 +577,9 @@ enum Inverse {
     CloseEventStream {
         effect: u64,
     },
+    CloseExchange {
+        effect: u64,
+    },
 }
 
 impl Inverse {
@@ -500,7 +590,8 @@ impl Inverse {
             | Self::RetireChild { effect, .. }
             | Self::RestoreComposition { effect, .. }
             | Self::CloseJournal { effect }
-            | Self::CloseEventStream { effect } => *effect,
+            | Self::CloseEventStream { effect }
+            | Self::CloseExchange { effect } => *effect,
         }
     }
 
@@ -512,6 +603,7 @@ impl Inverse {
             Self::RestoreComposition { .. } => "composition",
             Self::CloseJournal { .. } => "composition-journal",
             Self::CloseEventStream { .. } => "event-stream",
+            Self::CloseExchange { .. } => "exchange-ledger",
         }
     }
 }
@@ -544,10 +636,33 @@ impl Runtime {
         })
     }
 
+    pub fn new_with_exchange(limits: Limits, adapter: Arc<dyn ExchangeAdapter>) -> Result<Self> {
+        let runtime = Self::new(limits)?;
+        runtime.core.borrow_mut().exchange_adapter = Some(adapter);
+        Ok(runtime)
+    }
     pub fn open_persistent(limits: Limits, journal_component: ComponentSpec) -> Result<Self> {
+        Self::open_persistent_inner(limits, journal_component, None)
+    }
+
+    pub fn open_persistent_with_exchange(
+        limits: Limits,
+        journal_component: ComponentSpec,
+        adapter: Arc<dyn ExchangeAdapter>,
+    ) -> Result<Self> {
+        Self::open_persistent_inner(limits, journal_component, Some(adapter))
+    }
+
+    fn open_persistent_inner(
+        limits: Limits,
+        journal_component: ComponentSpec,
+        adapter: Option<Arc<dyn ExchangeAdapter>>,
+    ) -> Result<Self> {
         if journal_component.journal_paths.len() != 1
             || journal_component.event_stream_paths.len() > 1
             || !journal_component.event_grants.is_empty()
+            || !journal_component.snapshot_grants.is_empty()
+            || !journal_component.exchange_grants.is_empty()
             || !journal_component.children.is_empty()
             || !journal_component.patches.is_empty()
         {
@@ -557,7 +672,10 @@ impl Runtime {
         }
         let journal_root = journal_component.entry.clone();
         let expects_events = !journal_component.event_stream_paths.is_empty();
-        let mut runtime = Self::new(limits)?;
+        let mut runtime = match adapter {
+            Some(adapter) => Self::new_with_exchange(limits, adapter)?,
+            None => Self::new(limits)?,
+        };
         runtime.persistent_root = Some(journal_root.clone());
         let bootstrap = runtime.prepare_tree(ComponentTree {
             roots: vec![journal_component],
@@ -1348,6 +1466,8 @@ impl Runtime {
             pending_events: core.pending_events.len(),
             staged_events: core.event_outbox.len(),
             event_stream_registrations: usize::from(core.event_stream.is_some()),
+            exchange_registrations: usize::from(core.exchange.is_some()),
+            exchange_workers: core.exchange_workers.len(),
         }
     }
 
@@ -1424,14 +1544,15 @@ impl Runtime {
         let requests_append = artifact.manifest.requests(HostCapability::AppendEvent);
         let requests_resume = artifact.manifest.requests(HostCapability::ResumeEvent);
         let requests_resume_snapshot = artifact.manifest.requests(HostCapability::ResumeSnapshot);
-        if requests_append && (requests_resume || requests_resume_snapshot) {
+        let requests_resume_exchange = artifact.manifest.requests(HostCapability::ResumeExchange);
+        let requests_replay_append =
+            requests_resume || requests_resume_snapshot || requests_resume_exchange;
+        if requests_append && requests_replay_append {
             return Err(Error::Manifest(format!(
                 "component `{path}` cannot mix ordinary and replay-aware event append authority"
             )));
         }
-        if (requests_append || requests_resume || requests_resume_snapshot)
-            != !spec.event_grants.is_empty()
-        {
+        if (requests_append || requests_replay_append) != !spec.event_grants.is_empty() {
             return Err(Error::Manifest(format!(
                 "component `{path}` must pair event append authority with admitted event grants"
             )));
@@ -1455,6 +1576,28 @@ impl Runtime {
             return Err(Error::Manifest(format!(
                 "component `{path}` must pair snapshot authority with admitted snapshot grants"
             )));
+        }
+        let requests_open_exchange = artifact.manifest.requests(HostCapability::OpenExchange);
+        let requests_exchange = artifact.manifest.requests(HostCapability::Exchange);
+        if (requests_open_exchange || requests_exchange) != !spec.exchange_grants.is_empty()
+            || requests_open_exchange != requests_exchange
+        {
+            return Err(Error::Manifest(format!(
+                "component `{path}` must pair open-exchange and exchange authority with admitted grants"
+            )));
+        }
+        let mut exchange_identities = BTreeSet::new();
+        for grant in &spec.exchange_grants {
+            if grant.adapter.is_empty()
+                || grant.max_request_bytes == 0
+                || grant.max_response_bytes == 0
+                || grant.timeout_ms == 0
+                || !exchange_identities.insert(grant.adapter.clone())
+            {
+                return Err(Error::Manifest(format!(
+                    "component `{path}` has an invalid or duplicate exchange grant"
+                )));
+            }
         }
         let snapshots = self.prepare_snapshots(path, &spec.snapshot_grants)?;
         if artifact.manifest.component.max_activation_steps > self.limits.max_activation_steps {
@@ -1485,6 +1628,7 @@ impl Runtime {
             event_stream_paths: spec.event_stream_paths,
             event_grants: spec.event_grants,
             snapshots,
+            exchange_grants: spec.exchange_grants,
         })
     }
 
@@ -2223,6 +2367,9 @@ impl Runtime {
                         .get_mut(&fiber)
                         .ok_or_else(|| Error::Invariant("unloading fiber disappeared".into()))?;
                     fiber_record.committed.clear();
+                    fiber_record.staged_response = None;
+                    fiber_record.staged_usage = None;
+                    fiber_record.inbound_response = None;
                     let path = fiber_record.path.clone();
                     if let Some(error) = failed {
                         fiber_record.state = InternalState::Failed;
@@ -2553,6 +2700,7 @@ impl Core {
             composition_revision: 0,
             fibers: BTreeMap::new(),
             blocked_recovery: BTreeSet::new(),
+            invoking: BTreeSet::new(),
             roots: BTreeMap::new(),
             registrations: BTreeMap::new(),
             state_cells: BTreeMap::new(),
@@ -2567,6 +2715,10 @@ impl Core {
             journal_failure: None,
             event_stream: None,
             event_failure: None,
+            exchange: None,
+            exchange_adapter: None,
+            exchange_failure: None,
+            exchange_workers: Vec::new(),
             replaying: false,
         }
     }
@@ -2704,6 +2856,19 @@ impl Core {
                     ));
                 }
             }
+            Inverse::CloseExchange { .. } => {
+                let registration = self.exchange.take().ok_or_else(|| {
+                    Error::Invariant("exchange inverse found no registered ledger".into())
+                })?;
+                if registration.owner != fiber_id {
+                    return Err(Error::Invariant(
+                        "exchange inverse targeted another provider".into(),
+                    ));
+                }
+                for worker in self.exchange_workers.drain(..) {
+                    let _ = worker.join();
+                }
+            }
         }
         self.trace.push(TraceEvent::EffectRecovered {
             fiber: fiber_id,
@@ -2720,6 +2885,7 @@ impl Core {
             .ok_or_else(|| Error::Invariant("removed fiber does not exist".into()))?;
         if !fiber.accumulator.is_empty()
             || fiber.instance.is_some()
+            || self.invoking.contains(&id)
             || self.state_cells.keys().any(|(owner, _)| *owner == id)
             || self.bindings.values().any(|binding| binding.fiber == id)
             || self.patch_owners.values().any(|owner| *owner == id)
@@ -2739,6 +2905,13 @@ impl Core {
                 .event_stream
                 .as_ref()
                 .is_some_and(|stream| stream.owner == id)
+            || self
+                .exchange
+                .as_ref()
+                .is_some_and(|exchange| exchange.owner == id)
+            || fiber.staged_response.is_some()
+            || fiber.staged_usage.is_some()
+            || fiber.inbound_response.is_some()
         {
             return Err(Error::Invariant(
                 "removed fiber retained context effects".into(),
@@ -2956,79 +3129,6 @@ impl Core {
             kind: "callable-coeffect".into(),
         });
         STATUS_OK
-    }
-
-    fn host_invoke(
-        &mut self,
-        caller: FiberId,
-        slot: u64,
-        operation: u64,
-        arg0: u64,
-        arg1: u64,
-    ) -> i64 {
-        let Some(caller_record) = self.fibers.get(&caller) else {
-            return -(STATUS_INVALID as i64);
-        };
-        if caller_record.state != InternalState::Activating
-            || !caller_record
-                .spec
-                .artifact
-                .manifest
-                .requests(HostCapability::Invoke)
-        {
-            return -(STATUS_UNDECLARED as i64);
-        }
-        let Some(committed) = caller_record.committed.get(&slot).cloned() else {
-            return -(STATUS_UNSATISFIED as i64);
-        };
-        if committed.interface.kind != BindingKind::Callable {
-            return -(STATUS_UNDECLARED as i64);
-        }
-        let Some(binding) = self.bindings.get(&committed.interface) else {
-            return -(STATUS_UNSATISFIED as i64);
-        };
-        if binding.fiber != committed.fiber || binding.kind != BindingKind::Callable {
-            return -(STATUS_UNSATISFIED as i64);
-        }
-        let provider = committed.fiber;
-        let Some(mut instance) = self.fibers.get_mut(&provider).and_then(|record| {
-            (record.state == InternalState::Active)
-                .then(|| record.instance.take())
-                .flatten()
-        }) else {
-            return -(STATUS_UNSATISFIED as i64);
-        };
-        let result = instance
-            .invoke
-            .call(
-                &mut instance.store,
-                (instance.instance_id, operation, arg0, arg1),
-            )
-            .map(|result| result.0)
-            .unwrap_or(-(STATUS_INVALID as i64));
-        if let Some(record) = self.fibers.get_mut(&provider) {
-            record.instance = Some(instance);
-        } else {
-            return -(STATUS_INVALID as i64);
-        }
-        if result == 1
-            && operation == 1
-            && committed.interface.namespace == "quartz.composition"
-            && committed.interface.interface == "patch-authority"
-            && committed.interface.revision == 1
-        {
-            let Ok(index) = usize::try_from(arg0) else {
-                return -(STATUS_INVALID as i64);
-            };
-            if let Some(record) = self.fibers.get_mut(&caller) {
-                record.patch_authorization = Some(PatchAuthorization {
-                    provider,
-                    index,
-                    base_revision: arg1,
-                });
-            }
-        }
-        result
     }
 
     fn host_apply_patch(&mut self, actor: FiberId, index: u64, base_revision: u64) -> i32 {
@@ -3284,13 +3384,246 @@ impl Core {
         STATUS_OK
     }
 
+    fn host_open_exchange(&mut self, fiber: FiberId, index: u64) -> i32 {
+        let Ok(index) = usize::try_from(index) else {
+            return STATUS_INVALID;
+        };
+        let grant = {
+            let Some(record) = self.fibers.get(&fiber) else {
+                return STATUS_INVALID;
+            };
+            if record.state != InternalState::Activating
+                || !record
+                    .spec
+                    .artifact
+                    .manifest
+                    .requests(HostCapability::OpenExchange)
+            {
+                return STATUS_UNDECLARED;
+            }
+            let Some(grant) = record.spec.exchange_grants.get(index) else {
+                return STATUS_UNDECLARED;
+            };
+            grant.clone()
+        };
+        let Some(adapter) = self.exchange_adapter.as_ref() else {
+            return STATUS_DENIED;
+        };
+        if adapter.identity() != grant.adapter {
+            return STATUS_DENIED;
+        }
+        if self.exchange.is_some() {
+            return STATUS_COLLISION;
+        }
+        let ledger =
+            match ExchangeLedger::open(&grant.ledger_path, self.limits.max_exchange_record_bytes) {
+                Ok(ledger) => ledger,
+                Err(error) => {
+                    self.exchange_failure = Some(error);
+                    return STATUS_INVALID;
+                }
+            };
+        let effect = self.allocate_effect();
+        self.exchange = Some(ExchangeRegistration {
+            owner: fiber,
+            grant,
+            ledger,
+        });
+        self.fibers
+            .get_mut(&fiber)
+            .expect("exchange fiber checked above")
+            .accumulator
+            .push(Inverse::CloseExchange { effect });
+        self.trace.push(TraceEvent::EffectApplied {
+            fiber,
+            effect,
+            kind: "exchange-ledger".into(),
+        });
+        STATUS_OK
+    }
+
+    fn host_exchange(&mut self, fiber: FiberId, event_index: u64, invocation: u64) -> i64 {
+        if invocation == 0 {
+            return -(STATUS_INVALID as i64);
+        }
+        let Ok(event_index) = usize::try_from(event_index) else {
+            return -(STATUS_INVALID as i64);
+        };
+        let (request, request_sha256, grant, adapter) = {
+            let Some(record) = self.fibers.get(&fiber) else {
+                return -(STATUS_INVALID as i64);
+            };
+            if !matches!(
+                record.state,
+                InternalState::Activating | InternalState::Active
+            ) || (record.state == InternalState::Active && !self.invoking.contains(&fiber))
+                || !record
+                    .spec
+                    .artifact
+                    .manifest
+                    .requests(HostCapability::Exchange)
+            {
+                return -(STATUS_UNDECLARED as i64);
+            }
+            let Some(registration) = self.exchange.as_ref() else {
+                return -(STATUS_UNSATISFIED as i64);
+            };
+            if registration.owner != fiber {
+                return -(STATUS_DENIED as i64);
+            }
+            let Some(stream) = self.event_stream.as_ref() else {
+                return -(STATUS_UNSATISFIED as i64);
+            };
+            if record
+                .committed
+                .values()
+                .all(|provider| provider.fiber != stream.owner)
+            {
+                return -(STATUS_UNSATISFIED as i64);
+            }
+            let Some(payload) = stream
+                .stream
+                .records()
+                .get(event_index)
+                .and_then(|event| event.payload.as_ref())
+            else {
+                return -(STATUS_INVALID as i64);
+            };
+            if payload.bytes.is_empty()
+                || payload.bytes.len() > registration.grant.max_request_bytes
+                || std::str::from_utf8(&payload.bytes).is_err()
+            {
+                return -(STATUS_LIMIT as i64);
+            }
+            let Some(adapter) = self.exchange_adapter.clone() else {
+                return -(STATUS_DENIED as i64);
+            };
+            (
+                payload.bytes.clone(),
+                sha256_hex(&payload.bytes),
+                registration.grant.clone(),
+                adapter,
+            )
+        };
+
+        let recovered = {
+            let registration = self
+                .exchange
+                .as_ref()
+                .expect("exchange registration checked above");
+            match registration.ledger.outcome(invocation, &request_sha256) {
+                Ok(outcome) => outcome.cloned(),
+                Err(error) => {
+                    self.exchange_failure = Some(error);
+                    return -(STATUS_INVALID as i64);
+                }
+            }
+        };
+        if let Some(outcome) = recovered {
+            return self.stage_exchange_outcome(fiber, outcome);
+        }
+        let mut running = Vec::new();
+        for worker in self.exchange_workers.drain(..) {
+            if worker.is_finished() {
+                let _ = worker.join();
+            } else {
+                running.push(worker);
+            }
+        }
+        self.exchange_workers = running;
+        if !self.exchange_workers.is_empty() {
+            return -(STATUS_AMBIGUOUS as i64);
+        }
+        if let Err(error) = self
+            .exchange
+            .as_mut()
+            .expect("exchange registration checked above")
+            .ledger
+            .append_started(invocation, request_sha256.clone())
+        {
+            self.exchange_failure = Some(error);
+            return -(STATUS_INVALID as i64);
+        }
+
+        let timeout = Duration::from_millis(grant.timeout_ms);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let adapter_request = request.clone();
+        let worker = std::thread::spawn(move || {
+            let result = adapter.exchange(&adapter_request, timeout, grant.max_response_bytes);
+            let _ = sender.send(result);
+        });
+        let received = receiver.recv_timeout(timeout);
+        if matches!(received, Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
+            self.exchange_workers.push(worker);
+        } else {
+            let _ = worker.join();
+        }
+        let outcome = match received {
+            Ok(Ok(response))
+                if !response.bytes.is_empty()
+                    && response.bytes.len() <= grant.max_response_bytes
+                    && response.usage <= i64::MAX as u64
+                    && !response.provenance.is_empty()
+                    && std::str::from_utf8(&response.bytes).is_ok() =>
+            {
+                ExchangeLedgerOutcome::Succeeded {
+                    payload: DurablePayload {
+                        provenance: response.provenance,
+                        sha256: sha256_hex(&response.bytes),
+                        bytes: response.bytes,
+                    },
+                    usage: response.usage,
+                }
+            }
+            Ok(Ok(_)) => ExchangeLedgerOutcome::Failed {
+                failure: ExchangeLedgerFailure::Limit,
+            },
+            Ok(Err(ExchangeFailure::Rejected)) => ExchangeLedgerOutcome::Failed {
+                failure: ExchangeLedgerFailure::Rejected,
+            },
+            Ok(Err(ExchangeFailure::Ambiguous))
+            | Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                ExchangeLedgerOutcome::Failed {
+                    failure: ExchangeLedgerFailure::Ambiguous,
+                }
+            }
+        };
+        if let Err(error) = self
+            .exchange
+            .as_mut()
+            .expect("exchange registration checked above")
+            .ledger
+            .append_terminal(invocation, request_sha256, outcome.clone())
+        {
+            self.exchange_failure = Some(error);
+            return -(STATUS_AMBIGUOUS as i64);
+        }
+        self.stage_exchange_outcome(fiber, outcome)
+    }
+
+    fn stage_exchange_outcome(&mut self, fiber: FiberId, outcome: ExchangeLedgerOutcome) -> i64 {
+        match outcome {
+            ExchangeLedgerOutcome::Started => -(STATUS_AMBIGUOUS as i64),
+            ExchangeLedgerOutcome::Succeeded { payload, usage } => {
+                let Some(record) = self.fibers.get_mut(&fiber) else {
+                    return -(STATUS_INVALID as i64);
+                };
+                record.staged_response = Some(payload);
+                record.staged_usage = Some(usage);
+                usage as i64
+            }
+            ExchangeLedgerOutcome::Failed { .. } => -(STATUS_AMBIGUOUS as i64),
+        }
+    }
+
     fn host_append_event(
         &mut self,
         fiber: FiberId,
         index: u64,
         value: u64,
         resumable: bool,
-        snapshot_index: Option<u64>,
+        payload_source: EventPayloadSource,
     ) -> i32 {
         if value > i64::MAX as u64 {
             return STATUS_INVALID;
@@ -3302,12 +3635,11 @@ impl Core {
             let Some(record) = self.fibers.get(&fiber) else {
                 return STATUS_INVALID;
             };
-            let capability = if snapshot_index.is_some() {
-                HostCapability::ResumeSnapshot
-            } else if resumable {
-                HostCapability::ResumeEvent
-            } else {
-                HostCapability::AppendEvent
+            let capability = match payload_source {
+                EventPayloadSource::None if resumable => HostCapability::ResumeEvent,
+                EventPayloadSource::None => HostCapability::AppendEvent,
+                EventPayloadSource::Snapshot(_) => HostCapability::ResumeSnapshot,
+                EventPayloadSource::Exchange => HostCapability::ResumeExchange,
             };
             if record.state != InternalState::Activating
                 || !record.spec.artifact.manifest.requests(capability)
@@ -3327,20 +3659,27 @@ impl Core {
             {
                 return STATUS_UNSATISFIED;
             }
-            let payload = if let Some(snapshot_index) = snapshot_index {
-                let Ok(snapshot_index) = usize::try_from(snapshot_index) else {
-                    return STATUS_INVALID;
-                };
-                let Some(snapshot) = record.spec.snapshots.get(snapshot_index) else {
-                    return STATUS_UNDECLARED;
-                };
-                Some(DurablePayload {
-                    provenance: snapshot.grant.provenance.clone(),
-                    sha256: snapshot.grant.sha256.clone(),
-                    bytes: snapshot.bytes.to_vec(),
-                })
-            } else {
-                None
+            let payload = match payload_source {
+                EventPayloadSource::None => None,
+                EventPayloadSource::Snapshot(snapshot_index) => {
+                    let Ok(snapshot_index) = usize::try_from(snapshot_index) else {
+                        return STATUS_INVALID;
+                    };
+                    let Some(snapshot) = record.spec.snapshots.get(snapshot_index) else {
+                        return STATUS_UNDECLARED;
+                    };
+                    Some(DurablePayload {
+                        provenance: snapshot.grant.provenance.clone(),
+                        sha256: snapshot.grant.sha256.clone(),
+                        bytes: snapshot.bytes.to_vec(),
+                    })
+                }
+                EventPayloadSource::Exchange => {
+                    let Some(payload) = record.inbound_response.clone() else {
+                        return STATUS_UNSATISFIED;
+                    };
+                    Some(payload)
+                }
             };
             (record.path.clone(), grant.clone(), payload)
         };
@@ -3393,6 +3732,11 @@ impl Core {
             value,
             payload,
         });
+        if matches!(payload_source, EventPayloadSource::Exchange)
+            && let Some(record) = self.fibers.get_mut(&fiber)
+        {
+            record.inbound_response = None;
+        }
         STATUS_OK
     }
 
@@ -3452,7 +3796,10 @@ impl Core {
         let Some(stream) = self.event_stream.as_ref() else {
             return -(STATUS_UNSATISFIED as i64);
         };
-        if record.state != InternalState::Activating
+        if !matches!(
+            record.state,
+            InternalState::Activating | InternalState::Active
+        ) || (record.state == InternalState::Active && !self.invoking.contains(&fiber))
             || !record
                 .spec
                 .artifact
@@ -3475,7 +3822,10 @@ impl Core {
         let Some(stream) = self.event_stream.as_ref() else {
             return -(STATUS_UNSATISFIED as i64);
         };
-        if record.state != InternalState::Activating
+        if !matches!(
+            record.state,
+            InternalState::Activating | InternalState::Active
+        ) || (record.state == InternalState::Active && !self.invoking.contains(&fiber))
             || !record
                 .spec
                 .artifact
@@ -3515,6 +3865,9 @@ impl Fiber {
             activation_steps: 0,
             outcome: None,
             patch_authorization: None,
+            staged_response: None,
+            staged_usage: None,
+            inbound_response: None,
         }
     }
 
@@ -3584,9 +3937,7 @@ fn link_host(linker: &mut Linker<HostState>) -> Result<()> {
             "call-provider",
             |store: StoreContextMut<'_, HostState>,
              (slot, operation, arg0, arg1): (u64, u64, u64, u64)| {
-                Ok((with_core(store, |core, fiber| {
-                    core.host_invoke(fiber, slot, operation, arg0, arg1)
-                }),))
+                Ok((host_invoke(store, slot, operation, arg0, arg1),))
             },
         )
         .map_err(|error| Error::Link(error.to_string()))?;
@@ -3637,10 +3988,32 @@ fn link_host(linker: &mut Linker<HostState>) -> Result<()> {
     linker
         .root()
         .func_wrap(
+            "open-exchange",
+            |store: StoreContextMut<'_, HostState>, (index,): (u64,)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_open_exchange(fiber, index)
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
+            "exchange",
+            |store: StoreContextMut<'_, HostState>, (event_index, invocation): (u64, u64)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_exchange(fiber, event_index, invocation)
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
             "append-event",
             |store: StoreContextMut<'_, HostState>, (index, value): (u64, u64)| {
                 Ok((with_core(store, |core, fiber| {
-                    core.host_append_event(fiber, index, value, false, None)
+                    core.host_append_event(fiber, index, value, false, EventPayloadSource::None)
                 }),))
             },
         )
@@ -3651,7 +4024,7 @@ fn link_host(linker: &mut Linker<HostState>) -> Result<()> {
             "resume-event",
             |store: StoreContextMut<'_, HostState>, (index, value): (u64, u64)| {
                 Ok((with_core(store, |core, fiber| {
-                    core.host_append_event(fiber, index, value, true, None)
+                    core.host_append_event(fiber, index, value, true, EventPayloadSource::None)
                 }),))
             },
         )
@@ -3685,7 +4058,30 @@ fn link_host(linker: &mut Linker<HostState>) -> Result<()> {
             |store: StoreContextMut<'_, HostState>,
              (event_index, snapshot_index, value): (u64, u64, u64)| {
                 Ok((with_core(store, |core, fiber| {
-                    core.host_append_event(fiber, event_index, value, true, Some(snapshot_index))
+                    core.host_append_event(
+                        fiber,
+                        event_index,
+                        value,
+                        true,
+                        EventPayloadSource::Snapshot(snapshot_index),
+                    )
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
+            "resume-exchange",
+            |store: StoreContextMut<'_, HostState>, (event_index, value): (u64, u64)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_append_event(
+                        fiber,
+                        event_index,
+                        value,
+                        true,
+                        EventPayloadSource::Exchange,
+                    )
                 }),))
             },
         )
@@ -3711,6 +4107,122 @@ fn link_host(linker: &mut Linker<HostState>) -> Result<()> {
         )
         .map_err(|error| Error::Link(error.to_string()))?;
     Ok(())
+}
+
+fn host_invoke(
+    store: StoreContextMut<'_, HostState>,
+    slot: u64,
+    operation: u64,
+    arg0: u64,
+    arg1: u64,
+) -> i64 {
+    let caller = store.data().fiber;
+    let Some(core) = store.data().core.upgrade() else {
+        return -(STATUS_INVALID as i64);
+    };
+    let (committed, provider, mut instance) = {
+        let Ok(mut core) = core.try_borrow_mut() else {
+            return -(STATUS_INVALID as i64);
+        };
+        let Some(caller_record) = core.fibers.get(&caller) else {
+            return -(STATUS_INVALID as i64);
+        };
+        if caller_record.state != InternalState::Activating
+            || !caller_record
+                .spec
+                .artifact
+                .manifest
+                .requests(HostCapability::Invoke)
+        {
+            return -(STATUS_UNDECLARED as i64);
+        }
+        let Some(committed) = caller_record.committed.get(&slot).cloned() else {
+            return -(STATUS_UNSATISFIED as i64);
+        };
+        if committed.interface.kind != BindingKind::Callable {
+            return -(STATUS_UNDECLARED as i64);
+        }
+        let Some(binding) = core.bindings.get(&committed.interface) else {
+            return -(STATUS_UNSATISFIED as i64);
+        };
+        if binding.fiber != committed.fiber || binding.kind != BindingKind::Callable {
+            return -(STATUS_UNSATISFIED as i64);
+        }
+        let provider = committed.fiber;
+        if !core.invoking.insert(provider) {
+            return -(STATUS_BUSY as i64);
+        }
+        let Some(instance) = core.fibers.get_mut(&provider).and_then(|record| {
+            (record.state == InternalState::Active)
+                .then(|| record.instance.take())
+                .flatten()
+        }) else {
+            core.invoking.remove(&provider);
+            return -(STATUS_UNSATISFIED as i64);
+        };
+        (committed, provider, instance)
+    };
+
+    let result = instance
+        .invoke
+        .call(
+            &mut instance.store,
+            (instance.instance_id, operation, arg0, arg1),
+        )
+        .map(|result| result.0)
+        .unwrap_or(-(STATUS_INVALID as i64));
+
+    let Ok(mut core) = core.try_borrow_mut() else {
+        return -(STATUS_INVALID as i64);
+    };
+    core.invoking.remove(&provider);
+    let staged = {
+        let Some(provider_record) = core.fibers.get_mut(&provider) else {
+            return -(STATUS_INVALID as i64);
+        };
+        provider_record.instance = Some(instance);
+        match (
+            provider_record.staged_response.take(),
+            provider_record.staged_usage.take(),
+        ) {
+            (Some(payload), Some(usage)) if result >= 0 && usage == result as u64 => {
+                Some(Ok(payload))
+            }
+            (None, None) => None,
+            _ => Some(Err(())),
+        }
+    };
+    match staged {
+        Some(Ok(payload)) => {
+            let Some(caller_record) = core.fibers.get_mut(&caller) else {
+                return -(STATUS_INVALID as i64);
+            };
+            if caller_record.inbound_response.is_some() {
+                return -(STATUS_BUSY as i64);
+            }
+            caller_record.inbound_response = Some(payload);
+        }
+        Some(Err(())) => return -(STATUS_INVALID as i64),
+        None => {}
+    }
+    if result == 1
+        && operation == 1
+        && committed.interface.namespace == "quartz.composition"
+        && committed.interface.interface == "patch-authority"
+        && committed.interface.revision == 1
+    {
+        let Ok(index) = usize::try_from(arg0) else {
+            return -(STATUS_INVALID as i64);
+        };
+        if let Some(record) = core.fibers.get_mut(&caller) {
+            record.patch_authorization = Some(PatchAuthorization {
+                provider,
+                index,
+                base_revision: arg1,
+            });
+        }
+    }
+    result
 }
 
 fn with_core<T>(
@@ -3847,6 +4359,7 @@ fn same_spec(left: &PreparedSpec, right: &PreparedSpec) -> bool {
             .map(|snapshot| &snapshot.grant)
             .eq(right.snapshots.iter().map(|snapshot| &snapshot.grant))
         && left.children.len() == right.children.len()
+        && left.exchange_grants == right.exchange_grants
         && left
             .children
             .iter()
@@ -3982,6 +4495,7 @@ impl PreparedSpec {
                 .iter()
                 .map(|snapshot| snapshot.grant.clone())
                 .collect(),
+            exchange_grants: self.exchange_grants.clone(),
         }
     }
 }

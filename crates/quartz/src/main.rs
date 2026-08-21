@@ -1,12 +1,16 @@
+mod openai;
+
 use quartz_kernel::{
-    ComponentSpec, ComponentTree, CompositionPatch, Error, EventGrant, FiberState, Limits, Runtime,
-    SnapshotGrant, TraceEvent,
+    ComponentSpec, ComponentTree, CompositionPatch, Error, EventGrant, ExchangeAdapter,
+    ExchangeFailure, ExchangeGrant, ExchangeResponse, FiberState, Limits, Runtime, SnapshotGrant,
+    TraceEvent,
 };
 use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    time::Instant,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -50,6 +54,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some("--agent-verify") => {
             run_agent_phase(&required_path(args.next())?, AgentPhase::Verify)?
+        }
+        Some("--production-model") => {
+            let model = args.next().ok_or("production model name is required")?;
+            let prompt = required_path(args.next())?;
+            let journal = required_path(args.next())?;
+            run_production_model(&model, &prompt, &journal)?;
         }
         Some(argument) => return Err(format!("unknown argument `{argument}`").into()),
         None => run_acceptance()?,
@@ -122,6 +132,7 @@ fn run_acceptance() -> Result<(), Box<dyn std::error::Error>> {
     run_durable_acceptance(&fixtures)?;
     run_event_acceptance(&fixtures)?;
     run_agent_acceptance(&fixtures)?;
+    run_exchange_acceptance(&fixtures)?;
     println!("root removed: subtree recovered to a clean context");
     println!("initial_composition_ns={initial_composition_ns}");
     println!("invalid_replacement_ns={invalid_replacement_ns}");
@@ -477,6 +488,154 @@ fn run_agent_phase(journal: &Path, phase: AgentPhase) -> Result<(), Box<dyn std:
         }
     }
     Ok(())
+}
+
+fn run_production_model(
+    model: &str,
+    prompt: &Path,
+    journal: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .map_err(|_| "OPENAI_API_KEY is required for --production-model")?;
+    let adapter = Arc::new(openai::OpenAiResponses::new(api_key, model.to_owned())?);
+    let (response, provenance) = run_exchange_turn(prompt, journal, adapter)?;
+    println!("{}", std::str::from_utf8(&response)?);
+    println!("response provenance: {provenance}");
+    println!("production response reconstructed; shutdown clean");
+    Ok(())
+}
+
+fn run_exchange_acceptance(fixtures: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let root = std::env::temp_dir().join(format!("quartz-slice6-smoke-{}", std::process::id()));
+    fs::create_dir_all(&root)?;
+    let prompt = root.join("prompt.txt");
+    let journal = root.join("composition.qj");
+    fs::write(&prompt, b"Return one bounded smoke response.")?;
+    let (response, provenance) = run_exchange_turn(&prompt, &journal, Arc::new(SmokeExchange))?;
+    assert_eq!(response, b"bounded production-path response");
+    assert_eq!(provenance, "smoke:exchange");
+    fs::remove_dir_all(&root)?;
+    assert!(fixtures.join("production-agent-provider.wasm").is_file());
+    println!("production exchange: exact response reconstructed; authority recovered");
+    Ok(())
+}
+
+fn run_exchange_turn(
+    prompt: &Path,
+    journal: &Path,
+    adapter: Arc<dyn ExchangeAdapter>,
+) -> Result<(Vec<u8>, String), Box<dyn std::error::Error>> {
+    let fixtures = PathBuf::from(env!("QUARTZ_FIXTURE_DIR"));
+    let prompt = fs::canonicalize(prompt)?;
+    let prompt_bytes = fs::read(&prompt)?;
+    std::str::from_utf8(&prompt_bytes)?;
+    let events = journal.with_extension("qe");
+    let exchange = journal.with_extension("qx");
+    let desired = production_tree(&fixtures, &prompt, &exchange, adapter.identity());
+    let mut completed = None;
+
+    for _ in 0..8 {
+        let mut runtime = Runtime::open_persistent_with_exchange(
+            Limits::default(),
+            ComponentSpec::new("event-store", artifact(&fixtures, "event-store"))
+                .with_journal_paths(vec![journal.to_path_buf()])
+                .with_event_stream_paths(vec![events.clone()]),
+            adapter.clone(),
+        )?;
+        runtime.apply_tree(desired.clone())?;
+        if let Some(FiberState::Failed(error)) = runtime.fiber_state("a-loop") {
+            return Err(format!("production agent loop failed: {error}").into());
+        }
+        let records = runtime.events();
+        if records.iter().any(|event| event.value >> 56 == 7) {
+            let response = records
+                .iter()
+                .find(|event| event.value >> 56 == 5)
+                .and_then(|event| event.payload.clone())
+                .ok_or("production turn stopped without a durable response")?;
+            completed = Some((response.bytes, response.provenance));
+            drop(runtime);
+            break;
+        }
+    }
+    let (response, provenance) = completed.ok_or("production turn did not reach a stop fact")?;
+
+    let mut runtime = Runtime::open_persistent_with_exchange(
+        Limits::default(),
+        ComponentSpec::new("event-store", artifact(&fixtures, "event-store"))
+            .with_journal_paths(vec![journal.to_path_buf()])
+            .with_event_stream_paths(vec![events]),
+        adapter,
+    )?;
+    let reconstructed = runtime
+        .events()
+        .into_iter()
+        .find(|event| event.value >> 56 == 5)
+        .and_then(|event| event.payload)
+        .ok_or("durable response was not reconstructed")?;
+    if reconstructed.bytes != response || reconstructed.provenance != provenance {
+        return Err("reconstructed production response changed".into());
+    }
+    runtime.shutdown_persistent()?;
+    if !runtime.is_observationally_clean() {
+        return Err("production authority was not fully recovered".into());
+    }
+    Ok((response, provenance))
+}
+
+struct SmokeExchange;
+
+impl ExchangeAdapter for SmokeExchange {
+    fn identity(&self) -> &str {
+        "smoke-exchange"
+    }
+
+    fn exchange(
+        &self,
+        request: &[u8],
+        _timeout: Duration,
+        _max_response_bytes: usize,
+    ) -> Result<ExchangeResponse, ExchangeFailure> {
+        assert_eq!(request, b"Return one bounded smoke response.");
+        Ok(ExchangeResponse {
+            bytes: b"bounded production-path response".to_vec(),
+            provenance: "smoke:exchange".into(),
+            usage: 5,
+        })
+    }
+}
+
+fn production_tree(
+    fixtures: &Path,
+    prompt: &Path,
+    exchange: &Path,
+    adapter: &str,
+) -> ComponentTree {
+    let event_grant = || EventGrant::new("quartz.agent", "repository-turn", 2);
+    ComponentTree {
+        roots: vec![
+            ComponentSpec::new("a-loop", artifact(fixtures, "agent-loop"))
+                .with_config(1)
+                .with_event_grants(vec![event_grant()]),
+            ComponentSpec::new("b-gateway", artifact(fixtures, "agent-gateway")),
+            ComponentSpec::new(
+                "c-provider",
+                artifact(fixtures, "production-agent-provider"),
+            )
+            .with_exchange_grants(vec![ExchangeGrant::new(
+                adapter,
+                exchange,
+                64 * 1024,
+                64 * 1024,
+                120_000,
+            )]),
+            ComponentSpec::new("d-tool", artifact(fixtures, "agent-tool-a")),
+            ComponentSpec::new("z-client", artifact(fixtures, "production-agent-client"))
+                .with_config(1)
+                .with_event_grants(vec![event_grant()])
+                .with_snapshot_grants(vec![snapshot_grant(prompt)]),
+        ],
+    }
 }
 
 fn agent_tree(

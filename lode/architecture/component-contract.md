@@ -57,11 +57,11 @@ so compiled code is retained only while a desired, staged, or live generation
 owns it. A process remains an optional isolation mode; it is not the composition
 model.
 
-The ABI 6 WIT contract exposes four lifecycle calls and sixteen capability
+The ABI 7 WIT contract exposes four lifecycle calls and nineteen capability
 imports:
 
 - `start(config)`, `step(instance)`, `invoke(instance, operation, arg0, arg1)`,
-  and `drop(instance)` implement bounded activation, pure synchronous callable
+  and `drop(instance)` implement bounded activation, synchronous callable
   dispatch, and disposal;
 - `set-state` performs an invertible fiber-owned context mutation;
 - `publish` installs a declared scalar coeffect with a structural inverse;
@@ -83,13 +83,22 @@ imports:
   that fiber by indexed canonical-file grant during activation;
 - `resume-snapshot` has replay-aware append enforcement and attaches one
   admitted snapshot as a bounded durable event payload.
+- `open-exchange` registers one host-admitted adapter and durable ledger as a
+  component-owned effect;
+- `exchange` consumes one committed event payload during the invoked
+  provider's callable dispatch and stages a bounded response under a stable invocation identity;
+- `resume-exchange` attaches the staged callable response to one replay-aware
+  durable event request.
 
 Every binding declares `value` or `callable` kind as part of its versioned
 identity. Context-changing imports remain tracked by structural inverses.
 Journal and event records are withheld external emissions and survive component
 recovery; registration inverses close access but do not claim to undo committed
-facts. Authorization calls are pure. The world exposes no ambient filesystem,
-network, clock, randomness, process, environment, or credential import.
+facts. Exchange requests are irreversible external emissions guarded by a
+durable started/terminal ledger; registration and staged-response authority are
+recovered, but network emission, billing, and ledger records are not. The world
+exposes no ambient filesystem, network, clock, randomness, process, environment,
+or credential import.
 
 ### Slice 1 verification
 
@@ -145,6 +154,22 @@ quartz` admits real `README.md` and `lode/summary.md` snapshots, starts a fresh
 process after every durable boundary, preserves the first transcript across
 inspector replacement, cites both canonical paths, and recovers all live
 authority on clean shutdown.
+
+### Slice 6 verification
+
+`cargo test -p quartz --test slice6` exercises six production-exchange
+contracts: durable response reconstruction and governed provider replacement,
+missing grant or adapter denial, independent request and response bounds with a
+closed ambiguous turn after external emission, host-enforced timeout without
+retry plus worker joining before clean recovery, started-only crash ambiguity
+without retry, and cached-success replay with invocation-digest collision
+rejection. `cargo test -p quartz --bin quartz`
+covers bounded normalization of a completed background Responses API envelope.
+`cargo run --release -p quartz` runs the same sandboxed production provider and
+loop against a deterministic host adapter, starts a fresh runtime generation
+for each fact, reconstructs exact response bytes, and recovers every live
+authority. The credentialed OpenAI command is documented in `README.md`; it
+requires `OPENAI_API_KEY`.
 
 ### Decision evidence
 
@@ -244,9 +269,11 @@ Slice 1 adds a callable binding kind beside scalar values. A callable provider
 publishes its declared interface and implements the revisioned `invoke`
 export. A consumer may invoke only a callable slot in its committed provider
 view and only while its own activation step is running. Calls are synchronous
-and inertial: provider identity cannot change during the call. The invoked
-export may update guest-local state but may not reenter context host operations;
-effects remain owned by ordinary component activation steps.
+and inertial: provider identity cannot change during the call. Ordinary
+providers cannot reenter context operations. ABI 7 permits the one provider
+currently marked as invoked to use only its declared event-read and exchange
+imports after callable dispatch releases the core borrow; concurrent and nested
+provider calls fail closed.
 
 The composition authority is the callable
 `quartz.composition/patch-authority@1` interface. Authorization is a pure call;

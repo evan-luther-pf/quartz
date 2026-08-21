@@ -1,9 +1,9 @@
 {
-  "abi": 6,
+  "abi": 7,
   "module": "quartz.slice4.agent-loop",
   "version": "0.1.0",
   "execution_mode": "wasm-component",
-  "requested_host_capabilities": ["event-count", "invoke", "publish", "read-event", "resume-event", "set-state"],
+  "requested_host_capabilities": ["event-count", "invoke", "publish", "read-event", "resume-event", "resume-exchange", "set-state"],
   "component": {
     "id": "agent-loop",
     "config_schema": "u64",

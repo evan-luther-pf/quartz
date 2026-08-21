@@ -9,8 +9,9 @@ pub use manifest::{
     ProvidedBinding, RequiredBinding, Requirement,
 };
 pub use runtime::{
-    ComponentSpec, ComponentTree, CompositionPatch, ContextObservation, FiberId, FiberState,
-    Limits, Runtime, TraceEvent,
+    ComponentSpec, ComponentTree, CompositionPatch, ContextObservation, ExchangeAdapter,
+    ExchangeFailure, ExchangeGrant, ExchangeResponse, FiberId, FiberState, Limits, Runtime,
+    TraceEvent,
 };
 
 use std::path::PathBuf;
@@ -123,6 +124,17 @@ pub enum Error {
     PayloadBytesLimit { actual: usize, limit: usize },
     #[error("total durable payload bytes {actual} exceeds limit {limit}")]
     PayloadTotalBytesLimit { actual: usize, limit: usize },
+    #[error("exchange ledger {operation} failed for {path}: {source}")]
+    ExchangeIo {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("durable exchange ledger is corrupt: {0}")]
+    ExchangeCorrupt(String),
+    #[error("exchange ledger record size {actual} exceeds limit {limit}")]
+    ExchangeRecordLimit { actual: usize, limit: usize },
     #[error("persistent composition error: {0}")]
     Persistence(String),
     #[error("runtime invariant violated: {0}")]

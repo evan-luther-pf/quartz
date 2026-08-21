@@ -14,7 +14,7 @@ A component may change the desired component tree through the same context it us
 
 ## Implemented foundation
 
-Slices 0 through 5 are complete. Quartz has a Rust context kernel and loads
+Slices 0 through 6 are complete. Quartz has a Rust context kernel and loads
 every acceptance component as a Wasmtime component through the public WIT
 contract. The runtime tracks structural inverses, resolves scalar and callable
 dependencies by provider fiber identity, orders dependent recovery before
@@ -57,16 +57,32 @@ scenario inspects real `README.md` and `lode/summary.md` bytes across two turns,
 governedly replaces the inspector, preserves the first transcript exactly, and
 recovers all live inspection authority on shutdown.
 
+A production provider now implements the same `quartz.agent/provider@1`
+callable as the deterministic provider. One explicit host adapter owns
+credential-bearing network access; sandboxed code receives only indexed,
+bounded exchange authority. The checksummed exchange ledger synchronizes
+started and terminal outcomes by invocation identity and request digest,
+reconstructs exact successes without another emission, and permanently blocks
+automatic retry after any started outcome without success. The OpenAI adapter
+starts a background Responses API request with `store: false`, polls under the
+host deadline, and normalizes assistant text. Response, provenance, digest, and
+usage enter the durable turn only after terminal ledger synchronization. Any
+started exchange without success durably closes as `interrupted/unknown` and
+then stop. Provider replacement and shutdown recover live exchange authority
+while requests, temporary remote retention, billing, and ledger records remain
+honestly external.
+
 Removing the application and persistence roots leaves no fibers, bindings,
 state cells, child registrations, pending patches or events, composition
-effects, desired roots, journal or event registrations, outbox entries, or live
-module artifacts. Durable journal and event records remain honestly external.
+effects, desired roots, journal, event, or exchange registrations, outbox
+entries, in-flight provider calls or exchange workers, staged responses, or
+live module artifacts. Durable journal, event, and exchange records remain
+honestly external.
 
 ## Non-goals
 
-- Production model access.
+- Streaming production responses, automatic model retries, model-selected tools, or unbounded conversation/session payloads.
 - Repository mutation.
-- Production or unbounded conversation/session payloads.
 - TUI.
 - Package installation or remote transport.
 - Compatibility with the existing Quartz repository.

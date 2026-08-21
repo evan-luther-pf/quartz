@@ -1,11 +1,11 @@
 {
   "abi": 7,
-  "module": "quartz.slice4.agent-client",
+  "module": "quartz.slice6.production-agent-client",
   "version": "0.1.0",
   "execution_mode": "wasm-component",
-  "requested_host_capabilities": ["event-count", "invoke", "read-event", "resume-event"],
+  "requested_host_capabilities": ["event-count", "invoke", "read-event", "resume-snapshot"],
   "component": {
-    "id": "agent-client",
+    "id": "production-agent-client",
     "config_schema": "u64",
     "max_activation_steps": 1,
     "inject": [

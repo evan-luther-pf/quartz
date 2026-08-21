@@ -1,4 +1,4 @@
-package quartz:component@0.6.0;
+package quartz:component@0.7.0;
 
 world module {
   /// Set a fiber-owned context cell. Returns zero or a Quartz status code.
@@ -43,6 +43,16 @@ world module {
 
   /// Queue one replay-aware event with an admitted immutable snapshot payload.
   import resume-snapshot: func(event-index: u64, snapshot-index: u64, value: u64) -> s32;
+
+  /// Register one component-owned, host-admitted bounded exchange ledger.
+  import open-exchange: func(index: u64) -> s32;
+
+  /// Run or reconstruct one stable exchange from a committed event payload.
+  /// Non-negative values are usage; negative values are Quartz status codes.
+  import exchange: func(event-index: u64, invocation: u64) -> s64;
+
+  /// Queue the staged callable response as a replay-aware durable payload.
+  import resume-exchange: func(event-index: u64, value: u64) -> s32;
   /// Return the bounded committed event count, or a negative Quartz status.
   import event-count: func() -> s64;
 

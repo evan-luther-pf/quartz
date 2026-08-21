@@ -1,5 +1,5 @@
 {
-  "abi": 6,
+  "abi": 7,
   "module": "quartz.slice4.agent-gateway",
   "version": "0.1.0",
   "execution_mode": "wasm-component",

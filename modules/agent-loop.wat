@@ -2,6 +2,7 @@
   (import "event-count" (func $event-count (result s64)))
   (import "read-event" (func $read-event (param "index" u64) (result s64)))
   (import "resume-event" (func $resume-event (param "index" u64) (param "value" u64) (result s32)))
+  (import "resume-exchange" (func $resume-exchange (param "index" u64) (param "value" u64) (result s32)))
   (import "call-provider" (func $call-provider (param "slot" u64) (param "operation" u64)
     (param "arg0" u64) (param "arg1" u64) (result s64)))
   (import "set-state" (func $set-state (param "key" u64) (param "value" u64) (result s32)))
@@ -9,6 +10,7 @@
   (core func $event-count-core (canon lower (func $event-count)))
   (core func $read-event-core (canon lower (func $read-event)))
   (core func $resume-event-core (canon lower (func $resume-event)))
+  (core func $resume-exchange-core (canon lower (func $resume-exchange)))
   (core func $call-provider-core (canon lower (func $call-provider)))
   (core func $set-state-core (canon lower (func $set-state)))
   (core func $publish-core (canon lower (func $publish)))
@@ -16,6 +18,7 @@
     (import "host" "event-count" (func $event-count (result i64)))
     (import "host" "read-event" (func $read-event (param i64) (result i64)))
     (import "host" "resume-event" (func $resume-event (param i64 i64) (result i32)))
+    (import "host" "resume-exchange" (func $resume-exchange (param i64 i64) (result i32)))
     (import "host" "call-provider" (func $call-provider (param i64 i64 i64 i64) (result i64)))
     (import "host" "set-state" (func $set-state (param i64 i64) (result i32)))
     (import "host" "publish" (func $publish (param i64 i64) (result i32)))
@@ -49,8 +52,35 @@
         local.get $status
         i32.sub
       end)
-    (func (export "start") (param i64) (result i64) i64.const 1)
-    (func (export "step") (param i64) (result i32)
+    (func $commit-provider (param $value i64) (result i32)
+      (local $status i32)
+      i64.const 0
+      local.get $value
+      call $resume-exchange
+      local.set $status
+      local.get $status
+      i32.const 3
+      i32.eq
+      if
+        i64.const 0
+        local.get $value
+        call $resume-event
+        local.set $status
+      end
+      local.get $status
+      i32.eqz
+      if (result i32)
+        i32.const 1
+      else
+        i32.const 0
+        local.get $status
+        i32.sub
+      end)
+    (func (export "start") (param $config i64) (result i64)
+      local.get $config
+      i64.const 1
+      i64.add)
+    (func (export "step") (param $instance i64) (result i32)
       (local $count i64)
       (local $index i64)
       (local $value i64)
@@ -292,6 +322,33 @@
         call $commit
         return
       end
+      local.get $instance
+      i64.const 2
+      i64.eq
+      if
+        local.get $message-set
+        if
+          local.get $usage
+          i32.eqz
+          if
+            i64.const 6
+            local.get $turn
+            i64.const 0
+            local.get $message
+            call $fact
+            call $commit
+            return
+          else
+            i64.const 7
+            local.get $turn
+            i64.const 0
+            i64.const 1
+            call $fact
+            call $commit
+            return
+          end
+        end
+      end
       local.get $tool-call
       i32.eqz
       if
@@ -311,6 +368,18 @@
         i64.lt_s
         if
           local.get $response
+          i64.const -10
+          i64.eq
+          if
+            i64.const 8
+            local.get $turn
+            local.get $invocation
+            i64.const 1
+            call $fact
+            call $commit
+            return
+          end
+          local.get $response
           i32.wrap_i64
           return
         end
@@ -320,12 +389,19 @@
         i64.const 2
         i64.add
         local.set $invocation
-        i64.const 3
+        local.get $instance
+        i64.const 2
+        i64.eq
+        if (result i64)
+          i64.const 5
+        else
+          i64.const 3
+        end
         local.get $turn
         local.get $invocation
         local.get $response
         call $fact
-        call $commit
+        call $commit-provider
         return
       end
       local.get $tool-kind
@@ -365,6 +441,18 @@
         i64.lt_s
         if
           local.get $response
+          i64.const -10
+          i64.eq
+          if
+            i64.const 8
+            local.get $turn
+            local.get $invocation
+            i64.const 1
+            call $fact
+            call $commit
+            return
+          end
+          local.get $response
           i32.wrap_i64
           return
         end
@@ -373,7 +461,7 @@
         local.get $invocation
         local.get $response
         call $fact
-        call $commit
+        call $commit-provider
         return
       end
       local.get $request2
@@ -412,6 +500,18 @@
         i64.lt_s
         if
           local.get $response
+          i64.const -10
+          i64.eq
+          if
+            i64.const 8
+            local.get $turn
+            local.get $invocation
+            i64.const 1
+            call $fact
+            call $commit
+            return
+          end
+          local.get $response
           i32.wrap_i64
           return
         end
@@ -420,7 +520,7 @@
         local.get $invocation
         local.get $response
         call $fact
-        call $commit
+        call $commit-provider
         return
       end
       local.get $usage
@@ -452,6 +552,7 @@
     (export "event-count" (func $event-count-core))
     (export "read-event" (func $read-event-core))
     (export "resume-event" (func $resume-event-core))
+    (export "resume-exchange" (func $resume-exchange-core))
     (export "call-provider" (func $call-provider-core))
     (export "set-state" (func $set-state-core))
     (export "publish" (func $publish-core)))

@@ -8,6 +8,8 @@ build = "build.rs"
 
 [dependencies]
 quartz-kernel = { path = "../quartz-kernel" }
+serde_json.workspace = true
+ureq.workspace = true
 
 [dev-dependencies]
 sha2.workspace = true

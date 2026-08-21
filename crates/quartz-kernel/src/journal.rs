@@ -13,9 +13,11 @@ use crate::{ComponentTree, CompositionPatch, Error, Result};
 const COMPOSITION_MAGIC: &[u8; 8] = b"QUARTZJ2";
 const EVENT_MAGIC: &[u8; 8] = b"QUARTZE2";
 const HEADER_LEN: usize = 12;
+const EXCHANGE_MAGIC: &[u8; 8] = b"QUARTZX1";
 const CHECKSUM_LEN: usize = 32;
 const COMPOSITION_SCHEMA_VERSION: u32 = 2;
 const EVENT_SCHEMA_VERSION: u32 = 2;
+const EXCHANGE_SCHEMA_VERSION: u32 = 1;
 
 type FramedPayloads = Vec<(u64, Vec<u8>)>;
 type DecodedLog = (u64, FramedPayloads, usize);
@@ -160,6 +162,31 @@ struct JournalPayload {
 struct EventPayload {
     schema: u32,
     fact: EventFact,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ExchangePayload {
+    schema: u32,
+    invocation: u64,
+    request_sha256: String,
+    outcome: ExchangeLedgerOutcome,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case", tag = "kind")]
+pub(crate) enum ExchangeLedgerOutcome {
+    Started,
+    Succeeded { payload: DurablePayload, usage: u64 },
+    Failed { failure: ExchangeLedgerFailure },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ExchangeLedgerFailure {
+    Rejected,
+    Ambiguous,
+    Limit,
 }
 
 pub(crate) struct Journal {
@@ -411,6 +438,156 @@ impl EventStream {
     }
 }
 
+pub(crate) struct ExchangeLedger {
+    log: FramedLog,
+    records: BTreeMap<u64, (String, ExchangeLedgerOutcome)>,
+}
+
+impl ExchangeLedger {
+    pub(crate) fn open(path: &Path, max_record_bytes: usize) -> Result<Self> {
+        let (log, payloads) =
+            FramedLog::open(path, EXCHANGE_MAGIC, max_record_bytes, LogKind::Exchange)?;
+        let mut records = BTreeMap::new();
+        for (_, payload) in payloads {
+            let record: ExchangePayload = serde_json::from_slice(&payload)
+                .map_err(|error| Error::ExchangeCorrupt(error.to_string()))?;
+            if record.schema != EXCHANGE_SCHEMA_VERSION {
+                return Err(Error::ExchangeCorrupt(format!(
+                    "unsupported exchange ledger schema {}",
+                    record.schema
+                )));
+            }
+            if record.invocation == 0 || !valid_sha256(&record.request_sha256) {
+                return Err(Error::ExchangeCorrupt(
+                    "exchange record has invalid identity".into(),
+                ));
+            }
+            if let ExchangeLedgerOutcome::Succeeded { payload, usage } = &record.outcome {
+                validate_exchange_payload(payload)?;
+                if *usage > i64::MAX as u64 {
+                    return Err(Error::ExchangeCorrupt(
+                        "exchange usage exceeds the signed ABI range".into(),
+                    ));
+                }
+            }
+            match records.get(&record.invocation) {
+                None if record.outcome == ExchangeLedgerOutcome::Started => {
+                    records.insert(record.invocation, (record.request_sha256, record.outcome));
+                }
+                Some((request_sha256, ExchangeLedgerOutcome::Started))
+                    if request_sha256 == &record.request_sha256
+                        && record.outcome != ExchangeLedgerOutcome::Started =>
+                {
+                    records.insert(record.invocation, (record.request_sha256, record.outcome));
+                }
+                _ => {
+                    return Err(Error::ExchangeCorrupt(format!(
+                        "invalid exchange transition for invocation {}",
+                        record.invocation
+                    )));
+                }
+            }
+        }
+        Ok(Self { log, records })
+    }
+
+    pub(crate) fn outcome(
+        &self,
+        invocation: u64,
+        request_sha256: &str,
+    ) -> Result<Option<&ExchangeLedgerOutcome>> {
+        let Some((stored_sha256, outcome)) = self.records.get(&invocation) else {
+            return Ok(None);
+        };
+        if stored_sha256 != request_sha256 {
+            return Err(Error::ExchangeCorrupt(format!(
+                "invocation {invocation} was reused with different request bytes"
+            )));
+        }
+        Ok(Some(outcome))
+    }
+
+    pub(crate) fn append_started(&mut self, invocation: u64, request_sha256: String) -> Result<()> {
+        if invocation == 0
+            || !valid_sha256(&request_sha256)
+            || self.records.contains_key(&invocation)
+        {
+            return Err(Error::ExchangeCorrupt(format!(
+                "invalid new exchange invocation {invocation}"
+            )));
+        }
+        self.append(
+            invocation,
+            request_sha256.clone(),
+            ExchangeLedgerOutcome::Started,
+        )?;
+        self.records
+            .insert(invocation, (request_sha256, ExchangeLedgerOutcome::Started));
+        Ok(())
+    }
+
+    pub(crate) fn append_terminal(
+        &mut self,
+        invocation: u64,
+        request_sha256: String,
+        outcome: ExchangeLedgerOutcome,
+    ) -> Result<()> {
+        if outcome == ExchangeLedgerOutcome::Started
+            || !matches!(
+                self.records.get(&invocation),
+                Some((stored, ExchangeLedgerOutcome::Started)) if stored == &request_sha256
+            )
+        {
+            return Err(Error::ExchangeCorrupt(format!(
+                "invalid terminal exchange invocation {invocation}"
+            )));
+        }
+        if let ExchangeLedgerOutcome::Succeeded { payload, usage } = &outcome {
+            validate_exchange_payload(payload)?;
+            if *usage > i64::MAX as u64 {
+                return Err(Error::ExchangeCorrupt(
+                    "exchange usage exceeds the signed ABI range".into(),
+                ));
+            }
+        }
+        self.append(invocation, request_sha256.clone(), outcome.clone())?;
+        self.records.insert(invocation, (request_sha256, outcome));
+        Ok(())
+    }
+
+    fn append(
+        &mut self,
+        invocation: u64,
+        request_sha256: String,
+        outcome: ExchangeLedgerOutcome,
+    ) -> Result<()> {
+        let payload = serde_json::to_vec(&ExchangePayload {
+            schema: EXCHANGE_SCHEMA_VERSION,
+            invocation,
+            request_sha256,
+            outcome,
+        })?;
+        self.log.append(&payload)?;
+        Ok(())
+    }
+}
+
+fn validate_exchange_payload(payload: &DurablePayload) -> Result<()> {
+    if payload.provenance.is_empty() {
+        return Err(Error::ExchangeCorrupt(
+            "exchange payload provenance is empty".into(),
+        ));
+    }
+    let actual = sha256_hex(&payload.bytes);
+    if payload.sha256 != actual {
+        return Err(Error::ExchangeCorrupt(format!(
+            "exchange payload checksum mismatch: expected {}, found {actual}",
+            payload.sha256
+        )));
+    }
+    Ok(())
+}
+
 fn validate_durable_payload(payload: Option<&DurablePayload>) -> Result<()> {
     let Some(payload) = payload else {
         return Ok(());
@@ -430,6 +607,13 @@ fn validate_durable_payload(payload: Option<&DurablePayload>) -> Result<()> {
     Ok(())
 }
 
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     digest_hex(Sha256::digest(bytes))
 }
@@ -447,6 +631,7 @@ fn digest_hex(digest: impl IntoIterator<Item = u8>) -> String {
 enum LogKind {
     Composition,
     Event,
+    Exchange,
 }
 
 impl LogKind {
@@ -454,6 +639,7 @@ impl LogKind {
         match self {
             Self::Composition => "composition journal",
             Self::Event => "event stream",
+            Self::Exchange => "exchange ledger",
         }
     }
 
@@ -461,6 +647,7 @@ impl LogKind {
         match self {
             Self::Composition => Error::JournalCorrupt(message.into()),
             Self::Event => Error::EventCorrupt(message.into()),
+            Self::Exchange => Error::ExchangeCorrupt(message.into()),
         }
     }
 
@@ -468,6 +655,7 @@ impl LogKind {
         match self {
             Self::Composition => Error::JournalRecordLimit { actual, limit },
             Self::Event => Error::EventRecordBytesLimit { actual, limit },
+            Self::Exchange => Error::ExchangeRecordLimit { actual, limit },
         }
     }
 }
@@ -671,6 +859,11 @@ fn durable_io(
             source,
         },
         LogKind::Event => Error::EventIo {
+            operation,
+            path: path.to_path_buf(),
+            source,
+        },
+        LogKind::Exchange => Error::ExchangeIo {
             operation,
             path: path.to_path_buf(),
             source,
