@@ -1,9 +1,9 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{Error, Result};
 
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 pub const MANIFEST_SECTION: &str = "quartz:manifest";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -48,18 +48,19 @@ pub struct ProvidedBinding {
     pub revision: u32,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BindingKind {
     Callable,
     Value,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HostCapability {
     ApplyPatch,
     Invoke,
+    OpenJournal,
     Publish,
     PublishCallable,
     RegisterChild,
@@ -104,7 +105,7 @@ impl Manifest {
         }
         if self.component.config_schema != "u64" {
             return Err(Error::Manifest(
-                "ABI 2 supports only the u64 config schema".into(),
+                "ABI 3 supports only the u64 config schema".into(),
             ));
         }
         if self.component.max_activation_steps == 0 {

@@ -1,3 +1,4 @@
+mod journal;
 mod manifest;
 mod module;
 mod runtime;
@@ -68,6 +69,25 @@ pub enum Error {
     PatchTargetOwned(String),
     #[error("composition patch failed and the prior composition was restored: {0}")]
     PatchRolledBack(String),
+    #[error("artifact digest mismatch for {path}: expected {expected}, found {actual}")]
+    ArtifactDigestMismatch {
+        path: PathBuf,
+        expected: String,
+        actual: String,
+    },
+    #[error("journal {operation} failed for {path}: {source}")]
+    JournalIo {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("composition journal is corrupt: {0}")]
+    JournalCorrupt(String),
+    #[error("journal record size {actual} exceeds limit {limit}")]
+    JournalRecordLimit { actual: usize, limit: usize },
+    #[error("persistent composition error: {0}")]
+    Persistence(String),
     #[error("runtime invariant violated: {0}")]
     Invariant(String),
 }

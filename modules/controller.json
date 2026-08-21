@@ -1,5 +1,5 @@
 {
-  "abi": 2,
+  "abi": 3,
   "module": "quartz.slice1.controller",
   "version": "0.1.0",
   "execution_mode": "wasm-component",

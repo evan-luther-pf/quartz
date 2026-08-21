@@ -57,7 +57,7 @@ so compiled code is retained only while a desired, staged, or live generation
 owns it. A process remains an optional isolation mode; it is not the composition
 model.
 
-The ABI 2 WIT contract exposes four lifecycle calls and seven capability
+The ABI 3 WIT contract exposes four lifecycle calls and eight capability
 imports:
 
 - `start(config)`, `step(instance)`, `invoke(instance, operation, arg0, arg1)`,
@@ -69,13 +69,16 @@ imports:
 - `publish-callable` installs a declared callable coeffect;
 - `call-provider` invokes a callable slot only through the committed view;
 - `apply-patch` queues one authority-approved, host-admitted composition patch;
-- `register-child` realizes a declared child entry as a parent-owned effect.
+- `register-child` realizes a declared child entry as a parent-owned effect;
+- `open-journal` registers one host-admitted journal path for durable
+  composition.
 
 Every binding declares `value` or `callable` kind as part of its versioned
-identity. All context-changing imports remain inside the system boundary and
-tracked by structural inverses. Authorization calls are pure. The world exposes
-no filesystem, network, clock, randomness, process, environment, or credential
-import.
+identity. Context-changing imports remain tracked by structural inverses.
+Journal records are withheld external emissions and survive component recovery;
+the registration inverse closes access but does not claim to undo committed
+facts. Authorization calls are pure. The world exposes no ambient filesystem,
+network, clock, randomness, process, environment, or credential import.
 
 ### Slice 1 verification
 
@@ -85,6 +88,17 @@ candidate rollback, pending-request cancellation, committed-patch recovery, and
 reversible top-level add/remove operations. `cargo run --release -p quartz`
 executes the governed controller path, inverts its accepted provider patch when
 the controller unloads, then asserts a clean context.
+
+### Slice 2 verification
+
+`cargo test -p quartz --test slice2` exercises eight durable-composition
+contracts: cold reconstruction, failed-candidate omission, persisted patch
+inverse recovery, torn-tail repair, interior-corruption rejection, artifact
+digest mismatch, journal-write failure before mutation, and clean empty restart.
+`cargo run --release -p quartz` starts three real executable generations against
+one journal: the first commits provider B and exits without recovery, the second
+reconstructs B and persists the controller inverse to provider A, and the third
+reconstructs A and performs a clean persistent shutdown.
 
 ### Decision evidence
 

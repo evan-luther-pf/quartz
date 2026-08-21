@@ -16,6 +16,8 @@
 - **Quiescence** — no lifecycle transition remains applicable or in flight.
 - **Composition revision** — the monotonic in-memory version checked by governed patch requests.
 - **Patch grant** — one exact host-admitted add, remove, or replacement operation exposed to guest code by index.
+- **Composition journal** — the versioned append-only stream of committed desired-tree snapshots used for restart reconstruction.
+- **Artifact digest** — the SHA-256 identity bound to module bytes when a composition declaration is admitted.
 - **Module artifact** — loadable code containing one or more component implementations.
 - **System boundary** — the set of locations Quartz can exclusively modify and restore; effects outside it require withholding, compensation, or explicit irreversibility.
 - **Handover** — replacement of the kernel process through state transfer and re-exec.

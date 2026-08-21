@@ -1,4 +1,4 @@
-package quartz:component@0.2.0;
+package quartz:component@0.3.0;
 
 world module {
   /// Set a fiber-owned context cell. Returns zero or a Quartz status code.
@@ -22,6 +22,9 @@ world module {
 
   /// Register one child from the committed declarative child list.
   import register-child: func(index: u32) -> s32;
+
+  /// Register one host-admitted composition journal path.
+  import open-journal: func(index: u64) -> s32;
 
   /// Create activation-local state. This call must not mutate the context.
   export start: func(config: u64) -> u64;

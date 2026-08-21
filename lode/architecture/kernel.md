@@ -123,6 +123,25 @@ claim. If an enclosing declaration has already removed both requester and
 target, recovery releases the claim without recreating state that the enclosing
 declaration removed.
 
+## Durable composition boundary
+
+Slice 2 persists the kernel-owned desired declaration without moving storage
+policy into the kernel. A bootstrap persistence component registers one
+host-admitted journal path as a context effect. The host framing mechanism
+appends checksummed desired-tree snapshots and replays only the latest committed
+snapshot; the component owns availability and capability lifetime.
+
+Persistent declarations exclude the bootstrap journal root. Restart activates
+that root first, verifies the recovered tree and artifact digests, assigns the
+recorded composition revision, then creates fresh application fibers. Historical
+fiber identities, accumulators, inverses, and lifecycle callbacks are never
+replayed.
+
+Durable append is withheld until a candidate declaration is admitted and, for a
+replacement, proven activatable. An append failure restores the prior
+in-memory composition. Recovering a committed composition effect appends the
+inverse declaration before releasing its target claim.
+
 ## Self-modification
 
 The authoritative state is a declarative component tree. A running component—including the agent—may propose a tree patch through a governed composition capability. Reconciliation turns the accepted patch into fiber insertions, updates, disablement, and removal. Source changes become new module artifacts; the loader stages the artifact, reconstructs affected fibers, and rolls back to the previous artifact if activation fails.

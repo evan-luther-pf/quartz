@@ -14,6 +14,7 @@
 ## Capabilities
 
 - `capabilities/self-modification.md` — governed composition changes and recovery rules.
+- `capabilities/durable-composition.md` — append-only desired-tree facts, artifact identity, and restart recovery.
 
 ## Research
 
@@ -22,8 +23,10 @@
 ## Implementation
 
 - `crates/quartz-kernel` — unified context, fibers, callable coeffects,
-  reconciliation, governed patches, Wasmtime loading, replacement, and rollback.
-- `crates/quartz` — Slice 0 and Slice 1 executable scenarios and contract tests.
+  reconciliation, governed patches, durable composition, Wasmtime loading,
+  replacement, and rollback.
+- `crates/quartz` — Slice 0 through Slice 2 executable scenarios and contract
+  tests.
 - `wit/quartz-component.wit` — public component/host boundary.
 - `modules` — real WebAssembly component sources and embedded manifests used by
   the executable acceptance paths.

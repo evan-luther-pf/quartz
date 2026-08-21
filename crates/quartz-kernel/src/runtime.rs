@@ -6,6 +6,7 @@ use std::{
     sync::Arc,
 };
 
+use serde::{Deserialize, Serialize};
 use wasmtime::{
     Store, StoreContextMut,
     component::{Instance, Linker, TypedFunc},
@@ -13,6 +14,7 @@ use wasmtime::{
 
 use crate::{
     BindingKind, Error, HostCapability, InterfaceId, Result,
+    journal::{Journal, JournalEffect, JournalSnapshot},
     module::{Artifact, ModuleLoader},
 };
 
@@ -29,13 +31,16 @@ const STATUS_BUSY: i32 = 9;
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FiberId(pub u64);
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ComponentSpec {
     pub entry: String,
     pub artifact: PathBuf,
+    pub artifact_digest: Option<String>,
     pub config: u64,
     pub children: Vec<ComponentSpec>,
     pub patches: Vec<CompositionPatch>,
+    pub journal_paths: Vec<PathBuf>,
 }
 
 impl ComponentSpec {
@@ -43,9 +48,11 @@ impl ComponentSpec {
         Self {
             entry: entry.into(),
             artifact: artifact.into(),
+            artifact_digest: None,
             config: 0,
             children: Vec::new(),
             patches: Vec::new(),
+            journal_paths: Vec::new(),
         }
     }
 
@@ -63,9 +70,20 @@ impl ComponentSpec {
         self.patches = patches;
         self
     }
+
+    pub fn with_artifact_digest(mut self, digest: impl Into<String>) -> Self {
+        self.artifact_digest = Some(digest.into());
+        self
+    }
+
+    pub fn with_journal_paths(mut self, paths: Vec<PathBuf>) -> Self {
+        self.journal_paths = paths;
+        self
+    }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case", tag = "operation")]
 pub enum CompositionPatch {
     AddRoot {
         root: Box<ComponentSpec>,
@@ -98,9 +116,18 @@ impl CompositionPatch {
             replacement: Box::new(replacement),
         }
     }
+
+    fn target(&self) -> &str {
+        match self {
+            Self::AddRoot { root } => &root.entry,
+            Self::RemoveRoot { entry } => entry,
+            Self::Replace { path, .. } => path,
+        }
+    }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ComponentTree {
     pub roots: Vec<ComponentSpec>,
 }
@@ -111,6 +138,7 @@ pub struct Limits {
     pub max_depth: usize,
     pub max_activation_steps: u32,
     pub max_reconciliation_steps: usize,
+    pub max_journal_record_bytes: usize,
 }
 
 impl Default for Limits {
@@ -120,6 +148,7 @@ impl Default for Limits {
             max_depth: 16,
             max_activation_steps: 1024,
             max_reconciliation_steps: 100_000,
+            max_journal_record_bytes: 1024 * 1024,
         }
     }
 }
@@ -217,6 +246,7 @@ pub struct ContextObservation {
     pub live_artifacts: usize,
     pub composition_effects: usize,
     pub pending_patches: usize,
+    pub journal_registrations: usize,
 }
 
 pub struct Runtime {
@@ -224,6 +254,8 @@ pub struct Runtime {
     core: Rc<RefCell<Core>>,
     limits: Limits,
     desired: BTreeMap<String, PreparedSpec>,
+    persistent_root: Option<String>,
+    defer_journal: bool,
 }
 
 #[derive(Clone)]
@@ -233,6 +265,7 @@ struct PreparedSpec {
     config: u64,
     children: Vec<PreparedSpec>,
     patches: Vec<PreparedPatch>,
+    journal_paths: Vec<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -276,6 +309,11 @@ struct PatchAuthorization {
     base_revision: u64,
 }
 
+struct JournalRegistration {
+    owner: FiberId,
+    journal: Journal,
+}
+
 struct Core {
     limits: Limits,
     next_fiber: u64,
@@ -291,6 +329,9 @@ struct Core {
     pending_patches: VecDeque<PendingPatch>,
     blocked_recovery: BTreeSet<FiberId>,
     trace: Vec<TraceEvent>,
+    journal: Option<JournalRegistration>,
+    journal_failure: Option<Error>,
+    replaying: bool,
 }
 
 struct Fiber {
@@ -358,6 +399,9 @@ enum Inverse {
         target: String,
         undo: PatchUndo,
     },
+    CloseJournal {
+        effect: u64,
+    },
 }
 
 impl Inverse {
@@ -366,7 +410,8 @@ impl Inverse {
             Self::RestoreState { effect, .. }
             | Self::RemoveBinding { effect, .. }
             | Self::RetireChild { effect, .. }
-            | Self::RestoreComposition { effect, .. } => *effect,
+            | Self::RestoreComposition { effect, .. }
+            | Self::CloseJournal { effect } => *effect,
         }
     }
 
@@ -376,6 +421,7 @@ impl Inverse {
             Self::RemoveBinding { .. } => "coeffect",
             Self::RetireChild { .. } => "component-registration",
             Self::RestoreComposition { .. } => "composition",
+            Self::CloseJournal { .. } => "composition-journal",
         }
     }
 }
@@ -403,15 +449,127 @@ impl Runtime {
             core,
             limits,
             desired: BTreeMap::new(),
+            persistent_root: None,
+            defer_journal: false,
         })
+    }
+
+    pub fn open_persistent(limits: Limits, journal_component: ComponentSpec) -> Result<Self> {
+        if journal_component.journal_paths.len() != 1
+            || !journal_component.children.is_empty()
+            || !journal_component.patches.is_empty()
+        {
+            return Err(Error::Persistence(
+                "journal bootstrap must admit exactly one path and no children or patches".into(),
+            ));
+        }
+        let journal_root = journal_component.entry.clone();
+        let mut runtime = Self::new(limits)?;
+        runtime.persistent_root = Some(journal_root.clone());
+        let bootstrap = runtime.prepare_tree(ComponentTree {
+            roots: vec![journal_component],
+        })?;
+        runtime.declare_prepared(bootstrap, false)?;
+        runtime.reconcile_to_quiescence()?;
+        if runtime.core.borrow().journal.is_none() {
+            let failure = runtime
+                .core
+                .borrow_mut()
+                .journal_failure
+                .take()
+                .unwrap_or_else(|| {
+                    Error::Persistence("journal component did not register its path".into())
+                });
+            return Err(failure);
+        }
+        let recovered = {
+            let core = runtime.core.borrow();
+            let registration = core
+                .journal
+                .as_ref()
+                .expect("journal registration checked above");
+            let owner_path = core
+                .fibers
+                .get(&registration.owner)
+                .map(|fiber| fiber.path.as_str());
+            if owner_path != Some(journal_root.as_str()) {
+                return Err(Error::Persistence(
+                    "journal capability is not owned by the bootstrap root".into(),
+                ));
+            }
+            registration.journal.recovered()
+        };
+        if let Some(snapshot) = recovered {
+            runtime.core.borrow_mut().composition_revision = snapshot.composition_revision;
+            let prepared = runtime.prepare_application_tree(snapshot.tree)?;
+            runtime.declare_prepared(prepared, false)?;
+            runtime.core.borrow_mut().replaying = true;
+            runtime.reconcile_to_quiescence()?;
+            runtime.core.borrow_mut().replaying = false;
+            runtime.restore_composition_effects(snapshot.effects)?;
+        }
+        Ok(runtime)
     }
 
     pub fn composition_revision(&self) -> u64 {
         self.core.borrow().composition_revision
     }
 
+    pub fn journal_sequence(&self) -> Option<u64> {
+        self.core
+            .borrow()
+            .journal
+            .as_ref()
+            .map(|registration| registration.journal.sequence())
+    }
+
     pub fn declare_tree(&mut self, tree: ComponentTree) -> Result<()> {
+        if self.persistent_root.is_some() {
+            return Err(Error::Persistence(
+                "persistent declarations must reconcile through apply_tree".into(),
+            ));
+        }
         let prepared = self.prepare_tree(tree)?;
+        self.declare_prepared(prepared, true)?;
+        Ok(())
+    }
+
+    pub fn shutdown_persistent(&mut self) -> Result<()> {
+        if self.persistent_root.is_none() {
+            return Err(Error::Persistence("runtime is not persistent".into()));
+        }
+        self.apply_tree(ComponentTree::default())?;
+        self.declare_prepared(BTreeMap::new(), false)?;
+        self.reconcile_to_quiescence()?;
+        self.persistent_root = None;
+        Ok(())
+    }
+
+    fn prepare_application_tree(
+        &self,
+        mut tree: ComponentTree,
+    ) -> Result<BTreeMap<String, PreparedSpec>> {
+        let Some(journal_root) = &self.persistent_root else {
+            return self.prepare_tree(tree);
+        };
+        if tree.roots.iter().any(|root| root.entry == *journal_root) {
+            return Err(Error::Persistence(
+                "application tree cannot declare the persistence bootstrap root".into(),
+            ));
+        }
+        let journal = self
+            .desired
+            .get(journal_root)
+            .ok_or_else(|| Error::Invariant("persistence bootstrap root disappeared".into()))?;
+        tree.roots.push(journal.to_component_spec());
+        self.prepare_tree(tree)
+    }
+
+    fn declare_prepared(
+        &mut self,
+        prepared: BTreeMap<String, PreparedSpec>,
+        increment_revision: bool,
+    ) -> Result<bool> {
         {
             let core = self.core.borrow();
             for (target, actor) in &core.patch_owners {
@@ -504,15 +662,170 @@ impl Runtime {
             }
         }
         self.desired = prepared;
-        if changed {
+        if changed && increment_revision {
             self.core.borrow_mut().composition_revision += 1;
+        }
+        Ok(changed)
+    }
+
+    fn append_current_composition(&mut self) -> Result<()> {
+        let snapshot = self.current_journal_snapshot()?;
+        let mut core = self.core.borrow_mut();
+        let registration = core
+            .journal
+            .as_mut()
+            .ok_or_else(|| Error::Persistence("composition journal is unavailable".into()))?;
+        registration.journal.append(&snapshot)
+    }
+
+    fn current_journal_snapshot(&self) -> Result<JournalSnapshot> {
+        let tree = self.application_tree();
+        let core = self.core.borrow();
+        let mut effects = Vec::with_capacity(core.patch_owners.len());
+        for (target, actor) in &core.patch_owners {
+            let fiber = core
+                .fibers
+                .get(actor)
+                .ok_or_else(|| Error::Invariant("patch owner disappeared".into()))?;
+            if desired_spec(&self.desired, &fiber.path).is_none() {
+                continue;
+            }
+            let inverse = fiber
+                .accumulator
+                .iter()
+                .rev()
+                .find_map(|inverse| match inverse {
+                    Inverse::RestoreComposition {
+                        target: inverse_target,
+                        undo,
+                        ..
+                    } if inverse_target == target => Some(undo.to_composition_patch()),
+                    _ => None,
+                })
+                .ok_or_else(|| Error::Invariant("patch owner has no composition inverse".into()))?;
+            effects.push(JournalEffect {
+                actor_path: fiber.path.clone(),
+                target: target.clone(),
+                inverse,
+            });
+        }
+        Ok(JournalSnapshot {
+            composition_revision: core.composition_revision,
+            tree,
+            effects,
+        })
+    }
+
+    fn restore_composition_effects(&mut self, effects: Vec<JournalEffect>) -> Result<()> {
+        for record in effects {
+            let actor = self
+                .core
+                .borrow()
+                .fiber_by_path(&record.actor_path)
+                .ok_or_else(|| {
+                    Error::JournalCorrupt(format!(
+                        "composition effect actor `{}` is absent",
+                        record.actor_path
+                    ))
+                })?;
+            let prepared = self.prepare_patch(record.inverse, &record.actor_path)?;
+            if prepared.target() != record.target {
+                return Err(Error::JournalCorrupt(format!(
+                    "composition effect target `{}` does not match inverse `{}`",
+                    record.target,
+                    prepared.target()
+                )));
+            }
+            let undo = PatchUndo::from_prepared(prepared);
+            let mut core = self.core.borrow_mut();
+            if core
+                .patch_owners
+                .keys()
+                .any(|target| paths_overlap(target, &record.target))
+            {
+                return Err(Error::JournalCorrupt(format!(
+                    "composition effect target `{}` overlaps another owner",
+                    record.target
+                )));
+            }
+            let journal_owner = core
+                .journal
+                .as_ref()
+                .map(|journal| journal.owner)
+                .ok_or_else(|| Error::Persistence("composition journal is unavailable".into()))?;
+            let actor_record = core
+                .fibers
+                .get(&actor)
+                .ok_or_else(|| Error::Invariant("composition effect actor disappeared".into()))?;
+            if actor_record.state != InternalState::Active
+                || actor_record
+                    .committed
+                    .values()
+                    .all(|provider| provider.fiber != journal_owner)
+            {
+                return Err(Error::JournalCorrupt(format!(
+                    "composition effect actor `{}` did not commit the journal provider",
+                    record.actor_path
+                )));
+            }
+            let effect = core.allocate_effect();
+            core.patch_owners.insert(record.target.clone(), actor);
+            core.fibers
+                .get_mut(&actor)
+                .expect("composition effect actor checked above")
+                .accumulator
+                .push(Inverse::RestoreComposition {
+                    effect,
+                    target: record.target,
+                    undo,
+                });
         }
         Ok(())
     }
 
+    fn application_tree(&self) -> ComponentTree {
+        let mut roots = self.desired.clone();
+        if let Some(journal_root) = &self.persistent_root {
+            roots.remove(journal_root);
+        }
+        tree_from_prepared(&roots)
+    }
+
+    fn restore_persistent_state(
+        &mut self,
+        previous: BTreeMap<String, PreparedSpec>,
+        previous_revision: u64,
+    ) -> Result<()> {
+        self.defer_journal = true;
+        let result = self
+            .declare_prepared(previous, false)
+            .and_then(|_| self.reconcile_to_quiescence());
+        self.core.borrow_mut().composition_revision = previous_revision;
+        self.defer_journal = false;
+        result
+    }
+
     pub fn apply_tree(&mut self, tree: ComponentTree) -> Result<()> {
-        self.declare_tree(tree)?;
-        self.reconcile_to_quiescence()
+        if self.persistent_root.is_none() {
+            self.declare_tree(tree)?;
+            return self.reconcile_to_quiescence();
+        }
+        let prepared = self.prepare_application_tree(tree)?;
+        let previous = self.desired.clone();
+        let previous_revision = self.composition_revision();
+        self.declare_prepared(prepared, true)?;
+        self.defer_journal = true;
+        if let Err(error) = self.reconcile_to_quiescence() {
+            self.defer_journal = false;
+            self.restore_persistent_state(previous, previous_revision)?;
+            return Err(error);
+        }
+        self.defer_journal = false;
+        if let Err(error) = self.append_current_composition() {
+            self.restore_persistent_state(previous, previous_revision)?;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn step(&mut self) -> Result<bool> {
@@ -549,6 +862,15 @@ impl Runtime {
     }
 
     pub fn replace_entry(&mut self, path: &str, spec: ComponentSpec) -> Result<()> {
+        if self.persistent_root.is_some() {
+            return Err(Error::Persistence(
+                "persistent replacement requires a governed composition patch".into(),
+            ));
+        }
+        self.replace_entry_internal(path, spec)
+    }
+
+    fn replace_entry_internal(&mut self, path: &str, spec: ComponentSpec) -> Result<()> {
         if self
             .core
             .borrow()
@@ -714,6 +1036,7 @@ impl Runtime {
             live_artifacts: self.loader.live_artifact_count(),
             composition_effects: core.patch_owners.len(),
             pending_patches: core.pending_patches.len(),
+            journal_registrations: usize::from(core.journal.is_some()),
         }
     }
 
@@ -762,7 +1085,20 @@ impl Runtime {
                 spec.entry
             )));
         }
-        let artifact = self.loader.load(&spec.artifact)?;
+        let artifact = self
+            .loader
+            .load(&spec.artifact, spec.artifact_digest.as_deref())?;
+        let requests_journal = artifact.manifest.requests(HostCapability::OpenJournal);
+        if requests_journal != !spec.journal_paths.is_empty() {
+            return Err(Error::Manifest(format!(
+                "component `{path}` must pair open-journal authority with an admitted path"
+            )));
+        }
+        if !spec.journal_paths.is_empty() && self.persistent_root.as_deref() != Some(path) {
+            return Err(Error::Persistence(
+                "journal paths are reserved for the persistence bootstrap root".into(),
+            ));
+        }
         if artifact.manifest.component.max_activation_steps > self.limits.max_activation_steps {
             return Err(Error::ActivationLimit(
                 artifact.manifest.component.id.clone(),
@@ -787,10 +1123,20 @@ impl Runtime {
             config: spec.config,
             children,
             patches,
+            journal_paths: spec.journal_paths,
         })
     }
 
     fn prepare_patch(&self, patch: CompositionPatch, actor_path: &str) -> Result<PreparedPatch> {
+        if self
+            .persistent_root
+            .as_deref()
+            .is_some_and(|root| paths_overlap(root, patch.target()))
+        {
+            return Err(Error::InvalidPatch(
+                "a component cannot modify the persistence bootstrap root".into(),
+            ));
+        }
         match patch {
             CompositionPatch::AddRoot { root } => {
                 if root.entry.is_empty() || root.entry.contains('/') {
@@ -899,21 +1245,55 @@ impl Runtime {
             return Ok(true);
         };
         let target = patch.target().to_string();
+        let previous_revision = self.composition_revision();
         match self.apply_prepared_patch(&patch) {
             Ok(undo) => {
-                let mut core = self.core.borrow_mut();
-                let effect = core.allocate_effect();
-                core.patch_owners.insert(target.clone(), request.actor);
-                let Some(actor) = core.fibers.get_mut(&request.actor) else {
-                    return Err(Error::Invariant(
-                        "patch actor disappeared after commit".into(),
-                    ));
+                let rollback = undo.clone();
+                let effect = {
+                    let mut core = self.core.borrow_mut();
+                    let effect = core.allocate_effect();
+                    core.patch_owners.insert(target.clone(), request.actor);
+                    let Some(actor) = core.fibers.get_mut(&request.actor) else {
+                        return Err(Error::Invariant(
+                            "patch actor disappeared after commit".into(),
+                        ));
+                    };
+                    actor.accumulator.push(Inverse::RestoreComposition {
+                        effect,
+                        target: target.clone(),
+                        undo,
+                    });
+                    effect
                 };
-                actor.accumulator.push(Inverse::RestoreComposition {
-                    effect,
-                    target: target.clone(),
-                    undo,
-                });
+                if self.persistent_root.is_some()
+                    && !self.defer_journal
+                    && let Err(error) = self.append_current_composition()
+                {
+                    {
+                        let mut core = self.core.borrow_mut();
+                        core.patch_owners.remove(&target);
+                        let actor = core.fibers.get_mut(&request.actor).ok_or_else(|| {
+                            Error::Invariant("patch actor disappeared during rollback".into())
+                        })?;
+                        let removed = actor.accumulator.pop().ok_or_else(|| {
+                            Error::Invariant("patch inverse disappeared during rollback".into())
+                        })?;
+                        if removed.effect() != effect {
+                            return Err(Error::Invariant(
+                                "patch inverse was not last during rollback".into(),
+                            ));
+                        }
+                    }
+                    self.apply_patch_undo(&rollback)?.ok_or_else(|| {
+                        Error::Invariant(
+                            "journal failure rollback did not restore the patch target".into(),
+                        )
+                    })?;
+                    self.core.borrow_mut().composition_revision = previous_revision;
+                    self.reject_patch(request.actor, target, error.to_string());
+                    return Ok(true);
+                }
+                let mut core = self.core.borrow_mut();
                 let revision = core.composition_revision;
                 core.trace.push(TraceEvent::EffectApplied {
                     fiber: request.actor,
@@ -939,7 +1319,7 @@ impl Runtime {
                 let previous = desired_spec(&self.desired, path)
                     .cloned()
                     .ok_or_else(|| Error::UnknownEntry(path.clone()))?;
-                self.replace_entry(path, replacement.to_component_spec())
+                self.replace_entry_internal(path, replacement.to_component_spec())
                     .map_err(|error| match error {
                         Error::ReplacementRolledBack(error) => Error::PatchRolledBack(error),
                         error => error,
@@ -960,9 +1340,11 @@ impl Runtime {
                 let previous_revision = self.composition_revision();
                 let mut next = previous.clone();
                 next.insert(root.entry.clone(), root.clone());
-                self.apply_tree(tree_from_prepared(&next))?;
+                self.declare_prepared(next, true)?;
+                self.reconcile_to_quiescence()?;
                 if let Some(FiberState::Failed(error)) = self.fiber_state(&root.entry) {
-                    self.apply_tree(tree_from_prepared(&previous))?;
+                    self.declare_prepared(previous, false)?;
+                    self.reconcile_to_quiescence()?;
                     self.core.borrow_mut().composition_revision = previous_revision;
                     return Err(Error::PatchRolledBack(error));
                 }
@@ -978,8 +1360,43 @@ impl Runtime {
                     .ok_or_else(|| Error::UnknownEntry(entry.clone()))?;
                 let mut next = self.desired.clone();
                 next.remove(entry);
-                self.apply_tree(tree_from_prepared(&next))?;
+                self.declare_prepared(next, true)?;
+                self.reconcile_to_quiescence()?;
                 Ok(PatchUndo::AddRoot { root: previous })
+            }
+        }
+    }
+
+    fn apply_patch_undo(&mut self, undo: &PatchUndo) -> Result<Option<PatchUndo>> {
+        match undo {
+            PatchUndo::RemoveRoot { entry } => {
+                if self.desired.contains_key(entry) {
+                    self.apply_prepared_patch(&PreparedPatch::RemoveRoot {
+                        entry: entry.clone(),
+                    })
+                    .map(Some)
+                } else {
+                    Ok(None)
+                }
+            }
+            PatchUndo::AddRoot { root } => {
+                if self.desired.contains_key(&root.entry) {
+                    Ok(None)
+                } else {
+                    self.apply_prepared_patch(&PreparedPatch::AddRoot { root: root.clone() })
+                        .map(Some)
+                }
+            }
+            PatchUndo::Replace { path, replacement } => {
+                if desired_spec(&self.desired, path).is_some() {
+                    self.apply_prepared_patch(&PreparedPatch::Replace {
+                        path: path.clone(),
+                        replacement: replacement.clone(),
+                    })
+                    .map(Some)
+                } else {
+                    Ok(None)
+                }
             }
         }
     }
@@ -1032,37 +1449,33 @@ impl Runtime {
         };
 
         let actor_still_declared = desired_spec(&self.desired, &actor_path).is_some();
-        let result = if actor_still_declared {
-            match &undo {
-                PatchUndo::RemoveRoot { entry } => {
-                    if self.desired.contains_key(entry) {
-                        self.apply_prepared_patch(&PreparedPatch::RemoveRoot {
-                            entry: entry.clone(),
-                        })
-                        .map(|_| ())
+        let target_still_declared = desired_spec(&self.desired, &target).is_some();
+        let previous_revision = self.composition_revision();
+        let result = if actor_still_declared || target_still_declared {
+            match self.apply_patch_undo(&undo) {
+                Ok(reverse) => {
+                    if reverse.is_some() && self.persistent_root.is_some() && !self.defer_journal {
+                        if let Err(error) = self.append_current_composition() {
+                            let reverse = reverse.ok_or_else(|| {
+                                Error::Invariant(
+                                    "journal failure recovery lost its reverse patch".into(),
+                                )
+                            })?;
+                            self.apply_patch_undo(&reverse)?.ok_or_else(|| {
+                                Error::Invariant(
+                                    "journal failure did not restore committed composition".into(),
+                                )
+                            })?;
+                            self.core.borrow_mut().composition_revision = previous_revision;
+                            Err(error)
+                        } else {
+                            Ok(())
+                        }
                     } else {
                         Ok(())
                     }
                 }
-                PatchUndo::AddRoot { root } => {
-                    if self.desired.contains_key(&root.entry) {
-                        Ok(())
-                    } else {
-                        self.apply_prepared_patch(&PreparedPatch::AddRoot { root: root.clone() })
-                            .map(|_| ())
-                    }
-                }
-                PatchUndo::Replace { path, replacement } => {
-                    if desired_spec(&self.desired, path).is_some() {
-                        self.apply_prepared_patch(&PreparedPatch::Replace {
-                            path: path.clone(),
-                            replacement: replacement.clone(),
-                        })
-                        .map(|_| ())
-                    } else {
-                        Ok(())
-                    }
-                }
+                Err(error) => Err(error),
             }
         } else {
             Ok(())
@@ -1584,6 +1997,9 @@ impl Core {
             patch_owners: BTreeMap::new(),
             pending_patches: VecDeque::new(),
             trace: Vec::new(),
+            journal: None,
+            journal_failure: None,
+            replaying: false,
         }
     }
 
@@ -1700,6 +2116,16 @@ impl Core {
                     "composition inverse reached core recovery".into(),
                 ));
             }
+            Inverse::CloseJournal { .. } => {
+                let registration = self.journal.take().ok_or_else(|| {
+                    Error::Invariant("journal inverse found no registered journal".into())
+                })?;
+                if registration.owner != fiber_id {
+                    return Err(Error::Invariant(
+                        "journal inverse targeted another provider".into(),
+                    ));
+                }
+            }
         }
         self.trace.push(TraceEvent::EffectRecovered {
             fiber: fiber_id,
@@ -1723,6 +2149,10 @@ impl Core {
                 .pending_patches
                 .iter()
                 .any(|request| request.actor == id)
+            || self
+                .journal
+                .as_ref()
+                .is_some_and(|journal| journal.owner == id)
         {
             return Err(Error::Invariant(
                 "removed fiber retained context effects".into(),
@@ -2016,6 +2446,9 @@ impl Core {
     }
 
     fn host_apply_patch(&mut self, actor: FiberId, index: u64, base_revision: u64) -> i32 {
+        if self.replaying {
+            return STATUS_BUSY;
+        }
         let Ok(index) = usize::try_from(index) else {
             return STATUS_INVALID;
         };
@@ -2048,6 +2481,14 @@ impl Core {
                 .all(|provider| provider.fiber != authorization.provider)
         {
             return STATUS_DENIED;
+        }
+        if let Some(journal) = &self.journal
+            && record
+                .committed
+                .values()
+                .all(|provider| provider.fiber != journal.owner)
+        {
+            return STATUS_UNDECLARED;
         }
         let target = patch.target();
         if self
@@ -2143,6 +2584,58 @@ impl Core {
             parent,
             child,
             path,
+        });
+        STATUS_OK
+    }
+
+    fn host_open_journal(&mut self, fiber: FiberId, index: u64) -> i32 {
+        let Ok(index) = usize::try_from(index) else {
+            return STATUS_INVALID;
+        };
+        let path = {
+            let Some(record) = self.fibers.get(&fiber) else {
+                return STATUS_INVALID;
+            };
+            if record.state != InternalState::Activating {
+                return STATUS_INVALID;
+            }
+            if !record
+                .spec
+                .artifact
+                .manifest
+                .requests(HostCapability::OpenJournal)
+            {
+                return STATUS_UNDECLARED;
+            }
+            let Some(path) = record.spec.journal_paths.get(index) else {
+                return STATUS_UNDECLARED;
+            };
+            path.clone()
+        };
+        if self.journal.is_some() {
+            return STATUS_COLLISION;
+        }
+        let journal = match Journal::open(&path, self.limits.max_journal_record_bytes) {
+            Ok(journal) => journal,
+            Err(error) => {
+                self.journal_failure = Some(error);
+                return STATUS_INVALID;
+            }
+        };
+        let effect = self.allocate_effect();
+        self.journal = Some(JournalRegistration {
+            owner: fiber,
+            journal,
+        });
+        self.fibers
+            .get_mut(&fiber)
+            .expect("journal fiber checked above")
+            .accumulator
+            .push(Inverse::CloseJournal { effect });
+        self.trace.push(TraceEvent::EffectApplied {
+            fiber,
+            effect,
+            kind: "composition-journal".into(),
         });
         STATUS_OK
     }
@@ -2257,6 +2750,17 @@ fn link_host(linker: &mut Linker<HostState>) -> Result<()> {
             |store: StoreContextMut<'_, HostState>, (index,): (u32,)| {
                 Ok((with_core(store, |core, fiber| {
                     core.host_register_child(fiber, index)
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
+            "open-journal",
+            |store: StoreContextMut<'_, HostState>, (index,): (u64,)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_open_journal(fiber, index)
                 }),))
             },
         )
@@ -2387,7 +2891,9 @@ fn detect_cycle(edges: &BTreeMap<&str, BTreeSet<&str>>) -> Result<()> {
 fn same_spec(left: &PreparedSpec, right: &PreparedSpec) -> bool {
     left.entry == right.entry
         && left.artifact.path == right.artifact.path
+        && left.artifact.digest == right.artifact.digest
         && left.config == right.config
+        && left.journal_paths == right.journal_paths
         && left.children.len() == right.children.len()
         && left
             .children
@@ -2504,6 +3010,7 @@ impl PreparedSpec {
         ComponentSpec {
             entry: self.entry.clone(),
             artifact: self.artifact.path.clone(),
+            artifact_digest: Some(self.artifact.digest.clone()),
             config: self.config,
             children: self
                 .children
@@ -2515,6 +3022,7 @@ impl PreparedSpec {
                 .iter()
                 .map(PreparedPatch::to_composition_patch)
                 .collect(),
+            journal_paths: self.journal_paths.clone(),
         }
     }
 }
@@ -2525,6 +3033,26 @@ impl PreparedPatch {
             Self::AddRoot { root } => &root.entry,
             Self::RemoveRoot { entry } => entry,
             Self::Replace { path, .. } => path,
+        }
+    }
+
+    fn to_composition_patch(&self) -> CompositionPatch {
+        match self {
+            Self::AddRoot { root } => CompositionPatch::add_root(root.to_component_spec()),
+            Self::RemoveRoot { entry } => CompositionPatch::remove_root(entry),
+            Self::Replace { path, replacement } => {
+                CompositionPatch::replace(path, replacement.to_component_spec())
+            }
+        }
+    }
+}
+
+impl PatchUndo {
+    fn from_prepared(patch: PreparedPatch) -> Self {
+        match patch {
+            PreparedPatch::AddRoot { root } => Self::AddRoot { root },
+            PreparedPatch::RemoveRoot { entry } => Self::RemoveRoot { entry },
+            PreparedPatch::Replace { path, replacement } => Self::Replace { path, replacement },
         }
     }
 

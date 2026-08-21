@@ -14,26 +14,34 @@ A component may change the desired component tree through the same context it us
 
 ## Implemented foundation
 
-Slices 0 and 1 are complete. Quartz has a Rust context kernel and loads every
-acceptance component as a Wasmtime component through the public WIT contract.
-The runtime tracks structural inverses, resolves scalar and callable
+Slices 0 through 2 are complete. Quartz has a Rust context kernel and loads
+every acceptance component as a Wasmtime component through the public WIT
+contract. The runtime tracks structural inverses, resolves scalar and callable
 dependencies by provider fiber identity, orders dependent recovery before
 provider recovery, owns child registrations in parent accumulators, and
 reconciles declared trees to quiescence.
 
-A sandboxed controller can now invoke a callable governor and select an explicit
+A sandboxed controller can invoke a callable governor and select an explicit
 host-admitted add, remove, or replacement grant against a composition revision.
 Successful patches belong to the controller accumulator; denied, stale,
 malformed, cancelled, and failed requests leave or restore the prior
-composition. Removing the declared roots leaves no fibers, bindings, state
-cells, registrations, pending patches, composition effects, desired roots, or
-live module artifacts.
+composition.
+
+A sandboxed persistence component can register one host-admitted journal path.
+Committed desired-tree snapshots carry canonical artifact paths, SHA-256
+digests, composition revisions, sequence numbers, and checksums. Restart
+verifies the latest complete record, creates fresh fibers from that declaration,
+and preserves committed patch inverses without replaying historical lifecycle
+effects. Torn final writes are removed; interior corruption fails closed.
+Removing the application and journal roots leaves no fibers, bindings, state
+cells, registrations, pending patches, composition effects, desired roots,
+journal registrations, or live module artifacts.
 
 ## Non-goals
 
 - Production model access.
 - Repository mutation.
-- Persistent sessions.
+- Conversation and model-visible session persistence.
 - TUI.
 - Package installation or remote transport.
 - Compatibility with the existing Quartz repository.

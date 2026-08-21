@@ -2,7 +2,9 @@ use quartz_kernel::{
     ComponentSpec, ComponentTree, CompositionPatch, Error, FiberState, Limits, Runtime, TraceEvent,
 };
 use std::{
+    fs,
     path::{Path, PathBuf},
+    process::Command,
     time::Instant,
 };
 
@@ -17,6 +19,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(2_000);
             std::thread::sleep(std::time::Duration::from_millis(millis));
+        }
+        Some("--durable-write") => {
+            run_durable_phase(&required_path(args.next())?, DurablePhase::Write)?
+        }
+        Some("--durable-recover") => {
+            run_durable_phase(&required_path(args.next())?, DurablePhase::Recover)?
+        }
+        Some("--durable-verify") => {
+            run_durable_phase(&required_path(args.next())?, DurablePhase::Verify)?
         }
         Some(argument) => return Err(format!("unknown argument `{argument}`").into()),
         None => run_acceptance()?,
@@ -86,6 +97,7 @@ fn run_acceptance() -> Result<(), Box<dyn std::error::Error>> {
     let scenario_total_ns = started.elapsed().as_nanos();
     let cross_component_resolve_ns = measure_cross_component_resolve(&fixtures, 1_000_000)?;
     run_governed_acceptance(&fixtures)?;
+    run_durable_acceptance(&fixtures)?;
     println!("root removed: subtree recovered to a clean context");
     println!("initial_composition_ns={initial_composition_ns}");
     println!("invalid_replacement_ns={invalid_replacement_ns}");
@@ -138,6 +150,101 @@ fn run_governed_acceptance(fixtures: &Path) -> Result<(), Box<dyn std::error::Er
     );
     println!("governed composition removed: context clean");
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum DurablePhase {
+    Write,
+    Recover,
+    Verify,
+}
+
+fn run_durable_acceptance(fixtures: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let journal =
+        std::env::temp_dir().join(format!("quartz-slice2-smoke-{}.qj", std::process::id()));
+    if journal.exists() {
+        fs::remove_file(&journal)?;
+    }
+    let executable = std::env::current_exe()?;
+    for argument in ["--durable-write", "--durable-recover", "--durable-verify"] {
+        let status = Command::new(&executable)
+            .arg(argument)
+            .arg(&journal)
+            .status()?;
+        if !status.success() {
+            return Err(format!("durable phase `{argument}` failed with {status}").into());
+        }
+    }
+    fs::remove_file(&journal)?;
+    assert!(fixtures.join("journal.wasm").is_file());
+    Ok(())
+}
+
+fn run_durable_phase(
+    journal: &Path,
+    phase: DurablePhase,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixtures = PathBuf::from(env!("QUARTZ_FIXTURE_DIR"));
+    let mut runtime = Runtime::open_persistent(
+        Limits::default(),
+        ComponentSpec::new("journal", artifact(&fixtures, "journal"))
+            .with_journal_paths(vec![journal.to_path_buf()]),
+    )?;
+    match phase {
+        DurablePhase::Write => {
+            runtime.apply_tree(durable_tree(&fixtures, true, "provider-a"))?;
+            assert_eq!(runtime.state_value("app/provider", 10), Some(2));
+            assert_eq!(runtime.observation().composition_effects, 1);
+            assert_eq!(runtime.journal_sequence(), Some(1));
+            println!("durable commit: provider-b journaled before process exit");
+        }
+        DurablePhase::Recover => {
+            assert_eq!(runtime.state_value("app/provider", 10), Some(2));
+            assert_eq!(runtime.observation().composition_effects, 1);
+            runtime.apply_tree(durable_tree(&fixtures, false, "provider-b"))?;
+            assert_eq!(runtime.state_value("app/provider", 10), Some(1));
+            assert_eq!(runtime.observation().composition_effects, 0);
+            assert_eq!(runtime.journal_sequence(), Some(2));
+            println!("durable restart: provider-b reconstructed; inverse journaled provider-a");
+        }
+        DurablePhase::Verify => {
+            assert_eq!(runtime.state_value("app/provider", 10), Some(1));
+            assert_eq!(runtime.observation().composition_effects, 0);
+            runtime.shutdown_persistent()?;
+            assert!(runtime.is_observationally_clean());
+            println!("durable second restart: provider-a reconstructed; shutdown clean");
+        }
+    }
+    Ok(())
+}
+
+fn durable_tree(fixtures: &Path, controller: bool, provider: &str) -> ComponentTree {
+    let mut roots = vec![
+        ComponentSpec::new("app", artifact(fixtures, "root"))
+            .with_config(3)
+            .with_children(vec![
+                ComponentSpec::new("governor", artifact(fixtures, "governor")),
+                ComponentSpec::new("provider", artifact(fixtures, provider)),
+                ComponentSpec::new("consumer", artifact(fixtures, "consumer")),
+            ]),
+    ];
+    if controller {
+        roots.push(
+            ComponentSpec::new("controller", artifact(fixtures, "durable-controller"))
+                .with_config(1_u64 << 32)
+                .with_patches(vec![CompositionPatch::replace(
+                    "app/provider",
+                    ComponentSpec::new("provider", artifact(fixtures, "provider-b")),
+                )]),
+        );
+    }
+    ComponentTree { roots }
+}
+
+fn required_path(value: Option<String>) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    value
+        .map(PathBuf::from)
+        .ok_or_else(|| "durable phase requires a journal path".into())
 }
 
 fn measure_cross_component_resolve(
