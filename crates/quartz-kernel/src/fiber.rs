@@ -10,6 +10,7 @@ use crate::{
     events::{EventStreamRegistration, PendingEvent},
     exchange::{ExchangeAdapter, ExchangeRegistration},
     journal::{DurablePayload, EventFact},
+    repository::{WorkspaceAuthorization, WorkspaceGrant, recover_workspace_publication},
     wasm_host::{
         GuestInstance, STATUS_COLLISION, STATUS_INVALID, STATUS_LIMIT, STATUS_OK,
         STATUS_UNDECLARED, STATUS_UNSATISFIED,
@@ -63,6 +64,8 @@ pub(crate) struct Fiber {
     pub(crate) staged_response: Option<DurablePayload>,
     pub(crate) staged_usage: Option<u64>,
     pub(crate) inbound_response: Option<DurablePayload>,
+    pub(crate) workspace_buffers: Vec<Vec<u8>>,
+    pub(crate) workspace_authorization: Option<WorkspaceAuthorization>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,6 +126,12 @@ pub(crate) enum Inverse {
     CloseExchange {
         effect: u64,
     },
+    RestoreWorkspace {
+        effect: u64,
+        grant: WorkspaceGrant,
+        before_bytes: Vec<u8>,
+        result_bytes: Vec<u8>,
+    },
 }
 
 impl Inverse {
@@ -134,7 +143,8 @@ impl Inverse {
             | Self::RestoreComposition { effect, .. }
             | Self::CloseJournal { effect }
             | Self::CloseEventStream { effect }
-            | Self::CloseExchange { effect } => *effect,
+            | Self::CloseExchange { effect }
+            | Self::RestoreWorkspace { effect, .. } => *effect,
         }
     }
 
@@ -147,6 +157,7 @@ impl Inverse {
             Self::CloseJournal { .. } => "composition-journal",
             Self::CloseEventStream { .. } => "event-stream",
             Self::CloseExchange { .. } => "exchange-ledger",
+            Self::RestoreWorkspace { .. } => "workspace-publication",
         }
     }
 }
@@ -359,6 +370,33 @@ impl Core {
                     let _ = worker.join();
                 }
             }
+            Inverse::RestoreWorkspace {
+                effect,
+                grant,
+                before_bytes,
+                result_bytes,
+            } => {
+                if let Err(error) = recover_workspace_publication(
+                    &grant,
+                    &before_bytes,
+                    &result_bytes,
+                    self.limits.max_mutation_record_bytes,
+                ) {
+                    self.fibers
+                        .get_mut(&fiber_id)
+                        .ok_or_else(|| {
+                            Error::Invariant("workspace inverse owner disappeared".into())
+                        })?
+                        .accumulator
+                        .push(Inverse::RestoreWorkspace {
+                            effect,
+                            grant,
+                            before_bytes,
+                            result_bytes,
+                        });
+                    return Err(error);
+                }
+            }
         }
         self.trace.push(TraceEvent::EffectRecovered {
             fiber: fiber_id,
@@ -402,6 +440,7 @@ impl Core {
             || fiber.staged_response.is_some()
             || fiber.staged_usage.is_some()
             || fiber.inbound_response.is_some()
+            || fiber.workspace_authorization.is_some()
         {
             return Err(Error::Invariant(
                 "removed fiber retained context effects".into(),
@@ -696,6 +735,11 @@ impl Fiber {
         path: String,
         spec: PreparedSpec,
     ) -> Self {
+        let workspace_buffers = spec
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.bytes.to_vec())
+            .collect();
         Self {
             id,
             parent,
@@ -713,6 +757,8 @@ impl Fiber {
             staged_response: None,
             staged_usage: None,
             inbound_response: None,
+            workspace_buffers,
+            workspace_authorization: None,
         }
     }
 

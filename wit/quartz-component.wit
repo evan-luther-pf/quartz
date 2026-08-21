@@ -1,4 +1,4 @@
-package quartz:component@0.7.0;
+package quartz:component@0.8.0;
 
 world module {
   /// Set a fiber-owned context cell. Returns zero or a Quartz status code.
@@ -53,6 +53,21 @@ world module {
 
   /// Queue the staged callable response as a replay-aware durable payload.
   import resume-exchange: func(event-index: u64, value: u64) -> s32;
+
+  /// Return one private mutable workspace length, or a negative Quartz status.
+  import workspace-len: func(index: u64) -> s64;
+
+  /// Return one private mutable workspace byte, or a negative Quartz status.
+  import workspace-byte: func(index: u64, offset: u64) -> s32;
+
+  /// Resize one private mutable workspace within its admitted bound.
+  import workspace-set-len: func(index: u64, length: u64) -> s32;
+
+  /// Replace one existing byte in a private mutable workspace.
+  import workspace-write-byte: func(index: u64, offset: u64, value: u32) -> s32;
+
+  /// Publish one exactly approved workspace to its admitted source file.
+  import publish-workspace: func(index: u64) -> s32;
   /// Return the bounded committed event count, or a negative Quartz status.
   import event-count: func() -> s64;
 

@@ -14,7 +14,7 @@ A component may change the desired component tree through the same context it us
 
 ## Implemented foundation
 
-Slices 0 through 6 are complete. Quartz has a Rust context kernel and loads
+Slices 0 through 7 are complete. Quartz has a Rust context kernel and loads
 every acceptance component as a Wasmtime component through the public WIT
 contract. The runtime tracks structural inverses, resolves scalar and callable
 dependencies by provider fiber identity, orders dependent recovery before
@@ -72,17 +72,31 @@ then stop. Provider replacement and shutdown recover live exchange authority
 while requests, temporary remote retention, billing, and ledger records remain
 honestly external.
 
+Host-admitted workspace grants bind one canonical regular source file, one
+provenance label, bounded private bytes, exact before/result digests, a stable
+operation identity, and a durable mutation ledger. Sandboxed editors mutate
+only their indexed buffer and publish only after invoking a committed callable
+authority that approves that exact operation and workspace. Publication records
+intent, verifies the live source, atomically replaces it, and records the
+outcome. Restart reconstructs an applied operation without publishing twice.
+Editor replacement restores the prior generation before admitting the next
+workspace, and removal restores the original only while the source retains the
+published digest. Source drift and mutation collisions fail closed.
+
 Removing the application and persistence roots leaves no fibers, bindings,
 state cells, child registrations, pending patches or events, composition
 effects, desired roots, journal, event, or exchange registrations, outbox
-entries, in-flight provider calls or exchange workers, staged responses, or
-live module artifacts. Durable journal, event, and exchange records remain
-honestly external.
+entries, in-flight provider calls or exchange workers, staged responses,
+workspace buffers or approvals, publication inverses, or live module artifacts.
+Durable journal, event, exchange, and mutation-ledger records remain honestly
+external.
 
 ## Non-goals
 
-- Streaming production responses, automatic model retries, model-selected tools, or unbounded conversation/session payloads.
-- Repository mutation.
+- Streaming production responses, automatic model retries, model-selected
+  tools, or unbounded conversation/session payloads.
+- Model-selected repository paths, directory mutation, or multi-file
+  transactions.
 - TUI.
 - Package installation or remote transport.
 - Compatibility with the existing Quartz repository.

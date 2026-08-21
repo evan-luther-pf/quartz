@@ -461,6 +461,7 @@ impl Runtime {
                     fiber_record.staged_response = None;
                     fiber_record.staged_usage = None;
                     fiber_record.inbound_response = None;
+                    fiber_record.workspace_authorization = None;
                     let path = fiber_record.path.clone();
                     if let Some(error) = failed {
                         fiber_record.state = InternalState::Failed;
@@ -570,15 +571,42 @@ impl Runtime {
         let Some((id, target)) = candidate else {
             return Ok(false);
         };
-        let spec = self
-            .core
-            .borrow()
-            .fibers
-            .get(&id)
-            .ok_or_else(|| Error::Invariant("activation candidate disappeared".into()))?
-            .spec
-            .clone();
-        match self.instantiate(id, &spec) {
+        let (path, mut spec) = {
+            let core = self.core.borrow();
+            let fiber = core
+                .fibers
+                .get(&id)
+                .ok_or_else(|| Error::Invariant("activation candidate disappeared".into()))?;
+            (fiber.path.clone(), fiber.spec.clone())
+        };
+        let activation = if spec.workspaces.is_empty() {
+            self.instantiate(id, &spec)
+        } else {
+            let grants: Vec<_> = spec
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.grant.clone())
+                .collect();
+            match self.prepare_workspaces(&path, &grants) {
+                Ok(workspaces) => {
+                    let workspace_buffers = workspaces
+                        .iter()
+                        .map(|workspace| workspace.bytes.to_vec())
+                        .collect();
+                    let mut core = self.core.borrow_mut();
+                    let fiber = core.fibers.get_mut(&id).ok_or_else(|| {
+                        Error::Invariant("activation candidate disappeared".into())
+                    })?;
+                    fiber.workspace_buffers = workspace_buffers;
+                    fiber.spec.workspaces = workspaces.clone();
+                    drop(core);
+                    spec.workspaces = workspaces;
+                    self.instantiate(id, &spec)
+                }
+                Err(error) => Err(error),
+            }
+        };
+        match activation {
             Ok(instance) => {
                 let mut core = self.core.borrow_mut();
                 let path = {
@@ -637,9 +665,33 @@ impl Runtime {
         path: &str,
         old: FiberId,
         candidate: FiberId,
-        spec: PreparedSpec,
+        mut spec: PreparedSpec,
         instance: GuestInstance,
     ) -> Result<()> {
+        if !spec.workspaces.is_empty() {
+            let grants: Vec<_> = spec
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.grant.clone())
+                .collect();
+            match self.prepare_workspaces(path, &grants) {
+                Ok(workspaces) => spec.workspaces = workspaces,
+                Err(error) => {
+                    let mut core = self.core.borrow_mut();
+                    let old = core.fibers.get_mut(&old).ok_or_else(|| {
+                        Error::Invariant(
+                            "old generation disappeared during workspace staging".into(),
+                        )
+                    })?;
+                    old.retired = false;
+                    old.pinned = false;
+                    drop(core);
+                    drop(instance);
+                    self.reconcile_to_quiescence()?;
+                    return Err(Error::ReplacementRolledBack(error.to_string()));
+                }
+            }
+        }
         let mut core = self.core.borrow_mut();
         let old_record = core
             .fibers

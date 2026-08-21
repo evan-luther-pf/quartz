@@ -12,7 +12,7 @@ use crate::{
     fiber::{Core, FiberBackup, InternalState, Inverse},
     journal::{EventGrant, Journal, JournalEffect, JournalSnapshot},
     module::Artifact,
-    repository::PreparedSnapshot,
+    repository::{PreparedSnapshot, PreparedWorkspace},
     runtime::Runtime,
     wasm_host::{
         STATUS_BUSY, STATUS_COLLISION, STATUS_DENIED, STATUS_INVALID, STATUS_OK, STATUS_STALE,
@@ -76,6 +76,7 @@ pub(crate) struct PreparedSpec {
     pub(crate) event_grants: Vec<EventGrant>,
     pub(crate) snapshots: Vec<PreparedSnapshot>,
     pub(crate) exchange_grants: Vec<ExchangeGrant>,
+    pub(crate) workspaces: Vec<PreparedWorkspace>,
 }
 
 #[derive(Clone)]
@@ -733,7 +734,20 @@ impl Runtime {
                 )));
             }
         }
+        let requests_workspace_read = artifact.manifest.requests(HostCapability::WorkspaceRead);
+        let requests_workspace_write = artifact.manifest.requests(HostCapability::WorkspaceWrite);
+        let requests_workspace_publish =
+            artifact.manifest.requests(HostCapability::WorkspacePublish);
+        if !(requests_workspace_read == requests_workspace_write
+            && requests_workspace_write == requests_workspace_publish)
+            || requests_workspace_read != !spec.workspace_grants.is_empty()
+        {
+            return Err(Error::Manifest(format!(
+                "component `{path}` must pair workspace read, write, and publish authority with admitted grants"
+            )));
+        }
         let snapshots = self.prepare_snapshots(path, &spec.snapshot_grants)?;
+        let workspaces = self.stage_workspaces(path, &spec.workspace_grants)?;
         if artifact.manifest.component.max_activation_steps > self.limits.max_activation_steps {
             return Err(Error::ActivationLimit(
                 artifact.manifest.component.id.clone(),
@@ -763,6 +777,7 @@ impl Runtime {
             event_grants: spec.event_grants,
             snapshots,
             exchange_grants: spec.exchange_grants,
+            workspaces,
         })
     }
 
@@ -1443,6 +1458,11 @@ fn same_spec(left: &PreparedSpec, right: &PreparedSpec) -> bool {
         && left.children.len() == right.children.len()
         && left.exchange_grants == right.exchange_grants
         && left
+            .workspaces
+            .iter()
+            .map(|workspace| &workspace.grant)
+            .eq(right.workspaces.iter().map(|workspace| &workspace.grant))
+        && left
             .children
             .iter()
             .zip(&right.children)
@@ -1578,6 +1598,11 @@ impl PreparedSpec {
                 .map(|snapshot| snapshot.grant.clone())
                 .collect(),
             exchange_grants: self.exchange_grants.clone(),
+            workspace_grants: self
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.grant.clone())
+                .collect(),
         }
     }
 }

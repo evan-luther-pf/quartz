@@ -14,10 +14,12 @@ const COMPOSITION_MAGIC: &[u8; 8] = b"QUARTZJ2";
 const EVENT_MAGIC: &[u8; 8] = b"QUARTZE2";
 const HEADER_LEN: usize = 12;
 const EXCHANGE_MAGIC: &[u8; 8] = b"QUARTZX1";
+const MUTATION_MAGIC: &[u8; 8] = b"QUARTZM1";
 const CHECKSUM_LEN: usize = 32;
 const COMPOSITION_SCHEMA_VERSION: u32 = 2;
 const EVENT_SCHEMA_VERSION: u32 = 2;
 const EXCHANGE_SCHEMA_VERSION: u32 = 1;
+const MUTATION_SCHEMA_VERSION: u32 = 1;
 
 type FramedPayloads = Vec<(u64, Vec<u8>)>;
 type DecodedLog = (u64, FramedPayloads, usize);
@@ -171,6 +173,50 @@ struct ExchangePayload {
     invocation: u64,
     request_sha256: String,
     outcome: ExchangeLedgerOutcome,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MutationPayload {
+    schema: u32,
+    operation: u64,
+    source_path: PathBuf,
+    provenance: String,
+    before_sha256: String,
+    result_sha256: String,
+    before_bytes: Vec<u8>,
+    result_bytes: Vec<u8>,
+    outcome: MutationLedgerOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum MutationLedgerOutcome {
+    Started,
+    Applied,
+    Reverted,
+    Ambiguous,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MutationLedgerRecord {
+    pub(crate) source_path: PathBuf,
+    pub(crate) provenance: String,
+    pub(crate) before_sha256: String,
+    pub(crate) result_sha256: String,
+    pub(crate) before_bytes: Vec<u8>,
+    pub(crate) result_bytes: Vec<u8>,
+    pub(crate) outcome: MutationLedgerOutcome,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct MutationLedgerIdentity<'a> {
+    pub(crate) source_path: &'a Path,
+    pub(crate) provenance: &'a str,
+    pub(crate) before_sha256: &'a str,
+    pub(crate) result_sha256: &'a str,
+    pub(crate) before_bytes: &'a [u8],
+    pub(crate) result_bytes: &'a [u8],
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -572,6 +618,190 @@ impl ExchangeLedger {
     }
 }
 
+pub(crate) struct MutationLedger {
+    log: FramedLog,
+    records: BTreeMap<u64, MutationLedgerRecord>,
+}
+
+impl MutationLedger {
+    pub(crate) fn open(path: &Path, max_record_bytes: usize) -> Result<Self> {
+        let (log, payloads) =
+            FramedLog::open(path, MUTATION_MAGIC, max_record_bytes, LogKind::Mutation)?;
+        let mut records = BTreeMap::new();
+        for (_, payload) in payloads {
+            let payload: MutationPayload = serde_json::from_slice(&payload)
+                .map_err(|error| Error::MutationCorrupt(error.to_string()))?;
+            if payload.schema != MUTATION_SCHEMA_VERSION {
+                return Err(Error::MutationCorrupt(format!(
+                    "unsupported mutation ledger schema {}",
+                    payload.schema
+                )));
+            }
+            let record = MutationLedgerRecord {
+                source_path: payload.source_path,
+                provenance: payload.provenance,
+                before_sha256: payload.before_sha256,
+                result_sha256: payload.result_sha256,
+                before_bytes: payload.before_bytes,
+                result_bytes: payload.result_bytes,
+                outcome: payload.outcome,
+            };
+            validate_mutation_record(payload.operation, &record)?;
+            match records.get(&payload.operation) {
+                None if record.outcome == MutationLedgerOutcome::Started => {
+                    records.insert(payload.operation, record);
+                }
+                Some(previous)
+                    if same_mutation(previous, &record)
+                        && matches!(
+                            (previous.outcome, record.outcome),
+                            (
+                                MutationLedgerOutcome::Started,
+                                MutationLedgerOutcome::Applied
+                                    | MutationLedgerOutcome::Reverted
+                                    | MutationLedgerOutcome::Ambiguous
+                            ) | (
+                                MutationLedgerOutcome::Applied,
+                                MutationLedgerOutcome::Reverted | MutationLedgerOutcome::Ambiguous
+                            )
+                        ) =>
+                {
+                    records.insert(payload.operation, record);
+                }
+                _ => {
+                    return Err(Error::MutationCorrupt(format!(
+                        "invalid mutation transition for operation {}",
+                        payload.operation
+                    )));
+                }
+            }
+        }
+        Ok(Self { log, records })
+    }
+
+    pub(crate) fn record(
+        &self,
+        operation: u64,
+        identity: MutationLedgerIdentity<'_>,
+    ) -> Result<Option<&MutationLedgerRecord>> {
+        let Some(record) = self.records.get(&operation) else {
+            return Ok(None);
+        };
+        if record.source_path != identity.source_path
+            || record.provenance != identity.provenance
+            || record.before_sha256 != identity.before_sha256
+            || record.result_sha256 != identity.result_sha256
+            || record.before_bytes != identity.before_bytes
+            || record.result_bytes != identity.result_bytes
+        {
+            return Err(Error::MutationCorrupt(format!(
+                "operation {operation} was reused with different mutation identity or bytes"
+            )));
+        }
+        Ok(Some(record))
+    }
+
+    pub(crate) fn append_started(
+        &mut self,
+        operation: u64,
+        record: MutationLedgerRecord,
+    ) -> Result<()> {
+        if self.records.contains_key(&operation) || record.outcome != MutationLedgerOutcome::Started
+        {
+            return Err(Error::MutationCorrupt(format!(
+                "invalid new mutation operation {operation}"
+            )));
+        }
+
+        validate_mutation_record(operation, &record)?;
+        self.append(operation, &record)?;
+        self.records.insert(operation, record);
+        Ok(())
+    }
+    pub(crate) fn lookup(&self, operation: u64) -> Option<&MutationLedgerRecord> {
+        self.records.get(&operation)
+    }
+
+    pub(crate) fn append_outcome(
+        &mut self,
+        operation: u64,
+        outcome: MutationLedgerOutcome,
+    ) -> Result<()> {
+        if outcome == MutationLedgerOutcome::Started {
+            return Err(Error::MutationCorrupt(format!(
+                "invalid terminal mutation operation {operation}"
+            )));
+        }
+        let Some(previous) = self.records.get(&operation) else {
+            return Err(Error::MutationCorrupt(format!(
+                "unknown mutation operation {operation}"
+            )));
+        };
+        if !matches!(
+            (previous.outcome, outcome),
+            (
+                MutationLedgerOutcome::Started,
+                MutationLedgerOutcome::Applied
+                    | MutationLedgerOutcome::Reverted
+                    | MutationLedgerOutcome::Ambiguous
+            ) | (
+                MutationLedgerOutcome::Applied,
+                MutationLedgerOutcome::Reverted | MutationLedgerOutcome::Ambiguous
+            )
+        ) {
+            return Err(Error::MutationCorrupt(format!(
+                "invalid terminal mutation transition for operation {operation}"
+            )));
+        }
+        let mut record = previous.clone();
+        record.outcome = outcome;
+        self.append(operation, &record)?;
+        self.records.insert(operation, record);
+        Ok(())
+    }
+
+    fn append(&mut self, operation: u64, record: &MutationLedgerRecord) -> Result<()> {
+        let payload = serde_json::to_vec(&MutationPayload {
+            schema: MUTATION_SCHEMA_VERSION,
+            operation,
+            source_path: record.source_path.clone(),
+            provenance: record.provenance.clone(),
+            before_sha256: record.before_sha256.clone(),
+            result_sha256: record.result_sha256.clone(),
+            before_bytes: record.before_bytes.clone(),
+            result_bytes: record.result_bytes.clone(),
+            outcome: record.outcome,
+        })?;
+        self.log.append(&payload)?;
+        Ok(())
+    }
+}
+
+fn validate_mutation_record(operation: u64, record: &MutationLedgerRecord) -> Result<()> {
+    if operation == 0
+        || !record.source_path.is_absolute()
+        || record.provenance.is_empty()
+        || !valid_sha256(&record.before_sha256)
+        || !valid_sha256(&record.result_sha256)
+        || sha256_hex(&record.before_bytes) != record.before_sha256
+        || sha256_hex(&record.result_bytes) != record.result_sha256
+    {
+        return Err(Error::MutationCorrupt(
+            "mutation record has invalid identity or bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn same_mutation(left: &MutationLedgerRecord, right: &MutationLedgerRecord) -> bool {
+    left.source_path == right.source_path
+        && left.provenance == right.provenance
+        && left.before_sha256 == right.before_sha256
+        && left.result_sha256 == right.result_sha256
+        && left.before_bytes == right.before_bytes
+        && left.result_bytes == right.result_bytes
+}
+
 fn validate_exchange_payload(payload: &DurablePayload) -> Result<()> {
     if payload.provenance.is_empty() {
         return Err(Error::ExchangeCorrupt(
@@ -607,7 +837,7 @@ fn validate_durable_payload(payload: Option<&DurablePayload>) -> Result<()> {
     Ok(())
 }
 
-fn valid_sha256(value: &str) -> bool {
+pub(crate) fn valid_sha256(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
@@ -632,6 +862,7 @@ enum LogKind {
     Composition,
     Event,
     Exchange,
+    Mutation,
 }
 
 impl LogKind {
@@ -640,6 +871,7 @@ impl LogKind {
             Self::Composition => "composition journal",
             Self::Event => "event stream",
             Self::Exchange => "exchange ledger",
+            Self::Mutation => "mutation ledger",
         }
     }
 
@@ -648,6 +880,7 @@ impl LogKind {
             Self::Composition => Error::JournalCorrupt(message.into()),
             Self::Event => Error::EventCorrupt(message.into()),
             Self::Exchange => Error::ExchangeCorrupt(message.into()),
+            Self::Mutation => Error::MutationCorrupt(message.into()),
         }
     }
 
@@ -656,6 +889,7 @@ impl LogKind {
             Self::Composition => Error::JournalRecordLimit { actual, limit },
             Self::Event => Error::EventRecordBytesLimit { actual, limit },
             Self::Exchange => Error::ExchangeRecordLimit { actual, limit },
+            Self::Mutation => Error::MutationRecordLimit { actual, limit },
         }
     }
 }
@@ -864,6 +1098,11 @@ fn durable_io(
             source,
         },
         LogKind::Exchange => Error::ExchangeIo {
+            operation,
+            path: path.to_path_buf(),
+            source,
+        },
+        LogKind::Mutation => Error::MutationIo {
             operation,
             path: path.to_path_buf(),
             source,

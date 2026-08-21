@@ -260,6 +260,32 @@ is still finishing, exchange recovery joins it before reporting a clean
 context. Recovery closes the ledger and clears staged authority. Ledger records,
 transmitted input, remote compute, and billing remain honestly external.
 
+## Bounded mutable workspace boundary
+
+Slice 7 admits one canonical regular source file into a host-owned, bounded
+mutable buffer without exposing a path or ambient filesystem authority to guest
+code. A workspace grant binds provenance, a durable operation identity, exact
+before/result digests, a canonical mutation ledger, and a byte limit.
+Activation reads and verifies mutable source bytes only after any replaced fiber
+has recovered, so a new generation never stages stale bytes from before its
+predecessor's inverse.
+
+An editor may publish only while activating and only after a committed callable
+mutation-authority provider approves the same operation and workspace index.
+The host independently verifies the staged result and current source, records
+started intent, synchronizes a same-directory temporary file, atomically renames
+it, and records the terminal outcome. A successful publication installs a fiber
+inverse. Recovery restores the exact admitted bytes only from the published
+digest; any third digest records ambiguity and is not overwritten.
+
+Applied operations reconstruct from the checksummed mutation ledger without a
+second replacement or duplicate terminal record. Workspace buffers, staged
+approvals, callable views, and publication inverses are reversible context
+authority. Source bytes and mutation-ledger records cross the system boundary:
+recovery is exact only while Quartz retains the published source identity.
+Concurrent non-Quartz writers are excluded during the bounded replacement
+critical section.
+
 ## Self-modification
 
 The authoritative state is a declarative component tree. A running component—including the agent—may propose a tree patch through a governed composition capability. Reconciliation turns the accepted patch into fiber insertions, updates, disablement, and removal. Source changes become new module artifacts; the loader stages the artifact, reconstructs affected fibers, and rolls back to the previous artifact if activation fails.

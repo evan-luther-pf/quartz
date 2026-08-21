@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{Error, Result};
 
-pub const ABI_VERSION: u32 = 7;
+pub const ABI_VERSION: u32 = 8;
 pub const MANIFEST_SECTION: &str = "quartz:manifest";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -76,6 +76,9 @@ pub enum HostCapability {
     ResumeExchange,
     ResumeSnapshot,
     SetState,
+    WorkspaceRead,
+    WorkspaceWrite,
+    WorkspacePublish,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

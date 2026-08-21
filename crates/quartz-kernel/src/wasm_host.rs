@@ -13,6 +13,7 @@ use crate::{
     composition::{PatchAuthorization, PreparedSpec},
     events::EventPayloadSource,
     fiber::{Core, InternalState},
+    repository::WorkspaceAuthorization,
     runtime::Runtime,
 };
 
@@ -285,6 +286,61 @@ fn link_host(linker: &mut Linker<HostState>) -> Result<()> {
     linker
         .root()
         .func_wrap(
+            "workspace-len",
+            |store: StoreContextMut<'_, HostState>, (index,): (u64,)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_workspace_len(fiber, index)
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
+            "workspace-byte",
+            |store: StoreContextMut<'_, HostState>, (index, offset): (u64, u64)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_workspace_byte(fiber, index, offset)
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
+            "workspace-set-len",
+            |store: StoreContextMut<'_, HostState>, (index, length): (u64, u64)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_workspace_set_len(fiber, index, length)
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
+            "workspace-write-byte",
+            |store: StoreContextMut<'_, HostState>, (index, offset, value): (u64, u64, u32)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_workspace_write_byte(fiber, index, offset, value)
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
+            "publish-workspace",
+            |store: StoreContextMut<'_, HostState>, (index,): (u64,)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_publish_workspace(fiber, index)
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
             "event-count",
             |store: StoreContextMut<'_, HostState>, (): ()| {
                 Ok((with_core(store, |core, fiber| core.host_event_count(fiber)),))
@@ -417,6 +473,32 @@ fn host_invoke(
                 base_revision: arg1,
             });
         }
+    }
+    if result == 1
+        && operation == 1
+        && committed.interface.namespace == "quartz.repository"
+        && committed.interface.interface == "mutation-authority"
+        && committed.interface.revision == 1
+    {
+        let Ok(index) = usize::try_from(arg1) else {
+            return -(STATUS_INVALID as i64);
+        };
+        let Some(record) = core.fibers.get_mut(&caller) else {
+            return -(STATUS_INVALID as i64);
+        };
+        if record
+            .spec
+            .workspaces
+            .get(index)
+            .is_none_or(|workspace| workspace.grant.operation != arg0)
+        {
+            return -(STATUS_INVALID as i64);
+        }
+        record.workspace_authorization = Some(WorkspaceAuthorization {
+            provider,
+            index,
+            operation: arg0,
+        });
     }
     result
 }

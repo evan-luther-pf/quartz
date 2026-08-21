@@ -1,5 +1,5 @@
 {
-  "abi": 7,
+  "abi": 8,
   "module": "quartz.slice3.event-store",
   "version": "0.1.0",
   "execution_mode": "wasm-component",

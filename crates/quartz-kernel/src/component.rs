@@ -5,6 +5,7 @@ use crate::{
     composition::CompositionPatch,
     exchange::ExchangeGrant,
     journal::{EventGrant, SnapshotGrant},
+    repository::WorkspaceGrant,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -24,6 +25,7 @@ pub struct ComponentSpec {
     pub event_grants: Vec<EventGrant>,
     pub snapshot_grants: Vec<SnapshotGrant>,
     pub exchange_grants: Vec<ExchangeGrant>,
+    pub workspace_grants: Vec<WorkspaceGrant>,
 }
 
 impl ComponentSpec {
@@ -40,6 +42,7 @@ impl ComponentSpec {
             event_grants: Vec::new(),
             snapshot_grants: Vec::new(),
             exchange_grants: Vec::new(),
+            workspace_grants: Vec::new(),
         }
     }
 
@@ -87,6 +90,11 @@ impl ComponentSpec {
         self.exchange_grants = grants;
         self
     }
+
+    pub fn with_workspace_grants(mut self, grants: Vec<WorkspaceGrant>) -> Self {
+        self.workspace_grants = grants;
+        self
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -110,6 +118,9 @@ pub struct Limits {
     pub max_payload_bytes: usize,
     pub max_payload_total_bytes: usize,
     pub max_exchange_record_bytes: usize,
+    pub max_workspace_grants: usize,
+    pub max_workspace_bytes: usize,
+    pub max_mutation_record_bytes: usize,
 }
 
 impl Default for Limits {
@@ -128,6 +139,9 @@ impl Default for Limits {
             max_payload_bytes: 64 * 1024,
             max_payload_total_bytes: 512 * 1024,
             max_exchange_record_bytes: 128 * 1024,
+            max_workspace_grants: 8,
+            max_workspace_bytes: 64 * 1024,
+            max_mutation_record_bytes: 256 * 1024,
         }
     }
 }

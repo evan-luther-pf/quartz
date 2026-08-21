@@ -20,6 +20,7 @@ pub use manifest::{
     ABI_VERSION, BindingKind, ComponentDeclaration, HostCapability, InterfaceId, Manifest,
     ProvidedBinding, RequiredBinding, Requirement,
 };
+pub use repository::WorkspaceGrant;
 pub use runtime::Runtime;
 
 use std::path::PathBuf;
@@ -143,6 +144,36 @@ pub enum Error {
     ExchangeCorrupt(String),
     #[error("exchange ledger record size {actual} exceeds limit {limit}")]
     ExchangeRecordLimit { actual: usize, limit: usize },
+    #[error("workspace {operation} failed for {path}: {source}")]
+    WorkspaceIo {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("workspace digest mismatch for {path}: expected {expected}, found {actual}")]
+    WorkspaceDigestMismatch {
+        path: PathBuf,
+        expected: String,
+        actual: String,
+    },
+    #[error("workspace grant count {actual} exceeds limit {limit}")]
+    WorkspaceGrantLimit { actual: usize, limit: usize },
+    #[error("workspace byte size {actual} exceeds limit {limit}")]
+    WorkspaceBytesLimit { actual: usize, limit: usize },
+    #[error("mutation ledger {operation} failed for {path}: {source}")]
+    MutationIo {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("durable mutation ledger is corrupt: {0}")]
+    MutationCorrupt(String),
+    #[error("mutation ledger record size {actual} exceeds limit {limit}")]
+    MutationRecordLimit { actual: usize, limit: usize },
+    #[error("repository mutation is ambiguous for {0}")]
+    MutationAmbiguous(PathBuf),
     #[error("persistent composition error: {0}")]
     Persistence(String),
     #[error("runtime invariant violated: {0}")]

@@ -57,7 +57,7 @@ so compiled code is retained only while a desired, staged, or live generation
 owns it. A process remains an optional isolation mode; it is not the composition
 model.
 
-The ABI 7 WIT contract exposes four lifecycle calls and nineteen capability
+The ABI 8 WIT contract exposes four lifecycle calls and twenty-four capability
 imports:
 
 - `start(config)`, `step(instance)`, `invoke(instance, operation, arg0, arg1)`,
@@ -89,16 +89,24 @@ imports:
   provider's callable dispatch and stages a bounded response under a stable invocation identity;
 - `resume-exchange` attaches the staged callable response to one replay-aware
   durable event request.
+- `workspace-len` and `workspace-byte` expose only a fiber's indexed bounded
+  host-owned mutable buffer;
+- `workspace-set-len` and `workspace-set-byte` mutate that buffer without
+  touching its admitted source file;
+- `publish-workspace` requires exact committed callable approval, admitted
+  before/result digests, and durable mutation identity before a digest-guarded
+  same-directory atomic publication.
 
 Every binding declares `value` or `callable` kind as part of its versioned
 identity. Context-changing imports remain tracked by structural inverses.
-Journal and event records are withheld external emissions and survive component
-recovery; registration inverses close access but do not claim to undo committed
-facts. Exchange requests are irreversible external emissions guarded by a
-durable started/terminal ledger; registration and staged-response authority are
-recovered, but network emission, billing, and ledger records are not. The world
-exposes no ambient filesystem, network, clock, randomness, process, environment,
-or credential import.
+Journal, event, exchange, and mutation-ledger records are external emissions and
+survive component recovery. Registration and publication inverses close live
+authority and restore only context-owned or still-identifiable source state;
+they do not claim to erase committed facts, network requests, billing, or
+unrecognized external edits. Exchange requests remain irreversible emissions
+guarded by a durable started/terminal ledger. The world exposes no ambient
+filesystem, network, clock, randomness, process, environment, or credential
+import.
 
 ### Slice 1 verification
 
@@ -170,6 +178,18 @@ loop against a deterministic host adapter, starts a fresh runtime generation
 for each fact, reconstructs exact response bytes, and recovers every live
 authority. The credentialed OpenAI command is documented in `README.md`; it
 requires `OPENAI_API_KEY`.
+
+### Slice 7 verification
+
+`cargo test -p quartz --test slice7` exercises six isolated-editing contracts:
+bounded workspace isolation and canonical admission, approval denial and stale
+source rejection, exact publication with replacement and subtree recovery,
+restart reconstruction without duplicate publication, mutation identity
+collision rejection, and source-drift ambiguity without overwrite. `cargo run
+--release -p quartz -- --repository-edit /tmp/quartz-slice7-smoke` runs the real
+file path through sandboxed editor and callable authority components, replaces
+the editor through the same public contract, restores the original bytes after
+each generation, and asserts a clean context.
 
 ### Decision evidence
 

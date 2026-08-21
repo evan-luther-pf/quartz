@@ -3,8 +3,9 @@ mod openai;
 use quartz_kernel::{
     ComponentSpec, ComponentTree, CompositionPatch, Error, EventGrant, ExchangeAdapter,
     ExchangeFailure, ExchangeGrant, ExchangeResponse, FiberState, Limits, Runtime, SnapshotGrant,
-    TraceEvent,
+    TraceEvent, WorkspaceGrant,
 };
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -54,6 +55,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some("--agent-verify") => {
             run_agent_phase(&required_path(args.next())?, AgentPhase::Verify)?
+        }
+        Some("--repository-edit") => {
+            run_repository_edit_acceptance(
+                &PathBuf::from(env!("QUARTZ_FIXTURE_DIR")),
+                &required_path(args.next())?,
+            )?;
         }
         Some("--production-model") => {
             let model = args.next().ok_or("production model name is required")?;
@@ -133,6 +140,9 @@ fn run_acceptance() -> Result<(), Box<dyn std::error::Error>> {
     run_event_acceptance(&fixtures)?;
     run_agent_acceptance(&fixtures)?;
     run_exchange_acceptance(&fixtures)?;
+    let repository =
+        std::env::temp_dir().join(format!("quartz-slice7-smoke-{}", std::process::id()));
+    run_repository_edit_acceptance(&fixtures, &repository)?;
     println!("root removed: subtree recovered to a clean context");
     println!("initial_composition_ns={initial_composition_ns}");
     println!("invalid_replacement_ns={invalid_replacement_ns}");
@@ -141,6 +151,127 @@ fn run_acceptance() -> Result<(), Box<dyn std::error::Error>> {
     println!("scenario_total_ns={scenario_total_ns}");
     println!("cross_component_resolve_ns_per={cross_component_resolve_ns:.3}");
     Ok(())
+}
+
+fn run_repository_edit_acceptance(
+    fixtures: &Path,
+    directory: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(directory)?;
+    let source = directory.join("quartz-slice7-source.txt");
+    let ledger = directory.join("quartz-slice7-mutations.qm");
+    if source.exists() || ledger.exists() {
+        return Err(format!(
+            "repository editing smoke paths already exist in `{}`",
+            directory.display()
+        )
+        .into());
+    }
+    let before = b"alpha";
+    let edited_a = b"alpha!";
+    let edited_b = b"alpha?";
+    fs::write(&source, before)?;
+
+    let mut runtime = Runtime::new(Limits::default())?;
+    runtime.apply_tree(repository_edit_tree(
+        fixtures,
+        &source,
+        &ledger,
+        "repo-editor-a",
+        b'!',
+        7_001,
+        edited_a,
+    )?)?;
+    assert_eq!(fs::read(&source)?, edited_a);
+    let editor_a = active_id(&runtime, "root/editor")?;
+    println!("sandboxed editor-a published one approved repository mutation");
+
+    runtime.replace_entry(
+        "root/editor",
+        repository_editor_spec(
+            fixtures,
+            &source,
+            &ledger,
+            "repo-editor-b",
+            b'?',
+            7_002,
+            edited_b,
+        )?,
+    )?;
+    let editor_b = active_id(&runtime, "root/editor")?;
+    assert_ne!(editor_a, editor_b);
+    assert_eq!(fs::read(&source)?, edited_b);
+    println!("editor-b replaced editor-a and published through the same capability");
+
+    runtime.apply_tree(ComponentTree::default())?;
+    assert_eq!(fs::read(&source)?, before);
+    assert!(
+        runtime.is_observationally_clean(),
+        "repository editing final context: {:?}",
+        runtime.observation()
+    );
+    fs::remove_file(&source)?;
+    fs::remove_file(&ledger)?;
+    if directory.read_dir()?.next().is_none() {
+        fs::remove_dir(directory)?;
+    }
+    println!("repository editing subtree removed: source restored and context clean");
+    Ok(())
+}
+
+fn repository_edit_tree(
+    fixtures: &Path,
+    source: &Path,
+    ledger: &Path,
+    editor: &str,
+    byte: u8,
+    operation: u64,
+    result: &[u8],
+) -> Result<ComponentTree, Error> {
+    Ok(ComponentTree {
+        roots: vec![
+            ComponentSpec::new("root", artifact(fixtures, "root"))
+                .with_config(2)
+                .with_children(vec![
+                    ComponentSpec::new("authority", artifact(fixtures, "mutation-authority"))
+                        .with_config(7_002),
+                    repository_editor_spec(
+                        fixtures, source, ledger, editor, byte, operation, result,
+                    )?,
+                ]),
+        ],
+    })
+}
+
+fn repository_editor_spec(
+    fixtures: &Path,
+    source: &Path,
+    ledger: &Path,
+    editor: &str,
+    byte: u8,
+    operation: u64,
+    result: &[u8],
+) -> Result<ComponentSpec, Error> {
+    Ok(ComponentSpec::new("editor", artifact(fixtures, editor))
+        .with_config(u64::from(byte))
+        .with_workspace_grants(vec![WorkspaceGrant::new(
+            source,
+            ledger,
+            operation,
+            "slice7 repository source",
+            digest(b"alpha"),
+            digest(result),
+            64,
+        )?]))
+}
+
+fn digest(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        use std::fmt::Write as _;
+        write!(&mut output, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    output
 }
 
 fn run_governed_acceptance(fixtures: &Path) -> Result<(), Box<dyn std::error::Error>> {
