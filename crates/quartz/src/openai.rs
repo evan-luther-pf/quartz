@@ -95,7 +95,7 @@ fn request_body(model: &str, prompt: &str) -> Value {
         "input": prompt,
         "background": true,
         "store": false,
-        "max_output_tokens": 256
+        "max_output_tokens": 1024
     })
 }
 
@@ -176,7 +176,7 @@ mod tests {
         assert_eq!(body["input"], "prompt");
         assert_eq!(body["background"], true);
         assert_eq!(body["store"], false);
-        assert_eq!(body["max_output_tokens"], 256);
+        assert_eq!(body["max_output_tokens"], 1024);
     }
 
     #[test]

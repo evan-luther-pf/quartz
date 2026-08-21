@@ -24,7 +24,7 @@ A sandboxed client submits one host-admitted UTF-8 prompt through `quartz.agent/
 - The request is the exact payload of one committed event visible through the caller's committed event-stream provider. Missing, ungranted, non-UTF-8, or oversized input is rejected before network emission.
 - A synchronized started record without a successful terminal result—rejection, limit, timeout, transport ambiguity, or crash—commits `interrupted/unknown` and then one stop; it is never retried.
 - Reusing an invocation identity with a different request digest fails closed.
-- Response bytes, usage, provenance, and digest are bounded and synchronized in the exchange ledger before they can enter the event outbox.
+- OpenAI generation is capped at 1,024 output tokens; response bytes, usage, provenance, and digest are independently bounded and synchronized in the exchange ledger before they can enter the event outbox.
 - The host supplies the deadline to the adapter and independently stops waiting at that deadline. The adapter bounds create and polling work by the same deadline. Timeout is durably terminal and ambiguous; Quartz does not claim remote cancellation or safe retry.
 - Callable dispatch releases the core borrow and marks exactly one provider in flight. That provider may call only its declared `event-count`, `read-event`, and `exchange` imports; concurrent or nested provider invocation fails closed. At most one adapter worker may remain outstanding, and a new invocation cannot emit while it is running.
 - Component recovery closes the exchange ledger, clears staged response authority, and joins any timed-out adapter worker before reporting a clean context. Durable ledger records and API emissions remain external.
