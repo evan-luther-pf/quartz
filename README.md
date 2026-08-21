@@ -14,7 +14,11 @@ components run as sandboxed Wasmtime components through
 `lode/`; the primary architecture paper is vendored at
 `research/spatiotemporal-composability.pdf`.
 
-Release smoke: `cargo run --release -p quartz`
+Release CLI help: `cargo run --release -p quartz -- --help`
+
+Release version: `cargo run --release -p quartz -- --version`
+
+Complete acceptance smoke: `cargo run --release -p quartz -- --acceptance`
 
 Focused contracts: `cargo test -p quartz --test slice0 --test slice1 --test slice2 --test slice3 --test slice4 --test slice5 --test slice6 --test slice7 --test slice8 --test slice9`
 

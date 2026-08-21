@@ -14,76 +14,188 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
-        Some("--idle") => {
+const USAGE: &str = "\
+Usage: quartz [COMMAND]
+
+Commands:
+  --help
+  --version
+  --acceptance
+  --idle [milliseconds]
+  --durable-write <journal>
+  --durable-recover <journal>
+  --durable-verify <journal>
+  --events-write <journal>
+  --events-recover <journal>
+  --events-verify <journal>
+  --agent-start <journal>
+  --agent-resume <expected-event-count> <journal>
+  --agent-replace <journal>
+  --agent-verify <journal>
+  --repository-edit <directory>
+  --reviewed-edit <directory>
+  --promote-edit <directory>
+  --production-model <model> <prompt> <journal>
+";
+
+#[derive(Debug, Eq, PartialEq)]
+enum CliCommand {
+    Help,
+    Version,
+    Acceptance,
+    Idle(u64),
+    DurableWrite(PathBuf),
+    DurableRecover(PathBuf),
+    DurableVerify(PathBuf),
+    EventsWrite(PathBuf),
+    EventsRecover(PathBuf),
+    EventsVerify(PathBuf),
+    AgentStart(PathBuf),
+    AgentResume(usize, PathBuf),
+    AgentReplace(PathBuf),
+    AgentVerify(PathBuf),
+    RepositoryEdit(PathBuf),
+    ReviewedEdit(PathBuf),
+    PromoteEdit(PathBuf),
+    ProductionModel {
+        model: String,
+        prompt: PathBuf,
+        journal: PathBuf,
+    },
+}
+
+fn main() {
+    if let Err(error) = run_cli(std::env::args().skip(1)) {
+        eprintln!("quartz: {error}");
+        std::process::exit(2);
+    }
+}
+
+fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), Box<dyn std::error::Error>> {
+    let command =
+        parse_args(args).map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+    match command {
+        CliCommand::Help => print!("{USAGE}"),
+        CliCommand::Version => println!("{}", version_text()),
+        CliCommand::Acceptance => run_acceptance()?,
+        CliCommand::Idle(millis) => {
             let _runtime = Runtime::new(Limits::default())?;
             println!("READY");
-            let millis = args
-                .next()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(2_000);
-            std::thread::sleep(std::time::Duration::from_millis(millis));
+            std::thread::sleep(Duration::from_millis(millis));
         }
-        Some("--durable-write") => {
-            run_durable_phase(&required_path(args.next())?, DurablePhase::Write)?
+        CliCommand::DurableWrite(path) => run_durable_phase(&path, DurablePhase::Write)?,
+        CliCommand::DurableRecover(path) => run_durable_phase(&path, DurablePhase::Recover)?,
+        CliCommand::DurableVerify(path) => run_durable_phase(&path, DurablePhase::Verify)?,
+        CliCommand::EventsWrite(path) => run_event_phase(&path, EventPhase::Write)?,
+        CliCommand::EventsRecover(path) => run_event_phase(&path, EventPhase::Recover)?,
+        CliCommand::EventsVerify(path) => run_event_phase(&path, EventPhase::Verify)?,
+        CliCommand::AgentStart(path) => run_agent_phase(&path, AgentPhase::Start)?,
+        CliCommand::AgentResume(expected, path) => {
+            run_agent_phase(&path, AgentPhase::Resume(expected))?
         }
-        Some("--durable-recover") => {
-            run_durable_phase(&required_path(args.next())?, DurablePhase::Recover)?
+        CliCommand::AgentReplace(path) => run_agent_phase(&path, AgentPhase::Replace)?,
+        CliCommand::AgentVerify(path) => run_agent_phase(&path, AgentPhase::Verify)?,
+        CliCommand::RepositoryEdit(path) => {
+            run_repository_edit_acceptance(&PathBuf::from(env!("QUARTZ_FIXTURE_DIR")), &path)?
         }
-        Some("--durable-verify") => {
-            run_durable_phase(&required_path(args.next())?, DurablePhase::Verify)?
+        CliCommand::ReviewedEdit(path) => {
+            run_reviewed_edit_acceptance(&PathBuf::from(env!("QUARTZ_FIXTURE_DIR")), &path)?
         }
-        Some("--events-write") => run_event_phase(&required_path(args.next())?, EventPhase::Write)?,
-        Some("--events-recover") => {
-            run_event_phase(&required_path(args.next())?, EventPhase::Recover)?
+        CliCommand::PromoteEdit(path) => {
+            run_promoted_edit_acceptance(&PathBuf::from(env!("QUARTZ_FIXTURE_DIR")), &path)?
         }
-        Some("--events-verify") => {
-            run_event_phase(&required_path(args.next())?, EventPhase::Verify)?
-        }
-        Some("--agent-start") => run_agent_phase(&required_path(args.next())?, AgentPhase::Start)?,
-        Some("--agent-resume") => {
-            let expected = args
-                .next()
-                .ok_or("agent resume requires an expected event count")?
-                .parse()?;
-            run_agent_phase(&required_path(args.next())?, AgentPhase::Resume(expected))?
-        }
-        Some("--agent-replace") => {
-            run_agent_phase(&required_path(args.next())?, AgentPhase::Replace)?
-        }
-        Some("--agent-verify") => {
-            run_agent_phase(&required_path(args.next())?, AgentPhase::Verify)?
-        }
-        Some("--repository-edit") => {
-            run_repository_edit_acceptance(
-                &PathBuf::from(env!("QUARTZ_FIXTURE_DIR")),
-                &required_path(args.next())?,
-            )?;
-        }
-        Some("--reviewed-edit") => {
-            run_reviewed_edit_acceptance(
-                &PathBuf::from(env!("QUARTZ_FIXTURE_DIR")),
-                &required_path(args.next())?,
-            )?;
-        }
-        Some("--promote-edit") => {
-            run_promoted_edit_acceptance(
-                &PathBuf::from(env!("QUARTZ_FIXTURE_DIR")),
-                &required_path(args.next())?,
-            )?;
-        }
-        Some("--production-model") => {
-            let model = args.next().ok_or("production model name is required")?;
-            let prompt = required_path(args.next())?;
-            let journal = required_path(args.next())?;
-            run_production_model(&model, &prompt, &journal)?;
-        }
-        Some(argument) => return Err(format!("unknown argument `{argument}`").into()),
-        None => run_acceptance()?,
+        CliCommand::ProductionModel {
+            model,
+            prompt,
+            journal,
+        } => run_production_model(&model, &prompt, &journal)?,
     }
     Ok(())
+}
+
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CliCommand, String> {
+    let mut args = args.into_iter();
+    let first = args.next();
+    let command = first.as_deref().unwrap_or("--help");
+    let parsed = match command {
+        "--help" => CliCommand::Help,
+        "--version" => CliCommand::Version,
+        "--acceptance" => CliCommand::Acceptance,
+        "--idle" => {
+            let millis = args
+                .next()
+                .map(|value| {
+                    value
+                        .parse()
+                        .map_err(|_| format!("invalid milliseconds for `--idle`: `{value}`"))
+                })
+                .transpose()?
+                .unwrap_or(2_000);
+            CliCommand::Idle(millis)
+        }
+        "--durable-write" => CliCommand::DurableWrite(path_arg(&mut args, command, "<journal>")?),
+        "--durable-recover" => {
+            CliCommand::DurableRecover(path_arg(&mut args, command, "<journal>")?)
+        }
+        "--durable-verify" => CliCommand::DurableVerify(path_arg(&mut args, command, "<journal>")?),
+        "--events-write" => CliCommand::EventsWrite(path_arg(&mut args, command, "<journal>")?),
+        "--events-recover" => CliCommand::EventsRecover(path_arg(&mut args, command, "<journal>")?),
+        "--events-verify" => CliCommand::EventsVerify(path_arg(&mut args, command, "<journal>")?),
+        "--agent-start" => CliCommand::AgentStart(path_arg(&mut args, command, "<journal>")?),
+        "--agent-resume" => {
+            let value = required_arg(&mut args, command, "<expected-event-count> <journal>")?;
+            let expected = value.parse().map_err(|_| {
+                format!("invalid expected event count for `--agent-resume`: `{value}`")
+            })?;
+            CliCommand::AgentResume(
+                expected,
+                path_arg(&mut args, command, "<expected-event-count> <journal>")?,
+            )
+        }
+        "--agent-replace" => CliCommand::AgentReplace(path_arg(&mut args, command, "<journal>")?),
+        "--agent-verify" => CliCommand::AgentVerify(path_arg(&mut args, command, "<journal>")?),
+        "--repository-edit" => {
+            CliCommand::RepositoryEdit(path_arg(&mut args, command, "<directory>")?)
+        }
+        "--reviewed-edit" => CliCommand::ReviewedEdit(path_arg(&mut args, command, "<directory>")?),
+        "--promote-edit" => CliCommand::PromoteEdit(path_arg(&mut args, command, "<directory>")?),
+        "--production-model" => CliCommand::ProductionModel {
+            model: required_arg(&mut args, command, "<model> <prompt> <journal>")?,
+            prompt: path_arg(&mut args, command, "<model> <prompt> <journal>")?,
+            journal: path_arg(&mut args, command, "<model> <prompt> <journal>")?,
+        },
+        unknown => {
+            return Err(format!("unknown command `{unknown}`; try `quartz --help`"));
+        }
+    };
+    if let Some(extra) = args.next() {
+        return Err(format!(
+            "unexpected trailing argument for `{command}`: `{extra}`; try `quartz --help`"
+        ));
+    }
+    Ok(parsed)
+}
+
+fn required_arg(
+    args: &mut impl Iterator<Item = String>,
+    command: &str,
+    expected: &str,
+) -> Result<String, String> {
+    args.next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("`{command}` requires {expected}; try `quartz --help`"))
+}
+
+fn path_arg(
+    args: &mut impl Iterator<Item = String>,
+    command: &str,
+    expected: &str,
+) -> Result<PathBuf, String> {
+    required_arg(args, command, expected).map(PathBuf::from)
+}
+
+fn version_text() -> String {
+    format!("quartz {}", env!("CARGO_PKG_VERSION"))
 }
 
 fn run_acceptance() -> Result<(), Box<dyn std::error::Error>> {
@@ -1184,12 +1296,6 @@ fn repository_sources() -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>
     Ok((root.join("README.md"), root.join("lode/summary.md")))
 }
 
-fn required_path(value: Option<String>) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    value
-        .map(PathBuf::from)
-        .ok_or_else(|| "durable phase requires a journal path".into())
-}
-
 fn measure_cross_component_resolve(
     fixtures: &Path,
     iterations: u64,
@@ -1273,4 +1379,114 @@ fn assert_replacement_order(
     }).expect("provider B activation trace");
     assert!(consumer_unavailable < old_recovery);
     assert!(old_recovery < new_activation);
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<CliCommand, String> {
+        parse_args(args.iter().map(|value| (*value).to_owned()))
+    }
+
+    #[test]
+    fn empty_and_help_select_the_same_usage() {
+        assert_eq!(parse(&[]), Ok(CliCommand::Help));
+        assert_eq!(parse(&["--help"]), Ok(CliCommand::Help));
+        for command in [
+            "--help",
+            "--version",
+            "--acceptance",
+            "--idle",
+            "--durable-write",
+            "--durable-recover",
+            "--durable-verify",
+            "--events-write",
+            "--events-recover",
+            "--events-verify",
+            "--agent-start",
+            "--agent-resume",
+            "--agent-replace",
+            "--agent-verify",
+            "--repository-edit",
+            "--reviewed-edit",
+            "--promote-edit",
+            "--production-model",
+        ] {
+            assert!(USAGE.contains(command), "usage omitted {command}");
+        }
+    }
+
+    #[test]
+    fn version_uses_the_package_version() {
+        assert_eq!(parse(&["--version"]), Ok(CliCommand::Version));
+        assert_eq!(
+            version_text(),
+            concat!("quartz ", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn acceptance_is_explicit() {
+        assert_eq!(parse(&[]), Ok(CliCommand::Help));
+        assert_eq!(parse(&["--acceptance"]), Ok(CliCommand::Acceptance));
+    }
+
+    #[test]
+    fn internal_scenario_commands_keep_their_shapes() {
+        assert_eq!(parse(&["--idle"]), Ok(CliCommand::Idle(2_000)));
+        assert_eq!(parse(&["--idle", "5"]), Ok(CliCommand::Idle(5)));
+        assert_eq!(
+            parse(&["--durable-write", "state.qj"]),
+            Ok(CliCommand::DurableWrite(PathBuf::from("state.qj")))
+        );
+        assert_eq!(
+            parse(&["--events-verify", "events.qj"]),
+            Ok(CliCommand::EventsVerify(PathBuf::from("events.qj")))
+        );
+        assert_eq!(
+            parse(&["--agent-resume", "7", "agent.qj"]),
+            Ok(CliCommand::AgentResume(7, PathBuf::from("agent.qj")))
+        );
+        assert_eq!(
+            parse(&["--repository-edit", "workspace"]),
+            Ok(CliCommand::RepositoryEdit(PathBuf::from("workspace")))
+        );
+        assert_eq!(
+            parse(&["--production-model", "model", "prompt", "turn.qj"]),
+            Ok(CliCommand::ProductionModel {
+                model: "model".into(),
+                prompt: PathBuf::from("prompt"),
+                journal: PathBuf::from("turn.qj"),
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_argument_shapes_fail_clearly() {
+        for (args, message) in [
+            (&["--durable-write"][..], "requires <journal>"),
+            (
+                &["--agent-resume", "bad", "state.qj"][..],
+                "invalid expected event count",
+            ),
+            (
+                &["--agent-resume", "7"][..],
+                "requires <expected-event-count> <journal>",
+            ),
+            (
+                &["--production-model", "model", "prompt"][..],
+                "requires <model> <prompt> <journal>",
+            ),
+            (&["--idle", "bad"][..], "invalid milliseconds"),
+            (&["--help", "extra"][..], "unexpected trailing argument"),
+            (&["--unknown"][..], "unknown command"),
+        ] {
+            let error = parse(args).unwrap_err();
+            assert!(
+                error.contains(message),
+                "`{error}` did not contain `{message}`"
+            );
+        }
+    }
 }

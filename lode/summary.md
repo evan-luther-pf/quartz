@@ -124,6 +124,16 @@ became a durable production-turn prompt and the model classified it as passed.
 No command runner, validation ledger, recorder component, retry protocol, or
 security-sandbox claim was added.
 
+The release CLI is now safe to discover: empty and `--help` invocations print
+usage, `--version` prints the package version, and the full architectural smoke
+runs only through `--acceptance`. One parser validates every preserved scenario
+command and rejects malformed or trailing arguments. Two independently
+reviewed candidates changed `main.rs` and README through the existing ABI 10
+workspace and promotion authorities, with restart reconstruction proven for
+each. The approved workspace test command passed 67 tests across 12 suites; its
+bounded result entered a durable production turn and the model returned
+`VALIDATION PASSED.` No kernel, dependency, or tracked-file addition was needed.
+
 ## Next boundary
 
 The dogfood run exposed orchestration, not validation transactions, as the next

@@ -70,3 +70,87 @@ production-model prompt path.
 - The executable and ABI remain unchanged. Session journals, event streams,
   exchange ledgers, mutation ledgers, prompts, and bounded command evidence
   remain under `.quartz/dogfood-publish-private/` for resume and inspection.
+
+## Safe CLI dogfood
+
+### Problem
+
+The executable treats an empty argument list as permission to run the full
+architectural acceptance scenario. It has no help or version surface, and each
+scenario arm validates arguments independently. This makes the release binary
+unsafe to invoke casually and difficult to discover.
+
+### Observable behavior
+
+`quartz` and `quartz --help` print the same concise usage and succeed.
+`quartz --version` prints `quartz <package-version>`. The former default
+scenario runs only through `--acceptance`. Existing internal scenario commands
+retain their behavior, but every command rejects missing, malformed, or
+trailing arguments with a command-specific error. README examples use the
+explicit acceptance command.
+
+### Non-goals
+
+- New kernel, WIT, component, or dependency contracts.
+- Renaming or removing internal scenario commands.
+- A general CLI framework, completion generator, configuration file, or TUI.
+- Model-selected paths or direct repository writes.
+
+### Invariants
+
+- The host admits `crates/quartz/src/main.rs` and `README.md` as the only
+  mutable sources and `crates/quartz/Cargo.toml` as read-only package metadata.
+- Two credentialed production turns retain separate bounded proposals, one per
+  mutable source. The supervising harness may materialize exact candidate bytes
+  in isolated staging, but publication still crosses the existing workspace,
+  mutation-authority, and promotion-authority contracts.
+- Review shows the exact candidate diff before approval. Each file is promoted
+  independently; no multi-file transaction is claimed.
+- Parser tests live in `main.rs`. The final task adds no files or dependencies.
+- Validation uses the exact argv
+  `["cargo", "test", "--workspace", "--all-targets"]` only after both
+  promotions. Its bounded result becomes the next durable production turn.
+- Failure evidence is shown to the user and model. Correction requires a new
+  reviewed proposal and a separately approved command; there is no automatic
+  retry.
+
+### Acceptance scenario
+
+1. Retain one production-model proposal for `main.rs` after inspecting all
+   three admitted files.
+2. Retain a second production-model proposal for `README.md` against the first
+   proposal's declared CLI surface.
+3. Materialize exact candidates outside the repository, show both diffs, and
+   obtain explicit approval.
+4. Promote both candidates through separate ABI 10 workspace grants and
+   reconstruct each promotion in a fresh runtime.
+5. Exercise empty, help, version, acceptance, missing-argument, trailing-
+   argument, and preserved internal-command behavior.
+6. Run the approved workspace test argv once and submit its bounded terminal
+   evidence through a fresh production turn.
+7. Remove temporary orchestration artifacts from the tracked tree while
+   retaining resumable records under `.quartz/`.
+
+### Verification
+
+- Separate credentialed `gpt-5.4` turns retained the `main.rs` parser design and
+  the matching README diff. Their exchange records remain under
+  `.quartz/dogfood-cli-safety/`.
+- The user reviewed and separately approved candidate digests
+  `1e5cc1d1729044e85f64419ce83ed93e63a0c7c295786fc61d9d771db132b066`
+  for `main.rs` and
+  `606e20637b84c0b347bd236a57c037675528b9f260fc2a043750a630790fb51e`
+  for README. ABI 10 workspace, mutation, and promotion authorities published
+  each exact candidate and reconstructed it in a fresh runtime before clean
+  authority withdrawal.
+- `cargo test --workspace --all-targets` ran once after both promotions: 67
+  tests passed across 12 suites. The bounded result entered a fresh durable
+  production turn, and the model returned `VALIDATION PASSED.` No correction or
+  retry ran.
+- The release executable produced identical successful output for empty and
+  `--help` invocations, printed exactly `quartz 0.1.0` for `--version`, preserved
+  `--idle`, rejected missing, trailing, and unknown arguments with exit status
+  2, and completed the full prior smoke only through `--acceptance`.
+- ABI 10, the kernel, package dependencies, and the tracked file set are
+  unchanged. Promotion, exchange, event, and mutation records remain under
+  `.quartz/dogfood-cli-safety/` for inspection.
