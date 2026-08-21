@@ -14,7 +14,7 @@ A component may change the desired component tree through the same context it us
 
 ## Implemented foundation
 
-Slices 0 through 7 are complete. Quartz has a Rust context kernel and loads
+Slices 0 through 8 are complete. Quartz has a Rust context kernel and loads
 every acceptance component as a Wasmtime component through the public WIT
 contract. The runtime tracks structural inverses, resolves scalar and callable
 dependencies by provider fiber identity, orders dependent recovery before
@@ -83,13 +83,24 @@ Editor replacement restores the prior generation before admitting the next
 workspace, and removal restores the original only while the source retains the
 published digest. Source drift and mutation collisions fail closed.
 
+Committed event payloads are now available to explicitly authorized sandboxed
+consumers through bounded length and byte reads over their committed
+event-stream view. A proposal editor selects one durable model response by turn
+identity, copies its exact bytes into a private workspace, and can publish only
+after the host separately admits that candidate digest for one fixed source and
+the callable mutation authority approves it. Proposal generation leaves the
+repository untouched and may end in a different process generation from
+application. Denial, wrong turn, missing payload, digest mismatch, and source
+drift fail closed. Governed editor replacement recovers the old publication
+before the new editor applies the same durable candidate.
+
 Removing the application and persistence roots leaves no fibers, bindings,
 state cells, child registrations, pending patches or events, composition
 effects, desired roots, journal, event, or exchange registrations, outbox
 entries, in-flight provider calls or exchange workers, staged responses,
-workspace buffers or approvals, publication inverses, or live module artifacts.
-Durable journal, event, exchange, and mutation-ledger records remain honestly
-external.
+workspace buffers or approvals, publication inverses, or live payload-read
+authority or module artifacts. Durable journal, event, candidate, exchange, and
+mutation-ledger records remain honestly external.
 
 ## Non-goals
 
@@ -97,6 +108,8 @@ external.
   tools, or unbounded conversation/session payloads.
 - Model-selected repository paths, directory mutation, or multi-file
   transactions.
+- Automatic edit approval, diff parsing, merge resolution, formatting, or Git
+  operations.
 - TUI.
 - Package installation or remote transport.
 - Compatibility with the existing Quartz repository.

@@ -2,19 +2,20 @@
 
 A small native coding harness designed for runtime self-modification through reversible effects and reactive coeffects.
 
-Slices 0 through 7 implement the spatiotemporal composition kernel, governed
+Slices 0 through 8 implement the spatiotemporal composition kernel, governed
 component-authored patches, crash-safe desired-composition recovery, a
 transactional durable event stream, restart-safe deterministic agent turns,
 host-admitted immutable repository inspection, credential-safe production
-model exchange, and authority-approved isolated repository editing in Rust. All
-acceptance components run as sandboxed Wasmtime components through
+model exchange, authority-approved isolated repository editing, and durable
+reviewed application of model-authored candidates in Rust. All acceptance
+components run as sandboxed Wasmtime components through
 `wit/quartz-component.wit`. Product knowledge and measured tradeoffs live in
 `lode/`; the primary architecture paper is vendored at
 `research/spatiotemporal-composability.pdf`.
 
 Release smoke: `cargo run --release -p quartz`
 
-Focused contracts: `cargo test -p quartz --test slice0 --test slice1 --test slice2 --test slice3 --test slice4 --test slice5 --test slice6 --test slice7`
+Focused contracts: `cargo test -p quartz --test slice0 --test slice1 --test slice2 --test slice3 --test slice4 --test slice5 --test slice6 --test slice7 --test slice8`
 
 Repository-editing smoke:
 
@@ -26,8 +27,20 @@ cargo run --release -p quartz -- \
 The command admits one real file as a bounded workspace, runs sandboxed editor
 A through a callable mutation authority, replaces it with editor B through the
 same public component contract, restores the original bytes after both
-generations, and leaves the checksummed mutation ledger in the temporary
-directory.
+generations, validates the checksummed mutation ledger, and removes its
+temporary artifacts.
+
+Reviewed-edit smoke:
+
+```sh
+cargo run --release -p quartz -- \
+  --reviewed-edit "$(mktemp -d /tmp/quartz-slice8.XXXXXX)"
+```
+
+The command commits one deterministic production-compatible response as a
+durable candidate while leaving the source untouched. Fresh runtimes prove
+denial, exact approval, governed editor replacement, guarded recovery, and a
+clean final context against the real temporary file.
 
 Credentialed OpenAI smoke:
 

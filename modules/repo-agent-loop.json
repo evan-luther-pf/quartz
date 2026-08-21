@@ -1,5 +1,5 @@
 {
-  "abi": 8,
+  "abi": 9,
   "module": "quartz.slice5.repo-agent-loop",
   "version": "0.1.0",
   "execution_mode": "wasm-component",

@@ -233,6 +233,23 @@ Snapshot access and event-stream registration are reversible capabilities.
 Committed payload facts are withheld external emissions: recovery closes live
 authority and clears pending work but does not claim to erase durable evidence.
 
+## Durable payload read boundary
+
+Slice 8 makes committed payload bytes available to sandboxed consumers without
+granting event-stream mutation or ambient storage access. Payload length and
+byte reads use the same fiber-state and committed-provider checks as scalar
+event projection, but require separate manifest capabilities. Missing payloads,
+invalid indices, and out-of-range offsets return explicit status codes.
+
+A reviewed-edit component may copy one durable model response into its private
+workspace only after a fresh runtime reconstructs the event stream. The host
+then admits the exact candidate digest and fixed source independently.
+Publication remains the Slice 7 operation: callable approval, source identity,
+mutation identity, durable intent, atomic replacement, and guarded inverse.
+Reading a durable candidate creates no context effect; the live authority to
+read it disappears with the consumer fiber, while the committed fact remains
+external.
+
 ## Bounded exchange boundary
 
 Slice 6 admits one explicit host exchange adapter without exposing ambient

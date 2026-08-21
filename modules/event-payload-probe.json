@@ -1,11 +1,11 @@
 {
   "abi": 9,
-  "module": "quartz.slice3.event-appender",
+  "module": "quartz.slice8.event-payload-probe",
   "version": "0.1.0",
   "execution_mode": "wasm-component",
-  "requested_host_capabilities": ["append-event"],
+  "requested_host_capabilities": ["event-payload-byte", "event-payload-len", "set-state"],
   "component": {
-    "id": "event-appender",
+    "id": "event-payload-probe",
     "config_schema": "u64",
     "max_activation_steps": 1,
     "inject": [

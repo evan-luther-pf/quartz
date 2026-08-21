@@ -358,6 +358,28 @@ fn link_host(linker: &mut Linker<HostState>) -> Result<()> {
             },
         )
         .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
+            "event-payload-len",
+            |store: StoreContextMut<'_, HostState>, (index,): (u64,)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_event_payload_len(fiber, index)
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
+            "event-payload-byte",
+            |store: StoreContextMut<'_, HostState>, (index, offset): (u64, u64)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_event_payload_byte(fiber, index, offset)
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
     Ok(())
 }
 

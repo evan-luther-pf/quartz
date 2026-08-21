@@ -34,7 +34,7 @@ A successful publication is a component-owned effect. Removing the editor restor
 
 ## Public contract
 
-ABI 8 adds five generic host imports:
+The workspace boundary exposes five generic host imports:
 
 - `workspace-len(index) -> s64` returns the owning fiber's bounded workspace length or a negative Quartz status;
 - `workspace-byte(index, offset) -> s32` returns one workspace byte or a negative Quartz status;

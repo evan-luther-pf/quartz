@@ -1,4 +1,4 @@
-package quartz:component@0.8.0;
+package quartz:component@0.9.0;
 
 world module {
   /// Set a fiber-owned context cell. Returns zero or a Quartz status code.
@@ -73,6 +73,12 @@ world module {
 
   /// Read one non-negative committed event value, or a negative Quartz status.
   import read-event: func(index: u64) -> s64;
+
+  /// Return one bounded committed event payload length, or a negative Quartz status.
+  import event-payload-len: func(index: u64) -> s64;
+
+  /// Return one bounded committed event payload byte, or a negative Quartz status.
+  import event-payload-byte: func(index: u64, offset: u64) -> s32;
 
   /// Create activation-local state. This call must not mutate the context.
   export start: func(config: u64) -> u64;

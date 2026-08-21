@@ -57,7 +57,7 @@ so compiled code is retained only while a desired, staged, or live generation
 owns it. A process remains an optional isolation mode; it is not the composition
 model.
 
-The ABI 8 WIT contract exposes four lifecycle calls and twenty-four capability
+The ABI 9 WIT contract exposes four lifecycle calls and twenty-six capability
 imports:
 
 - `start(config)`, `step(instance)`, `invoke(instance, operation, arg0, arg1)`,
@@ -74,8 +74,10 @@ imports:
 - `open-event-stream` registers one host-admitted durable event path;
 - `append-event` queues one granted typed fact until activation and composition
   commit;
-- `event-count` and `read-event` expose bounded committed facts to an authorized
-  projection component.
+- `event-count` and `read-event` expose bounded committed scalar facts to an
+  authorized projection component;
+- `event-payload-len` and `event-payload-byte` expose bounded committed payload
+  bytes through the same provider view but separate manifest capabilities;
 - `resume-event` has the same grant, outbox, and commit enforcement as
   `append-event`, but may append the unique owed fact after historical event
   projection during restart.
@@ -91,7 +93,7 @@ imports:
   durable event request.
 - `workspace-len` and `workspace-byte` expose only a fiber's indexed bounded
   host-owned mutable buffer;
-- `workspace-set-len` and `workspace-set-byte` mutate that buffer without
+- `workspace-set-len` and `workspace-write-byte` mutate that buffer without
   touching its admitted source file;
 - `publish-workspace` requires exact committed callable approval, admitted
   before/result digests, and durable mutation identity before a digest-guarded
@@ -190,6 +192,18 @@ collision rejection, and source-drift ambiguity without overwrite. `cargo run
 file path through sandboxed editor and callable authority components, replaces
 the editor through the same public contract, restores the original bytes after
 each generation, and asserts a clean context.
+
+### Slice 8 verification
+
+`cargo test -p quartz --test slice8` exercises three durable-reviewed-edit
+contracts: payload authority, missing-payload and offset bounds; explicit
+approval, wrong-turn and result-digest rejection plus source-drift ambiguity;
+and restart-stable candidate reconstruction with governed editor replacement
+ordering. `cargo run --release -p quartz -- --reviewed-edit
+/tmp/quartz-slice8-smoke` commits a production-compatible response without
+touching the source, reconstructs it in fresh runtimes, proves denial and exact
+approval, replaces the sandboxed editor through a governed patch, restores the
+original bytes, and asserts a clean context.
 
 ### Decision evidence
 

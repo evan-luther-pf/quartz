@@ -22,6 +22,9 @@
 - `capabilities/production-model-call.md` — credential-safe bounded exchange, durable ambiguity, and production Responses API calls.
 - `capabilities/isolated-repository-editing.md` — bounded mutable workspaces,
   callable approval, durable publication identity, and guarded recovery.
+- `capabilities/durable-reviewed-edit.md` — restart-stable model-authored
+  candidates, explicit exact-byte approval, and bounded application to one
+  host-selected source.
 
 ## Research
 
@@ -29,13 +32,13 @@
 
 ## Implementation
 
-Slices 0 through 7 are implemented as one Rust workspace:
+Slices 0 through 8 are implemented as one Rust workspace:
 
 - `crates/quartz-kernel` — unified context, fibers, callable coeffects,
   composition, durable journal/event/exchange/mutation records, immutable
-  snapshots, bounded workspaces, host exchange and publication authority,
-  Wasmtime loading, replacement, and rollback.
-- `crates/quartz` — Slice 0 through Slice 7 executable scenarios and contract
+  snapshots, bounded payload reads and workspaces, host exchange and publication
+  authority, Wasmtime loading, replacement, and rollback.
+- `crates/quartz` — Slice 0 through Slice 8 executable scenarios and contract
   tests.
 - `wit/quartz-component.wit` — public component/host boundary.
 - `modules` — real WebAssembly component sources and embedded manifests used by

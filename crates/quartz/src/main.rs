@@ -62,6 +62,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &required_path(args.next())?,
             )?;
         }
+        Some("--reviewed-edit") => {
+            run_reviewed_edit_acceptance(
+                &PathBuf::from(env!("QUARTZ_FIXTURE_DIR")),
+                &required_path(args.next())?,
+            )?;
+        }
         Some("--production-model") => {
             let model = args.next().ok_or("production model name is required")?;
             let prompt = required_path(args.next())?;
@@ -143,6 +149,8 @@ fn run_acceptance() -> Result<(), Box<dyn std::error::Error>> {
     let repository =
         std::env::temp_dir().join(format!("quartz-slice7-smoke-{}", std::process::id()));
     run_repository_edit_acceptance(&fixtures, &repository)?;
+    let reviewed = std::env::temp_dir().join(format!("quartz-slice8-smoke-{}", std::process::id()));
+    run_reviewed_edit_acceptance(&fixtures, &reviewed)?;
     println!("root removed: subtree recovered to a clean context");
     println!("initial_composition_ns={initial_composition_ns}");
     println!("invalid_replacement_ns={invalid_replacement_ns}");
@@ -217,6 +225,156 @@ fn run_repository_edit_acceptance(
     }
     println!("repository editing subtree removed: source restored and context clean");
     Ok(())
+}
+
+fn run_reviewed_edit_acceptance(
+    fixtures: &Path,
+    directory: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(directory)?;
+    let source = directory.join("quartz-slice8-source.txt");
+    let prompt = directory.join("quartz-slice8-prompt.txt");
+    let journal = directory.join("quartz-slice8-composition.qj");
+    let events = journal.with_extension("qe");
+    let exchange = journal.with_extension("qx");
+    let mutation = directory.join("quartz-slice8-mutations.qm");
+    if [&source, &prompt, &journal, &events, &exchange, &mutation]
+        .into_iter()
+        .any(|path| path.exists())
+    {
+        return Err(format!(
+            "reviewed editing smoke paths already exist in `{}`",
+            directory.display()
+        )
+        .into());
+    }
+    let before = b"alpha\n";
+    let candidate = b"alpha reviewed by Quartz\n";
+    fs::write(&source, before)?;
+    fs::write(&prompt, b"Return only the complete reviewed file bytes.")?;
+
+    let (response, provenance) =
+        run_exchange_turn(&prompt, &journal, Arc::new(ReviewedEditExchange))?;
+    assert_eq!(response, candidate);
+    assert_eq!(provenance, "smoke:reviewed-edit");
+    assert_eq!(fs::read(&source)?, before);
+    println!("reviewed candidate committed durably; repository source unchanged");
+
+    let persistence = || {
+        ComponentSpec::new("event-store", artifact(fixtures, "event-store"))
+            .with_journal_paths(vec![journal.clone()])
+            .with_event_stream_paths(vec![events.clone()])
+    };
+    let reviewed_tree = |editor: &str,
+                         operation: u64,
+                         authority_maximum: u64,
+                         replacement_base: Option<u64>|
+     -> Result<ComponentTree, Error> {
+        let mut children = vec![
+            ComponentSpec::new("authority", artifact(fixtures, "mutation-authority"))
+                .with_config(authority_maximum),
+            proposal_editor_spec(fixtures, &source, &mutation, editor, operation, candidate)?,
+        ];
+        if replacement_base.is_some() {
+            children.push(ComponentSpec::new(
+                "governor",
+                artifact(fixtures, "governor"),
+            ));
+        }
+        let mut roots = vec![
+            ComponentSpec::new("root", artifact(fixtures, "root"))
+                .with_config(children.len() as u64)
+                .with_children(children),
+        ];
+        if let Some(base_revision) = replacement_base {
+            roots.push(
+                ComponentSpec::new("zz-controller", artifact(fixtures, "durable-controller"))
+                    .with_config(base_revision << 32)
+                    .with_patches(vec![CompositionPatch::replace(
+                        "root/editor",
+                        proposal_editor_spec(
+                            fixtures,
+                            &source,
+                            &mutation,
+                            "proposal-editor-b",
+                            8_002,
+                            candidate,
+                        )?,
+                    )]),
+            );
+        }
+        Ok(ComponentTree { roots })
+    };
+    let mut denied = Runtime::open_persistent(Limits::default(), persistence())?;
+    denied.apply_tree(reviewed_tree("proposal-editor-a", 8_001, 8_000, None)?)?;
+    let denied_state = denied.fiber_state("root/editor");
+    assert!(
+        matches!(
+            &denied_state,
+            Some(FiberState::Failed(message)) if message.contains("guest returned status 7")
+        ),
+        "denied editor state: {denied_state:?}"
+    );
+    assert_eq!(fs::read(&source)?, before);
+    denied.shutdown_persistent()?;
+    assert!(denied.is_observationally_clean());
+    println!("denied candidate left the repository source unchanged");
+
+    let mut runtime = Runtime::open_persistent(Limits::default(), persistence())?;
+    let replacement_base = runtime.composition_revision() + 1;
+    runtime.apply_tree(reviewed_tree(
+        "proposal-editor-a",
+        8_001,
+        8_002,
+        Some(replacement_base),
+    )?)?;
+    assert_eq!(fs::read(&source)?, candidate);
+    assert!(runtime.trace().iter().any(|event| {
+        matches!(
+            event,
+            TraceEvent::ReplacementCommitted { path, .. } if path == "root/editor"
+        )
+    }));
+    active_id(&runtime, "root/editor")?;
+    println!("fresh runtime reconstructed and published the exact approved candidate");
+    println!("governed replacement reapplied it after prior editor recovery");
+
+    runtime.shutdown_persistent()?;
+    assert_eq!(fs::read(&source)?, before);
+    assert!(
+        runtime.is_observationally_clean(),
+        "reviewed editing final context: {:?}",
+        runtime.observation()
+    );
+    for path in [source, prompt, journal, events, exchange, mutation] {
+        fs::remove_file(path)?;
+    }
+    if directory.read_dir()?.next().is_none() {
+        fs::remove_dir(directory)?;
+    }
+    println!("reviewed editing subtree removed: source restored and context clean");
+    Ok(())
+}
+
+fn proposal_editor_spec(
+    fixtures: &Path,
+    source: &Path,
+    ledger: &Path,
+    editor: &str,
+    operation: u64,
+    result: &[u8],
+) -> Result<ComponentSpec, Error> {
+    Ok(ComponentSpec::new("editor", artifact(fixtures, editor))
+        .with_config(1)
+        .with_workspace_grants(vec![WorkspaceGrant::new(
+            source,
+            ledger,
+            operation,
+            "reviewed candidate turn 1",
+            digest(b"alpha\n"),
+            digest(result),
+            64 * 1024,
+        )?]))
 }
 
 fn repository_edit_tree(
@@ -732,6 +890,28 @@ impl ExchangeAdapter for SmokeExchange {
             bytes: b"bounded production-path response".to_vec(),
             provenance: "smoke:exchange".into(),
             usage: 5,
+        })
+    }
+}
+
+struct ReviewedEditExchange;
+
+impl ExchangeAdapter for ReviewedEditExchange {
+    fn identity(&self) -> &str {
+        "reviewed-edit-exchange"
+    }
+
+    fn exchange(
+        &self,
+        request: &[u8],
+        _timeout: Duration,
+        _max_response_bytes: usize,
+    ) -> Result<ExchangeResponse, ExchangeFailure> {
+        assert_eq!(request, b"Return only the complete reviewed file bytes.");
+        Ok(ExchangeResponse {
+            bytes: b"alpha reviewed by Quartz\n".to_vec(),
+            provenance: "smoke:reviewed-edit".into(),
+            usage: 7,
         })
     }
 }

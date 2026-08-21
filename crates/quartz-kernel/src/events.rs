@@ -400,36 +400,69 @@ impl Core {
         stream.stream.records().len() as i64
     }
 
-    pub(crate) fn host_read_event(&self, fiber: FiberId, index: u64) -> i64 {
+    fn event_record_for_read(
+        &self,
+        fiber: FiberId,
+        index: u64,
+        capability: HostCapability,
+    ) -> std::result::Result<&EventRecord, i64> {
         let Some(record) = self.fibers.get(&fiber) else {
-            return -(STATUS_INVALID as i64);
+            return Err(-(STATUS_INVALID as i64));
         };
         let Some(stream) = self.event_stream.as_ref() else {
-            return -(STATUS_UNSATISFIED as i64);
+            return Err(-(STATUS_UNSATISFIED as i64));
         };
         if !matches!(
             record.state,
             InternalState::Activating | InternalState::Active
         ) || (record.state == InternalState::Active && !self.invoking.contains(&fiber))
-            || !record
-                .spec
-                .artifact
-                .manifest
-                .requests(HostCapability::ReadEvent)
+            || !record.spec.artifact.manifest.requests(capability)
             || record
                 .committed
                 .values()
                 .all(|provider| provider.fiber != stream.owner)
         {
-            return -(STATUS_UNDECLARED as i64);
+            return Err(-(STATUS_UNDECLARED as i64));
         }
         let Ok(index) = usize::try_from(index) else {
-            return -(STATUS_INVALID as i64);
+            return Err(-(STATUS_INVALID as i64));
         };
         stream
             .stream
             .records()
             .get(index)
-            .map_or(-(STATUS_INVALID as i64), |event| event.value as i64)
+            .ok_or(-(STATUS_INVALID as i64))
+    }
+
+    pub(crate) fn host_read_event(&self, fiber: FiberId, index: u64) -> i64 {
+        self.event_record_for_read(fiber, index, HostCapability::ReadEvent)
+            .map_or_else(|status| status, |event| event.value as i64)
+    }
+
+    pub(crate) fn host_event_payload_len(&self, fiber: FiberId, index: u64) -> i64 {
+        self.event_record_for_read(fiber, index, HostCapability::EventPayloadLen)
+            .and_then(|event| {
+                let payload = event.payload.as_ref().ok_or(-(STATUS_UNSATISFIED as i64))?;
+                i64::try_from(payload.bytes.len()).map_err(|_| -(STATUS_LIMIT as i64))
+            })
+            .unwrap_or_else(|status| status)
+    }
+
+    pub(crate) fn host_event_payload_byte(&self, fiber: FiberId, index: u64, offset: u64) -> i32 {
+        let event = match self.event_record_for_read(fiber, index, HostCapability::EventPayloadByte)
+        {
+            Ok(event) => event,
+            Err(status) => return status as i32,
+        };
+        let Some(payload) = event.payload.as_ref() else {
+            return -STATUS_UNSATISFIED;
+        };
+        let Ok(offset) = usize::try_from(offset) else {
+            return -STATUS_INVALID;
+        };
+        payload
+            .bytes
+            .get(offset)
+            .map_or(-STATUS_INVALID, |byte| i32::from(*byte))
     }
 }

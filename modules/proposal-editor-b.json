@@ -1,0 +1,26 @@
+{
+  "abi": 9,
+  "module": "quartz.slice8.proposal-editor-b",
+  "version": "0.1.0",
+  "execution_mode": "wasm-component",
+  "requested_host_capabilities": [
+    "event-count",
+    "event-payload-byte",
+    "event-payload-len",
+    "invoke",
+    "read-event",
+    "workspace-publish",
+    "workspace-read",
+    "workspace-write"
+  ],
+  "component": {
+    "id": "proposal-editor-b",
+    "config_schema": "u64",
+    "max_activation_steps": 128,
+    "inject": [
+      {"slot": 4, "kind": "callable", "namespace": "quartz.events", "interface": "stream", "min_revision": 1, "max_revision": 1},
+      {"slot": 12, "kind": "callable", "namespace": "quartz.repository", "interface": "mutation-authority", "min_revision": 1, "max_revision": 1}
+    ],
+    "provide": []
+  }
+}

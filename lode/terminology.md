@@ -33,6 +33,9 @@
 - **Exchange grant** — one exact adapter identity, durable ledger path, byte bounds, and timeout admitted to a component by numeric index.
 - **Exchange ledger** — the checksummed append-only record of started and terminal external invocations used to prevent unsafe retries and replay exact successes.
 - **Staged response** — bounded adapter output held by a provider fiber during callable dispatch and transferred only through committed callable authority.
+- **Reviewed candidate** — one bounded durable model-response payload whose
+  exact digest is admitted for a fixed workspace only after proposal
+  generation completes.
 - **Workspace grant** — one exact host-admitted source file, mutation identity, byte bound, before/result digests, and durable ledger exposed to guest code by index.
 - **Mutation authority** — the committed callable provider whose exact approval is required before a workspace publication.
 - **Mutation ledger** — the checksummed append-only record used to prevent duplicate publication and classify incomplete or unsafe repository mutations.

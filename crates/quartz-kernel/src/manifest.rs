@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{Error, Result};
 
-pub const ABI_VERSION: u32 = 8;
+pub const ABI_VERSION: u32 = 9;
 pub const MANIFEST_SECTION: &str = "quartz:manifest";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -61,6 +61,8 @@ pub enum HostCapability {
     AppendEvent,
     ApplyPatch,
     EventCount,
+    EventPayloadByte,
+    EventPayloadLen,
     Exchange,
     Invoke,
     OpenEventStream,
@@ -118,7 +120,7 @@ impl Manifest {
         }
         if self.component.config_schema != "u64" {
             return Err(Error::Manifest(
-                "ABI 7 supports only the u64 config schema".into(),
+                "the current ABI supports only the u64 config schema".into(),
             ));
         }
         if self.component.max_activation_steps == 0 {
