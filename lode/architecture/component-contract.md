@@ -356,6 +356,34 @@ the kernel separately validates and applies the selected host-admitted patch.
 This keeps policy in a replaceable component while the kernel retains structural
 authority over the component tree.
 
+## Guest-authored durable payloads
+
+ABI 11 adds one missing primitive required by component-owned orchestration: a
+component may build a bounded payload in a host-admitted, fiber-private event
+output buffer and queue that exact buffer as a resumable event payload. The
+public imports set the buffer length, replace one byte, and consume the buffer
+into one declared event grant. The buffer is unavailable without an explicit
+grant, cannot name a path or external adapter, is discarded on failed
+activation, and becomes externally durable only through the existing withheld
+event outbox after activation commits.
+
+ABI 10 could persist only host-authored snapshot payloads or adapter-authored
+exchange payloads. It therefore forced the native host to author prompts and
+session facts, which is product orchestration rather than privileged I/O.
+Indexed workspace grants and callable coeffects already express multiple
+workspaces and exact command approval; they are not ABI gaps. Host-only source
+selection remains until the separate admitted-manifest slice.
+
+The first ABI 11 consumer is `repository-task-orchestrator`, built from the
+reviewable Rust source under `components/` and loaded from its committed WASM
+artifact. It imports only declared Quartz event and snapshot capabilities and no
+WASI filesystem, environment, network, clock, random, or polling interface.
+Before a session fact becomes durable, the component reads the prior fact
+stream, validates the transition and bounded payload grammar, copies the exact
+accepted bytes into its output, and queues the append. The native session
+reducer is a projection for privileged boundary work and display, not an
+alternate append authority.
+
 ## Versioning
 
 Key names alone are insufficient. Dependency declarations include a namespaced interface identity and compatible revision range. The runtime rejects collisions and incompatible providers before activation.

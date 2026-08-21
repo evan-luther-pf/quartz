@@ -67,6 +67,7 @@ pub(crate) struct Fiber {
     pub(crate) staged_response: Option<DurablePayload>,
     pub(crate) staged_usage: Option<u64>,
     pub(crate) inbound_response: Option<DurablePayload>,
+    pub(crate) event_output_buffers: Vec<Vec<u8>>,
     pub(crate) workspace_buffers: Vec<Vec<u8>>,
     pub(crate) workspace_authorization: Option<WorkspaceAuthorization>,
     pub(crate) promotion_authorization: Option<PromotionAuthorization>,
@@ -784,6 +785,7 @@ impl Fiber {
             .iter()
             .map(|workspace| workspace.bytes.to_vec())
             .collect();
+        let event_output_buffers = vec![Vec::new(); spec.event_output_grants.len()];
         Self {
             id,
             parent,
@@ -801,6 +803,7 @@ impl Fiber {
             staged_response: None,
             staged_usage: None,
             inbound_response: None,
+            event_output_buffers,
             workspace_buffers,
             workspace_authorization: None,
             promotion_authorization: None,

@@ -22,6 +22,8 @@
 - **System boundary** — the set of locations Quartz can exclusively modify and restore; effects outside it require withholding, compensation, or explicit irreversibility.
 - **Handover** — replacement of the kernel process through state transfer and re-exec.
 - **Event grant** — one exact host-admitted event type identity exposed to guest code by index.
+- **Event output grant** — one bounded fiber-private byte buffer whose exact
+  contents a component may consume into a declared resumable event payload.
 - **Event stream** — the versioned append-only stream of typed durable facts from which model-visible state can be reconstructed.
 - **Transactional outbox** — event requests synchronized in the composition journal before idempotent event-stream delivery.
 - **Snapshot grant** — one exact canonical regular file, provenance label, byte length, and SHA-256 identity admitted to a component by numeric index.
@@ -44,6 +46,9 @@
 - **Task continuation** — one bounded model decision bound to terminal approved
   command evidence and exact post-command admitted sources; it yields one
   corrected proposal generation or explicit completion.
+- **Repository-task orchestrator** — the loadable component that validates task
+  fact transitions, response grammars, candidate generations, command dispatch,
+  and promotion identity before authoring the accepted durable fact.
 - **Workspace grant** — one exact host-admitted source file, mutation identity, byte bound, before/result digests, and durable ledger exposed to guest code by index.
 - **Mutation authority** — the committed callable provider whose exact approval is required before a workspace publication.
 - **Mutation ledger** — the checksummed append-only record used to prevent duplicate publication and classify incomplete or unsafe repository mutations.

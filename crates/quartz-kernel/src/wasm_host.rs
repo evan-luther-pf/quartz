@@ -229,6 +229,46 @@ fn link_host(linker: &mut Linker<HostState>) -> Result<()> {
     linker
         .root()
         .func_wrap(
+            "event-output-set-len",
+            |store: StoreContextMut<'_, HostState>, (index, length): (u64, u64)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_event_output_set_len(fiber, index, length)
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
+            "event-output-write-byte",
+            |store: StoreContextMut<'_, HostState>, (index, offset, value): (u64, u64, u32)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_event_output_write_byte(fiber, index, offset, value)
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
+            "resume-event-output",
+            |store: StoreContextMut<'_, HostState>,
+             (event_index, output_index, value): (u64, u64, u64)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_append_event(
+                        fiber,
+                        event_index,
+                        value,
+                        true,
+                        EventPayloadSource::Output(output_index),
+                    )
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
             "snapshot-len",
             |store: StoreContextMut<'_, HostState>, (index,): (u64,)| {
                 Ok((with_core(store, |core, fiber| {

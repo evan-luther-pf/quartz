@@ -9,14 +9,24 @@ fn main() {
     let mut modules: Vec<_> = fs::read_dir(&source)
         .unwrap()
         .map(|entry| entry.unwrap().path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "wat"))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "wat" || extension == "wasm")
+        })
         .collect();
     modules.sort();
     for wat_path in modules {
         let manifest_path = wat_path.with_extension("json");
         let manifest = fs::read(&manifest_path).unwrap();
         serde_json::from_slice::<serde_json::Value>(&manifest).unwrap();
-        let mut component = wat::parse_file(&wat_path).unwrap();
+        let mut component = if wat_path
+            .extension()
+            .is_some_and(|extension| extension == "wat")
+        {
+            wat::parse_file(&wat_path).unwrap()
+        } else {
+            fs::read(&wat_path).unwrap()
+        };
         append_custom_section(&mut component, b"quartz:manifest", &manifest);
         let output_path = output
             .join(wat_path.file_stem().unwrap())

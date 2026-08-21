@@ -1,4 +1,6 @@
-use quartz_kernel::{ComponentSpec, ComponentTree, Error, EventGrant, Limits, Runtime};
+use quartz_kernel::{
+    ComponentSpec, ComponentTree, Error, EventGrant, EventOutputGrant, Limits, Runtime,
+};
 use std::{
     fs::{self, OpenOptions},
     io::Write,
@@ -211,6 +213,29 @@ fn clean_shutdown_recovers_event_capabilities() {
         .unwrap();
     runtime.shutdown_persistent().unwrap();
     assert!(runtime.is_observationally_clean());
+}
+
+#[test]
+fn guest_output_commits_as_exact_durable_event_payload() {
+    let case = TempCase::new("guest-output");
+    let journal = case.path("composition.qj");
+    let events = case.path("events.qe");
+    let mut runtime = persistent_runtime(&journal, &events, Limits::default()).unwrap();
+    runtime
+        .apply_tree(ComponentTree {
+            roots: vec![
+                spec("output", "event-output-appender")
+                    .with_event_grants(vec![EventGrant::new("quartz.session", "output", 1)])
+                    .with_event_output_grants(vec![EventOutputGrant::new("guest:test", 5)]),
+            ],
+        })
+        .unwrap();
+
+    let records = runtime.events();
+    let payload = records[0].payload.as_ref().unwrap();
+    assert_eq!(records[0].value, 7);
+    assert_eq!(payload.provenance, "guest:test");
+    assert_eq!(payload.bytes, b"guest");
 }
 
 fn persistent_runtime(

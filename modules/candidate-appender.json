@@ -1,5 +1,5 @@
 {
-  "abi": 10,
+  "abi": 11,
   "module": "quartz.slice8.candidate-appender",
   "version": "0.2.0",
   "execution_mode": "wasm-component",

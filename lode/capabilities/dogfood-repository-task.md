@@ -116,8 +116,8 @@ The later manifest change is likewise a clean cutover.
 
 ## Invariants
 
-- The public component ABI remains version 10. Kernel source and WIT do not gain
-  repository-task policy.
+- The public component ABI is version 11. Repository-task policy does not live
+  in kernel source or WIT host functions.
 - Every admitted source is a canonical regular file beneath one canonical
   repository root. Before bytes, byte length, and SHA-256 identity are exact and
   bounded.
@@ -157,9 +157,10 @@ The later manifest change is likewise a clean cutover.
 
 One `session.qe` file is the authoritative task history. It uses the existing
 bounded `QUARTZE2` event framing and contains only
-`quartz.session/fact@1` payloads. Monotonic fact IDs and checksummed frames
-establish order. Every payload is strict, versioned, independently bounded, and
-binds the identities and bytes needed to validate its predecessor.
+`quartz.session/fact@1` payloads committed by the
+`repository-task-orchestrator` component. Monotonic fact IDs and checksummed
+frames establish order. Every payload is strict, versioned, independently
+bounded, and binds the identities and bytes needed to validate its predecessor.
 
 The closed fact set is:
 
@@ -170,14 +171,16 @@ The closed fact set is:
 - continuation started and either completed with one proposal or completed the
   task with an explicit summary.
 
-The session reducer consumes facts in ID order and is the only source of task
-state. Proposal turns, generations, current selection, rejections, approvals,
-promotions, command attempts, continuation sequences, and completion are never
-inferred from cache filenames, directory contents, composition journals, event
-payload caches, exchange ledgers, promotion journals, or mutation ledgers.
-Those operation-specific ledgers may remain as bounded idempotency and recovery
-evidence at privileged I/O boundaries, but they cannot authorize a task action
-or supply missing session history.
+The loadable `repository-task-orchestrator` component consumes facts in ID
+order and is the authority for transition legality, model-response grammar,
+candidate-generation identity, command dispatch sequence, and promotion
+identity. The native reducer reconstructs the same facts only as a projection
+for privileged filesystem work and terminal presentation; it cannot append a
+fact the component rejects. Proposal turns, current generations, approvals,
+promotions, commands, continuations, and completion are not authorized by
+cache filenames, directory contents, composition journals, exchange ledgers,
+promotion journals, or mutation ledgers. Operation-specific ledgers remain
+bounded idempotency and recovery evidence at privileged I/O boundaries.
 
 Each external operation has a synchronized started fact before emission and at
 most one exact terminal fact. A model turn, promotion, or command with a started
@@ -195,27 +198,40 @@ returning. A torn final frame is removed on open; interior corruption fails
 closed.
 
 The cutover deleted task-state readers and writers for parallel proposal,
-revision, command, and continuation journals. Operation journals remain only at
-the model-exchange and repository-mutation boundaries. A child-process crash
-harness aborts after one, two, and three returned session-log appends and proves
-that every returned prefix reopens with its exact monotonic IDs. Reducer
-contracts separately prove interrupted initial, revision, promotion, command,
-and later-continuation operations remain terminal and cannot append later facts.
+revision, command, and continuation journals. `SessionLog::append` now stages
+one bounded serialized fact as an immutable snapshot; the orchestrator validates
+the full committed history, copies the accepted bytes into its fiber-private
+output, and commits them through the event outbox. The host has no production
+path to `DurableEventLog::append`. Operation journals remain only at the
+model-exchange and repository-mutation boundaries. A child-process crash
+harness aborts after one, two, and three returned component commits and proves
+that every returned prefix reopens with exact monotonic IDs. Contracts also
+prove malformed responses and illegal transitions are rejected before append.
 
 ## Public contract
 
-ABI 10 and WIT remain unchanged. The kernel exposes the existing event framing
-to justified host storage code as `DurableEventLog`: open one admitted path
-under explicit `Limits`, observe committed `EventRecord` values, and append one
-exact event plus optional `DurablePayload`. It is a synchronized wrapper over
-the same event-stream implementation, not another ledger format or product
-state machine.
+ABI 11 adds a bounded fiber-private event output grant and three imports:
+`event-output-set-len(index, length)`,
+`event-output-write-byte(index, offset, value)`, and
+`resume-event-output(event-index, output-index, value)`. The first two construct
+guest-authored bytes without external emission. The third consumes those bytes
+as one payload under a declared event grant; the existing event outbox withholds
+the append until activation commits and preserves crash recovery.
 
-The repository task uses `quartz.session/fact@1` as its sole task event schema.
-The existing `quartz.agent/repository-turn@2` component protocol and exchange
-ledgers still bound actual model emission; ABI 10 workspace, callable mutation,
-publication, and promotion capabilities still bound actual source mutation.
-Their results enter task state only after an exact session fact commits.
+ABI 11 closes the prior authoring gap. `resume-snapshot` can persist only bytes
+authored and pre-admitted by the host, while `resume-exchange` can persist only
+the adapter's staged response. Neither can persist component-authored model
+prompts and typed session facts whose grammar the component owns.
+Indexed workspace grants already support multiple concurrent workspaces, and a
+callable provider plus an admitted
+snapshot already supports exact command approval. Model-selected path indices
+remain Slice E work rather than an orchestration prerequisite.
+
+The repository task continues to use `quartz.session/fact@1` as its sole task
+event schema. Exchange ledgers bound actual model emission; workspace, callable
+mutation, publication, and promotion capabilities bound source mutation. Their
+results enter task state only after an exact component-authored session fact
+commits.
 
 Each command argument is non-empty and capped at 4 KiB; total argument bytes are
 capped at 32 KiB. Each admitted source and materialized result is UTF-8 and
@@ -261,9 +277,10 @@ with `ready`. The host materialized and verified all four candidates, the
 sources retained their admitted digests, and the final release executable
 reconstructed all four diffs without credentials.
 
-`cargo test -p quartz --bin quartz` passes 34 focused contracts.
-`cargo test --workspace --all-targets` passes 93 tests across 12 suites. Twenty
-release runs measure 3.220 ms p50 cold readiness, 3.000 MiB p50 idle RSS, and a
-14.173 MiB executable: respectively +3.4%, +3.2%, and -6.2% against the Slice 0
-budget. The release profile strips symbols and uses thin LTO. WIT, component ABI
-10, kernel source, and module manifests are unchanged.
+`cargo test -p quartz --bin quartz` passes 35 focused contracts.
+`cargo test --workspace --all-targets` passes 95 tests across 12 suites. Twenty
+release runs on the current arm64 macOS host measure 5.732 ms p50 cold readiness,
+3.094 MiB p50 idle RSS, and a 14.220 MiB executable. The real `--acceptance`
+path commits and reconstructs two component-validated task facts, and reports
+81.805 ns per cross-component committed coeffect read. The release profile
+strips symbols and uses thin LTO.

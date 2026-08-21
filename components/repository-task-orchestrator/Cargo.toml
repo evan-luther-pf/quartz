@@ -1,0 +1,22 @@
+[package]
+name = "quartz-repository-task-orchestrator"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+serde = { version = "1.0.219", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1.0.143", default-features = false, features = ["alloc"] }
+sha2 = { version = "0.10.9", default-features = false }
+wit-bindgen = { version = "0.60.0", default-features = false, features = ["macros", "realloc", "macro-string"] }
+dlmalloc = { version = "0.2.14", default-features = false, features = ["global"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = "symbols"
+
+[workspace]

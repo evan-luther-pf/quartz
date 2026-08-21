@@ -42,6 +42,22 @@ impl EventGrant {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventOutputGrant {
+    pub provenance: String,
+    pub max_bytes: usize,
+}
+
+impl EventOutputGrant {
+    pub fn new(provenance: impl Into<String>, max_bytes: usize) -> Self {
+        Self {
+            provenance: provenance.into(),
+            max_bytes,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SnapshotGrant {

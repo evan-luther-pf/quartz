@@ -8,10 +8,11 @@ transactional durable event stream, restart-safe deterministic agent turns,
 host-admitted immutable repository inspection, credential-safe production
 model exchange, authority-approved isolated repository editing, durable
 reviewed application, separately approved retention of model-authored
-candidates, and resumable multi-proposal repository turns in Rust. All acceptance
-components run as sandboxed Wasmtime components through
-`wit/quartz-component.wit`. Product knowledge and measured tradeoffs live in
-`lode/`; the primary architecture paper is vendored at
+candidates, and resumable multi-proposal repository turns. ABI 11 moves the
+repository-task transition, response, generation, command, and promotion gates
+into a loadable no-`std` Rust WASM component. Components run through
+`wit/quartz-component.wit`; product knowledge lives in `lode/`, and the primary
+architecture paper is vendored at
 `research/spatiotemporal-composability.pdf`.
 
 Release CLI help: `cargo run --release -p quartz -- --help`
@@ -21,6 +22,16 @@ Release version: `cargo run --release -p quartz -- --version`
 Complete acceptance smoke: `cargo run --release -p quartz -- --acceptance`
 
 Focused contracts: `cargo test -p quartz --test slice0 --test slice1 --test slice2 --test slice3 --test slice4 --test slice5 --test slice6 --test slice7 --test slice8 --test slice9`
+
+Rebuild the committed repository-task component artifact:
+
+```sh
+(cd components/repository-task-orchestrator && \
+  RUSTC="$(rustup which --toolchain stable rustc)" \
+  cargo build --release --target wasm32-wasip2)
+cp components/repository-task-orchestrator/target/wasm32-wasip2/release/quartz_repository_task_orchestrator.wasm \
+  modules/repository-task-orchestrator.wasm
+```
 
 Repository-editing smoke:
 
@@ -102,11 +113,13 @@ OPENAI_API_KEY="$OPENAI_API_KEY" cargo run --release -p quartz -- \
 ```
 
 The session directory contains one authoritative task history, `session.qe`.
-Resume derives proposal generations, decisions, promotions, command attempts,
-continuations, and completion only from its ordered checksummed facts.
-Neighboring prompt, response, exchange, promotion, and mutation files are
-operation evidence or disposable render caches; they cannot supply missing
-session history or authorize an action.
+Every fact is validated and authored through the loadable
+`repository-task-orchestrator` component; illegal transitions and malformed
+responses are rejected before append. Resume derives proposal generations,
+decisions, promotions, command attempts, continuations, and completion only
+from ordered checksummed facts. Neighboring prompt, response, exchange,
+promotion, and mutation files are operation evidence or disposable caches;
+they cannot supply missing history or authorize an action.
 
 The proposal command admits at least two exact UTF-8 files, commits one bounded
 production turn, validates multiple digest-anchored ranged edits, materializes
