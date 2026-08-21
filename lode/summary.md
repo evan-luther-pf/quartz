@@ -142,3 +142,18 @@ That path should be exercised before introducing another kernel capability.
 - TUI.
 - Package installation or remote transport.
 - Compatibility with the existing Quartz repository.
+
+## Parking lot (donated from ~/quartz, archived 2026-08-21)
+
+~/quartz is abandoned at `762ee84` with a clean tree except
+`docs/acp-implementation-plan.md` (untracked). Do not implement these without
+a measured product need:
+
+- ACP v1 external protocol via `agent-client-protocol = "=1.3.0"`; v2 is
+  draft and stays out. Relevant only if quartz-next gains an external client.
+- Subagent/task-agent bootstrap (OMP-style task + IRC): revisit only after the
+  single-agent loop wins its measured comparison.
+- Pi-derived TS product surface: superseded; salvage ideas only.
+
+Consolidation decision: all effort goes to ~/quartz-next; ~/quartz receives no
+further commits except archival notes.
