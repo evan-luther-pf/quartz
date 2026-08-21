@@ -10,6 +10,21 @@ resident in the native executable rather than a component.
 
 ## Observable behavior
 
+`quartz task <model> <task-path> <session-dir> <source> <source> [source ...]
+-- <executable> [arg ...]` is a thin terminal coordinator over the same public
+workflow. An empty session runs the existing proposal operation; a retained
+session reconstructs facts without repeating completed or interrupted
+emissions. The coordinator displays current diffs, requests `approve` or
+`reject` for each unpromoted generation, accepts one bounded UTF-8 feedback
+line for rejection, and invokes the existing revision or promotion operation.
+Once every current generation is promoted, it displays the exact argument
+vector as JSON and requires a fresh `approve` before invoking the existing
+command operation. It then invokes the existing continuation operation and
+repeats review, promotion, command approval, and continuation until `COMPLETE`,
+whose bounded summary is printed. `stop` or terminal EOF exits without adding a
+fact. Invalid, stale, pending, or interrupted state fails closed at the same
+underlying operation boundary.
+
 `quartz --propose <model> <task-path> <session-dir> <source> <source>
 [source ...]` admits at least two exact UTF-8 repository files and one bounded
 task. The host canonicalizes the sources beneath the repository root, records
@@ -265,14 +280,17 @@ grammar; host-computed result digest binding; rejection of model-authored result
 digests, incorrect source digests, invalid ranges, UTF-8 splits, unchanged
 results, and oversized results; exact chronological reconstruction, repeated
 correction cycles, every started-only external-operation class, sequence and
-identity tampering, stale promotion, and post-completion closure.
+identity tampering, stale promotion, and post-completion closure. The unified
+`task` contract drives reject, correct, approve, promote, failing command,
+continuation, reject, correct, approve, passing command, and `COMPLETE` through
+the same operations while reconstructing session state between actions.
 
 Prompt schema 1 sessions remain retained evidence but are not resumable after
 the clean schema 2 cutover. Quartz does not reinterpret their model-authored
 result digests.
 
-`cargo test -p quartz --bin quartz` passes 38 focused contracts.
-`cargo test --workspace --all-targets` passes 97 tests across 12 suites. Twenty
+`cargo test -p quartz --bin quartz` passes 39 focused contracts.
+`cargo test --workspace --all-targets` passes 98 tests across 12 suites. Twenty
 release runs measure 3.220 ms p50 cold readiness, 3.000 MiB p50 idle RSS, and a
 14.173 MiB executable: respectively +3.4%, +3.2%, and -6.2% against the Slice 0
 budget. The release profile strips symbols and uses thin LTO. WIT, component ABI
