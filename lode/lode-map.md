@@ -25,6 +25,8 @@
 - `capabilities/durable-reviewed-edit.md` — restart-stable model-authored
   candidates, explicit exact-byte approval, and bounded application to one
   host-selected source.
+- `capabilities/durable-edit-promotion.md` — separate durable retention
+  authority, restoration ownership transfer, and restart-safe promoted bytes.
 
 ## Research
 
@@ -32,13 +34,13 @@
 
 ## Implementation
 
-Slices 0 through 8 are implemented as one Rust workspace:
+Slices 0 through 9 are implemented as one Rust workspace:
 
 - `crates/quartz-kernel` — unified context, fibers, callable coeffects,
   composition, durable journal/event/exchange/mutation records, immutable
-  snapshots, bounded payload reads and workspaces, host exchange and publication
-  authority, Wasmtime loading, replacement, and rollback.
-- `crates/quartz` — Slice 0 through Slice 8 executable scenarios and contract
+  snapshots, bounded payload reads and workspaces, host exchange, publication,
+  and promotion authority, Wasmtime loading, replacement, and rollback.
+- `crates/quartz` — Slice 0 through Slice 9 executable scenarios and contract
   tests.
 - `wit/quartz-component.wit` — public component/host boundary.
 - `modules` — real WebAssembly component sources and embedded manifests used by

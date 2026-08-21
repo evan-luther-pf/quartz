@@ -14,7 +14,7 @@ A component may change the desired component tree through the same context it us
 
 ## Implemented foundation
 
-Slices 0 through 8 are complete. Quartz has a Rust context kernel and loads
+Slices 0 through 9 are complete. Quartz has a Rust context kernel and loads
 every acceptance component as a Wasmtime component through the public WIT
 contract. The runtime tracks structural inverses, resolves scalar and callable
 dependencies by provider fiber identity, orders dependent recovery before
@@ -94,13 +94,32 @@ application. Denial, wrong turn, missing payload, digest mismatch, and source
 drift fail closed. Governed editor replacement recovers the old publication
 before the new editor applies the same durable candidate.
 
+Retention is a separate authority from mutation. A sandboxed promotion editor
+must invoke a committed callable promotion provider whose approval is bound to
+the exact operation, source and candidate digests, bytes, workspace index, and
+approver fiber identity. The host synchronizes promotion intent before changing
+recovery ownership and synchronizes the terminal promotion before restoration
+is disarmed. Restart therefore restores an applied-only publication but
+reconstructs and verifies a committed promotion without republishing. Denial,
+cancellation, or failure before commit restores the original; failure after
+commit preserves the candidate. Third-party drift remains durably ambiguous and
+untouched.
+
 Removing the application and persistence roots leaves no fibers, bindings,
 state cells, child registrations, pending patches or events, composition
 effects, desired roots, journal, event, or exchange registrations, outbox
 entries, in-flight provider calls or exchange workers, staged responses,
-workspace buffers or approvals, publication inverses, or live payload-read
-authority or module artifacts. Durable journal, event, candidate, exchange, and
-mutation-ledger records remain honestly external.
+workspace buffers or approvals, restoration or promoted-verification effects,
+or live payload-read authority or module artifacts. Durable journal, event,
+candidate, exchange, and mutation-ledger records remain honestly external.
+
+## Next boundary
+
+Controlled validation of a reviewed candidate is next: host-admitted build and
+test commands produce bounded durable evidence without publishing source
+changes. Reviewable diff production follows that evidence boundary. Atomic
+multi-file repository transactions remain later work. The credentialed OpenAI
+smoke remains an explicit open gate when `OPENAI_API_KEY` is unavailable.
 
 ## Non-goals
 

@@ -1,16 +1,24 @@
 {
-  "abi": 9,
+  "abi": 10,
   "module": "quartz.slice0.provider-bad",
   "version": "0.1.0",
   "execution_mode": "wasm-component",
-  "requested_host_capabilities": ["set-state"],
+  "requested_host_capabilities": [
+    "set-state"
+  ],
   "component": {
     "id": "provider-bad",
     "config_schema": "u64",
     "max_activation_steps": 2,
     "inject": [],
     "provide": [
-      {"slot": 1, "kind": "value", "namespace": "quartz.slice0", "interface": "value", "revision": 1}
+      {
+        "slot": 1,
+        "kind": "value",
+        "namespace": "quartz.slice0",
+        "interface": "value",
+        "revision": 1
+      }
     ]
   }
 }

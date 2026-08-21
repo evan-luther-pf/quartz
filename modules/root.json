@@ -1,9 +1,11 @@
 {
-  "abi": 9,
+  "abi": 10,
   "module": "quartz.slice0.root",
   "version": "0.1.0",
   "execution_mode": "wasm-component",
-  "requested_host_capabilities": ["register-child"],
+  "requested_host_capabilities": [
+    "register-child"
+  ],
   "component": {
     "id": "root",
     "config_schema": "u64",

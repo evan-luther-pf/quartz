@@ -68,6 +68,9 @@ world module {
 
   /// Publish one exactly approved workspace to its admitted source file.
   import publish-workspace: func(index: u64) -> s32;
+
+  /// Durably retain one separately approved published workspace.
+  import promote-workspace: func(index: u64) -> s32;
   /// Return the bounded committed event count, or a negative Quartz status.
   import event-count: func() -> s64;
 

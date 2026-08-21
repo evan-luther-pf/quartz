@@ -2,12 +2,13 @@
 
 A small native coding harness designed for runtime self-modification through reversible effects and reactive coeffects.
 
-Slices 0 through 8 implement the spatiotemporal composition kernel, governed
+Slices 0 through 9 implement the spatiotemporal composition kernel, governed
 component-authored patches, crash-safe desired-composition recovery, a
 transactional durable event stream, restart-safe deterministic agent turns,
 host-admitted immutable repository inspection, credential-safe production
-model exchange, authority-approved isolated repository editing, and durable
-reviewed application of model-authored candidates in Rust. All acceptance
+model exchange, authority-approved isolated repository editing, durable
+reviewed application, and separately approved retention of model-authored
+candidates in Rust. All acceptance
 components run as sandboxed Wasmtime components through
 `wit/quartz-component.wit`. Product knowledge and measured tradeoffs live in
 `lode/`; the primary architecture paper is vendored at
@@ -15,7 +16,7 @@ components run as sandboxed Wasmtime components through
 
 Release smoke: `cargo run --release -p quartz`
 
-Focused contracts: `cargo test -p quartz --test slice0 --test slice1 --test slice2 --test slice3 --test slice4 --test slice5 --test slice6 --test slice7 --test slice8`
+Focused contracts: `cargo test -p quartz --test slice0 --test slice1 --test slice2 --test slice3 --test slice4 --test slice5 --test slice6 --test slice7 --test slice8 --test slice9`
 
 Repository-editing smoke:
 
@@ -41,6 +42,19 @@ The command commits one deterministic production-compatible response as a
 durable candidate while leaving the source untouched. Fresh runtimes prove
 denial, exact approval, governed editor replacement, guarded recovery, and a
 clean final context against the real temporary file.
+
+Promoted-edit smoke:
+
+```sh
+cargo run --release -p quartz -- \
+  --promote-edit "$(mktemp -d /tmp/quartz-slice9.XXXXXX)"
+```
+
+The command durably publishes one exact reviewed candidate, obtains retention
+approval from a separate callable authority, transfers recovery from source
+restoration to promoted-state verification, reconstructs that commit in a
+fresh runtime without republishing, and removes all live authority while
+retaining the approved bytes.
 
 Credentialed OpenAI smoke:
 

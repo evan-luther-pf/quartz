@@ -57,7 +57,7 @@ so compiled code is retained only while a desired, staged, or live generation
 owns it. A process remains an optional isolation mode; it is not the composition
 model.
 
-The ABI 9 WIT contract exposes four lifecycle calls and twenty-six capability
+The ABI 10 WIT contract exposes four lifecycle calls and twenty-seven capability
 imports:
 
 - `start(config)`, `step(instance)`, `invoke(instance, operation, arg0, arg1)`,
@@ -95,17 +95,21 @@ imports:
   host-owned mutable buffer;
 - `workspace-set-len` and `workspace-write-byte` mutate that buffer without
   touching its admitted source file;
-- `publish-workspace` requires exact committed callable approval, admitted
-  before/result digests, and durable mutation identity before a digest-guarded
-  same-directory atomic publication.
+- `publish-workspace` requires exact committed callable mutation approval,
+  admitted before/result digests, and durable mutation identity before a
+  digest-guarded same-directory atomic publication;
+- `promote-workspace` requires a separate committed callable approval bound to
+  the exact published mutation and transfers its recovery effect from source
+  restoration to promoted-state verification only after durable commit.
 
 Every binding declares `value` or `callable` kind as part of its versioned
 identity. Context-changing imports remain tracked by structural inverses.
 Journal, event, exchange, and mutation-ledger records are external emissions and
-survive component recovery. Registration and publication inverses close live
-authority and restore only context-owned or still-identifiable source state;
-they do not claim to erase committed facts, network requests, billing, or
-unrecognized external edits. Exchange requests remain irreversible emissions
+survive component recovery. Registration, publication, and promotion effects
+close live authority and restore or verify only context-owned or
+still-identifiable source state; they do not claim to erase committed facts,
+network requests, billing, approved promoted bytes, or unrecognized external
+edits. Exchange requests remain irreversible emissions
 guarded by a durable started/terminal ledger. The world exposes no ambient
 filesystem, network, clock, randomness, process, environment, or credential
 import.
@@ -204,6 +208,18 @@ ordering. `cargo run --release -p quartz -- --reviewed-edit
 touching the source, reconstructs it in fresh runtimes, proves denial and exact
 approval, replaces the sandboxed editor through a governed patch, restores the
 original bytes, and asserts a clean context.
+
+### Slice 9 verification
+
+`cargo test -p quartz --test slice9` exercises five durable-promotion contracts:
+separate exact approver binding; denial and cancellation restoration; restart
+before commit restoring the original; restart after commit preserving and
+verifying the candidate; and third-party drift ambiguity without overwrite.
+`cargo run --release -p quartz -- --promote-edit
+/tmp/quartz-slice9-smoke` publishes one reviewed candidate, promotes it through
+a separate sandboxed callable authority, reconstructs the durable commit in a
+fresh runtime without republishing, preserves the candidate during final
+shutdown, and asserts a clean live context.
 
 ### Decision evidence
 

@@ -738,12 +738,15 @@ impl Runtime {
         let requests_workspace_write = artifact.manifest.requests(HostCapability::WorkspaceWrite);
         let requests_workspace_publish =
             artifact.manifest.requests(HostCapability::WorkspacePublish);
+        let requests_workspace_promote =
+            artifact.manifest.requests(HostCapability::WorkspacePromote);
         if !(requests_workspace_read == requests_workspace_write
             && requests_workspace_write == requests_workspace_publish)
             || requests_workspace_read != !spec.workspace_grants.is_empty()
+            || (requests_workspace_promote && !requests_workspace_publish)
         {
             return Err(Error::Manifest(format!(
-                "component `{path}` must pair workspace read, write, and publish authority with admitted grants"
+                "component `{path}` must pair workspace read, write, and publish authority with admitted grants; promotion additionally requires publication"
             )));
         }
         let snapshots = self.prepare_snapshots(path, &spec.snapshot_grants)?;

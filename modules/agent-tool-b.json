@@ -1,16 +1,24 @@
 {
-  "abi": 9,
+  "abi": 10,
   "module": "quartz.slice4.agent-tool-b",
   "version": "0.1.0",
   "execution_mode": "wasm-component",
-  "requested_host_capabilities": ["publish-callable"],
+  "requested_host_capabilities": [
+    "publish-callable"
+  ],
   "component": {
     "id": "agent-tool-b",
     "config_schema": "u64",
     "max_activation_steps": 1,
     "inject": [],
     "provide": [
-      {"slot": 11, "kind": "callable", "namespace": "quartz.agent", "interface": "repository-read", "revision": 1}
+      {
+        "slot": 11,
+        "kind": "callable",
+        "namespace": "quartz.agent",
+        "interface": "repository-read",
+        "revision": 1
+      }
     ]
   }
 }

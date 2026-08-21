@@ -1,18 +1,33 @@
 {
-  "abi": 9,
+  "abi": 10,
   "module": "quartz.slice0.cycle-a",
   "version": "0.1.0",
   "execution_mode": "wasm-component",
-  "requested_host_capabilities": ["publish"],
+  "requested_host_capabilities": [
+    "publish"
+  ],
   "component": {
     "id": "cycle-a",
     "config_schema": "u64",
     "max_activation_steps": 1,
     "inject": [
-      {"slot": 2, "kind": "value", "namespace": "quartz.slice0", "interface": "cycle-b", "min_revision": 1, "max_revision": 1}
+      {
+        "slot": 2,
+        "kind": "value",
+        "namespace": "quartz.slice0",
+        "interface": "cycle-b",
+        "min_revision": 1,
+        "max_revision": 1
+      }
     ],
     "provide": [
-      {"slot": 1, "kind": "value", "namespace": "quartz.slice0", "interface": "cycle-a", "revision": 1}
+      {
+        "slot": 1,
+        "kind": "value",
+        "namespace": "quartz.slice0",
+        "interface": "cycle-a",
+        "revision": 1
+      }
     ]
   }
 }

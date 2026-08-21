@@ -12,8 +12,8 @@ use crate::{
     component::FiberId,
     composition::{PatchAuthorization, PreparedSpec},
     events::EventPayloadSource,
-    fiber::{Core, InternalState},
-    repository::WorkspaceAuthorization,
+    fiber::{Core, InternalState, Inverse},
+    repository::{PromotionAuthorization, WorkspaceAuthorization},
     runtime::Runtime,
 };
 
@@ -341,6 +341,17 @@ fn link_host(linker: &mut Linker<HostState>) -> Result<()> {
     linker
         .root()
         .func_wrap(
+            "promote-workspace",
+            |store: StoreContextMut<'_, HostState>, (index,): (u64,)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_promote_workspace(fiber, index)
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
             "event-count",
             |store: StoreContextMut<'_, HostState>, (): ()| {
                 Ok((with_core(store, |core, fiber| core.host_event_count(fiber)),))
@@ -520,6 +531,46 @@ fn host_invoke(
             provider,
             index,
             operation: arg0,
+        });
+    }
+    if result == 1
+        && operation == 1
+        && committed.interface.namespace == "quartz.repository"
+        && committed.interface.interface == "promotion-authority"
+        && committed.interface.revision == 1
+    {
+        let Ok(index) = usize::try_from(arg1) else {
+            return -(STATUS_INVALID as i64);
+        };
+        let Some(provider_record) = core.fibers.get(&provider) else {
+            return -(STATUS_INVALID as i64);
+        };
+        let approver = format!(
+            "{}@{}#{}",
+            provider_record.spec.artifact.manifest.module,
+            provider_record.spec.artifact.manifest.version,
+            provider_record.spec.artifact.digest
+        );
+        let Some(record) = core.fibers.get_mut(&caller) else {
+            return -(STATUS_INVALID as i64);
+        };
+        let Some(workspace) = record.spec.workspaces.get(index) else {
+            return -(STATUS_INVALID as i64);
+        };
+        if workspace.grant.operation != arg0
+            || !record.accumulator.iter().any(|inverse| match inverse {
+                Inverse::RestoreWorkspace { grant, .. }
+                | Inverse::VerifyPromotedWorkspace { grant, .. } => grant == &workspace.grant,
+                _ => false,
+            })
+        {
+            return -(STATUS_INVALID as i64);
+        }
+        record.promotion_authorization = Some(PromotionAuthorization {
+            provider,
+            index,
+            operation: arg0,
+            approver,
         });
     }
     result

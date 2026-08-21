@@ -1,15 +1,26 @@
 {
-  "abi": 9,
+  "abi": 10,
   "module": "quartz.slice1.controller",
   "version": "0.1.0",
   "execution_mode": "wasm-component",
-  "requested_host_capabilities": ["apply-patch", "invoke", "set-state"],
+  "requested_host_capabilities": [
+    "apply-patch",
+    "invoke",
+    "set-state"
+  ],
   "component": {
     "id": "controller",
     "config_schema": "u64",
     "max_activation_steps": 1,
     "inject": [
-      {"slot": 2, "kind": "callable", "namespace": "quartz.composition", "interface": "patch-authority", "min_revision": 1, "max_revision": 1}
+      {
+        "slot": 2,
+        "kind": "callable",
+        "namespace": "quartz.composition",
+        "interface": "patch-authority",
+        "min_revision": 1,
+        "max_revision": 1
+      }
     ],
     "provide": []
   }

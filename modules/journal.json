@@ -1,16 +1,25 @@
 {
-  "abi": 9,
+  "abi": 10,
   "module": "quartz.slice2.journal",
   "version": "0.1.0",
   "execution_mode": "wasm-component",
-  "requested_host_capabilities": ["open-journal", "publish-callable"],
+  "requested_host_capabilities": [
+    "open-journal",
+    "publish-callable"
+  ],
   "component": {
     "id": "journal",
     "config_schema": "u64",
     "max_activation_steps": 1,
     "inject": [],
     "provide": [
-      {"slot": 3, "kind": "callable", "namespace": "quartz.persistence", "interface": "composition-journal", "revision": 1}
+      {
+        "slot": 3,
+        "kind": "callable",
+        "namespace": "quartz.persistence",
+        "interface": "composition-journal",
+        "revision": 1
+      }
     ]
   }
 }

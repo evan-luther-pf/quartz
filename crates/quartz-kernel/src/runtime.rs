@@ -462,6 +462,7 @@ impl Runtime {
                     fiber_record.staged_usage = None;
                     fiber_record.inbound_response = None;
                     fiber_record.workspace_authorization = None;
+                    fiber_record.promotion_authorization = None;
                     let path = fiber_record.path.clone();
                     if let Some(error) = failed {
                         fiber_record.state = InternalState::Failed;

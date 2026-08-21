@@ -1,17 +1,44 @@
 {
-  "abi": 9,
+  "abi": 10,
   "module": "quartz.slice5.repo-agent-loop",
   "version": "0.1.0",
   "execution_mode": "wasm-component",
-  "requested_host_capabilities": ["event-count", "invoke", "read-event", "resume-event", "resume-snapshot"],
+  "requested_host_capabilities": [
+    "event-count",
+    "invoke",
+    "read-event",
+    "resume-event",
+    "resume-snapshot"
+  ],
   "component": {
     "id": "repo-agent-loop",
     "config_schema": "u64",
     "max_activation_steps": 1,
     "inject": [
-      {"slot": 4, "kind": "callable", "namespace": "quartz.events", "interface": "stream", "min_revision": 1, "max_revision": 1},
-      {"slot": 10, "kind": "callable", "namespace": "quartz.agent", "interface": "deterministic-provider", "min_revision": 1, "max_revision": 1},
-      {"slot": 11, "kind": "callable", "namespace": "quartz.agent", "interface": "repository-inspector", "min_revision": 1, "max_revision": 1}
+      {
+        "slot": 4,
+        "kind": "callable",
+        "namespace": "quartz.events",
+        "interface": "stream",
+        "min_revision": 1,
+        "max_revision": 1
+      },
+      {
+        "slot": 10,
+        "kind": "callable",
+        "namespace": "quartz.agent",
+        "interface": "deterministic-provider",
+        "min_revision": 1,
+        "max_revision": 1
+      },
+      {
+        "slot": 11,
+        "kind": "callable",
+        "namespace": "quartz.agent",
+        "interface": "repository-inspector",
+        "min_revision": 1,
+        "max_revision": 1
+      }
     ],
     "provide": []
   }

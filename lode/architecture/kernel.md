@@ -297,11 +297,31 @@ digest; any third digest records ambiguity and is not overwritten.
 
 Applied operations reconstruct from the checksummed mutation ledger without a
 second replacement or duplicate terminal record. Workspace buffers, staged
-approvals, callable views, and publication inverses are reversible context
-authority. Source bytes and mutation-ledger records cross the system boundary:
-recovery is exact only while Quartz retains the published source identity.
+approvals, callable views, and workspace recovery effects are reversible
+context authority. Source bytes and mutation-ledger records cross the system
+boundary: recovery is exact only while Quartz retains the expected source
+identity.
 Concurrent non-Quartz writers are excluded during the bounded replacement
 critical section.
+
+## Durable edit promotion boundary
+
+Slice 9 separates permission to retain published bytes from permission to
+publish them. A promotion grant binds one admitted workspace operation to the
+same canonical source, provenance, before/result digests, exact bytes and byte
+limit, plus a callable approver identity. The editor may request promotion only
+while activating, after exact mutation approval and successful publication, and
+through its committed promotion-provider view.
+
+The host verifies the live source and durable mutation identity, synchronizes a
+promotion-intent record, then synchronizes the terminal promotion before
+changing the fiber's recovery effect from restoration ownership to
+promoted-state verification. A process loss before terminal commit reconstructs
+restoration ownership; a process loss after commit reconstructs verification
+ownership without republishing. Removal then preserves the exact promoted
+candidate. Any different approver, identity field, or current source digest
+fails closed; a third source digest is durably ambiguous and never overwritten.
+All live workspace and callable authority still recovers in LIFO order.
 
 ## Self-modification
 

@@ -42,3 +42,7 @@
 - **Workspace publication** — an approved, durable, digest-guarded atomic
   replacement of one admitted source file with an inverse guarded by the
   published digest.
+- **Promotion authority** — the committed callable provider whose separate
+  exact approval is required to retain a workspace publication after recovery.
+- **Promotion commit** — the durable decision that transfers a publication
+  effect from source restoration to non-mutating promoted-state verification.

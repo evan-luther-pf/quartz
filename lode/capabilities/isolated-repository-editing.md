@@ -28,8 +28,8 @@ A successful publication is a component-owned effect. Removing the editor restor
 - Approval does not bypass host checks. The staged bytes must match the grant's exact result digest and the source must still match the admitted source digest before first publication.
 - The mutation ledger synchronizes `started` before source replacement and `applied`, `reverted`, or `ambiguous` afterward. Operation reuse with different source, provenance, before digest, after digest, or bytes fails as a collision.
 - Source replacement uses a same-directory temporary regular file, preserves the admitted file permissions, synchronizes the file, rechecks the live source digest, atomically renames the temporary file, and synchronizes the parent directory.
-- An applied operation is reconstructed only when the source still matches the recorded result digest. Recovery restores the recorded original bytes only from that same digest. Any third digest is ambiguous and is never overwritten.
-- Workspace buffers, staged approval, and publication inverses are fiber-owned. Recovery withdraws them in LIFO order. Mutation-ledger records and a source change that cannot be safely restored remain honestly external.
+- An applied operation is reconstructed only when the source still matches the recorded result digest. Unless a separate durable promotion commit transferred ownership, recovery restores the recorded original bytes only from that same digest. A promoted operation reconstructs verification ownership and preserves that exact result instead. Any third digest is ambiguous and is never overwritten.
+- Workspace buffers, staged approval, and workspace recovery effects are fiber-owned. Recovery withdraws them in LIFO order. Mutation-ledger records, promoted bytes, and a source change that cannot be safely restored remain honestly external.
 - The kernel implements only bounded workspace mechanics, durable mutation identity, and capability enforcement. Editor and approval policy remain replaceable components.
 
 ## Public contract

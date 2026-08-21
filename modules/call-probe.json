@@ -1,15 +1,24 @@
 {
-  "abi": 9,
+  "abi": 10,
   "module": "quartz.slice0.call-probe",
   "version": "0.1.0",
   "execution_mode": "wasm-component",
-  "requested_host_capabilities": ["resolve"],
+  "requested_host_capabilities": [
+    "resolve"
+  ],
   "component": {
     "id": "call-probe",
     "config_schema": "u64",
     "max_activation_steps": 1,
     "inject": [
-      {"slot": 1, "kind": "value", "namespace": "quartz.slice0", "interface": "value", "min_revision": 1, "max_revision": 1}
+      {
+        "slot": 1,
+        "kind": "value",
+        "namespace": "quartz.slice0",
+        "interface": "value",
+        "min_revision": 1,
+        "max_revision": 1
+      }
     ],
     "provide": []
   }

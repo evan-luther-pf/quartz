@@ -1,21 +1,23 @@
 {
   "abi": 10,
-  "module": "quartz.slice4.agent-loop",
+  "module": "quartz.slice9.promotion-editor-b",
   "version": "0.1.0",
   "execution_mode": "wasm-component",
   "requested_host_capabilities": [
     "event-count",
+    "event-payload-byte",
+    "event-payload-len",
     "invoke",
-    "publish",
     "read-event",
-    "resume-event",
-    "resume-exchange",
-    "set-state"
+    "workspace-promote",
+    "workspace-publish",
+    "workspace-read",
+    "workspace-write"
   ],
   "component": {
-    "id": "agent-loop",
+    "id": "promotion-editor-b",
     "config_schema": "u64",
-    "max_activation_steps": 1,
+    "max_activation_steps": 129,
     "inject": [
       {
         "slot": 4,
@@ -26,30 +28,22 @@
         "max_revision": 1
       },
       {
-        "slot": 10,
+        "slot": 12,
         "kind": "callable",
-        "namespace": "quartz.agent",
-        "interface": "provider",
+        "namespace": "quartz.repository",
+        "interface": "mutation-authority",
         "min_revision": 1,
         "max_revision": 1
       },
       {
-        "slot": 11,
+        "slot": 13,
         "kind": "callable",
-        "namespace": "quartz.agent",
-        "interface": "repository-read",
+        "namespace": "quartz.repository",
+        "interface": "promotion-authority",
         "min_revision": 1,
         "max_revision": 1
       }
     ],
-    "provide": [
-      {
-        "slot": 13,
-        "kind": "value",
-        "namespace": "quartz.agent",
-        "interface": "turn-state",
-        "revision": 1
-      }
-    ]
+    "provide": []
   }
 }

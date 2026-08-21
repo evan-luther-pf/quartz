@@ -24,13 +24,13 @@ A production-compatible provider response is committed as a bounded event payloa
 - The host admits one canonical source path and exact candidate digest only after the candidate is durable. Model output never chooses the path or widens the workspace byte bound.
 - Copying payload bytes mutates only the editor fiber's private workspace buffer. Publication still requires the existing committed callable authority, exact operation/index approval, source-before digest, candidate-result digest, and durable mutation identity.
 - Candidate production and candidate application are separate runtime generations. Restart cannot change candidate bytes or provenance and cannot duplicate an already committed model exchange.
-- Editor replacement follows ordinary lifecycle order: the old publication inverse restores the source before the next generation reads the durable candidate and admits its workspace bytes.
-- Removing the editor restores the original only while the source retains the published candidate digest. External drift is made durably ambiguous and is never overwritten.
-- Event facts, candidate payloads, exchange records, and mutation-ledger records remain honestly external. Live event access, workspace buffers, approvals, and publication inverses are recovered.
+- Without a separate promotion commit, editor replacement follows ordinary lifecycle order: the old restoration effect restores the source before the next generation reads the durable candidate and admits its workspace bytes.
+- Without promotion, removing the editor restores the original only while the source retains the published candidate digest. A committed promotion instead preserves and verifies the exact candidate under `durable-edit-promotion.md`. External drift is made durably ambiguous and is never overwritten.
+- Event facts, candidate payloads, exchange records, and mutation-ledger records remain honestly external. Live event access, workspace buffers, approvals, and workspace recovery effects are recovered.
 
 ## Public contract
 
-ABI 9 adds two read-only imports:
+ABI 9 introduced two read-only imports retained by the current ABI:
 
 - `event-payload-len(index) -> s64` returns the exact committed payload length, `STATUS_UNSATISFIED` when the selected fact has no payload, or a negative Quartz status;
 - `event-payload-byte(index, offset) -> s32` returns one payload byte or a negative Quartz status.

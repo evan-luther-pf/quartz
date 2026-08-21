@@ -220,6 +220,14 @@ pub(crate) struct WorkspaceAuthorization {
 }
 
 #[derive(Clone)]
+pub(crate) struct PromotionAuthorization {
+    pub(crate) provider: FiberId,
+    pub(crate) index: usize,
+    pub(crate) operation: u64,
+    pub(crate) approver: String,
+}
+
+#[derive(Clone)]
 pub(crate) struct PreparedSnapshot {
     pub(crate) grant: SnapshotGrant,
     pub(crate) bytes: Arc<[u8]>,
@@ -397,15 +405,17 @@ impl Runtime {
             let grant = &workspace.grant;
             let source_bytes = read_workspace_source(&grant.source_path, grant.max_bytes)?;
             let source_sha256 = sha256_hex(&source_bytes);
-            let recovered = if grant.ledger_path.exists() {
-                let ledger = MutationLedger::open(
+            let mut ledger = if grant.ledger_path.exists() {
+                Some(MutationLedger::open(
                     &grant.ledger_path,
                     self.limits.max_mutation_record_bytes,
-                )?;
-                ledger.lookup(grant.operation).cloned()
+                )?)
             } else {
                 None
             };
+            let recovered = ledger
+                .as_ref()
+                .and_then(|ledger| ledger.lookup(grant.operation).cloned());
             let bytes = if let Some(record) = recovered {
                 if record.source_path != grant.source_path
                     || record.provenance != grant.provenance
@@ -421,14 +431,34 @@ impl Runtime {
                 }
                 match record.outcome {
                     MutationLedgerOutcome::Started
-                        if source_sha256 == grant.before_sha256
-                            || source_sha256 == grant.result_sha256 => {}
-                    MutationLedgerOutcome::Applied if source_sha256 == grant.result_sha256 => {}
+                    | MutationLedgerOutcome::Applied
+                    | MutationLedgerOutcome::PromotionIntent
+                        if source_sha256 == grant.before_sha256 =>
+                    {
+                        ledger
+                            .as_mut()
+                            .expect("recovered mutation has a ledger")
+                            .append_outcome(grant.operation, MutationLedgerOutcome::Reverted)?;
+                    }
+                    MutationLedgerOutcome::Started
+                    | MutationLedgerOutcome::Applied
+                    | MutationLedgerOutcome::PromotionIntent
+                    | MutationLedgerOutcome::Promoted
+                        if source_sha256 == grant.result_sha256 => {}
                     MutationLedgerOutcome::Reverted if source_sha256 == grant.before_sha256 => {}
-                    MutationLedgerOutcome::Ambiguous => {
+                    MutationLedgerOutcome::Started
+                    | MutationLedgerOutcome::Applied
+                    | MutationLedgerOutcome::PromotionIntent
+                    | MutationLedgerOutcome::Promoted => {
+                        ledger
+                            .as_mut()
+                            .expect("recovered mutation has a ledger")
+                            .append_outcome(grant.operation, MutationLedgerOutcome::Ambiguous)?;
                         return Err(Error::MutationAmbiguous(grant.source_path.clone()));
                     }
-                    _ => return Err(Error::MutationAmbiguous(grant.source_path.clone())),
+                    MutationLedgerOutcome::Reverted | MutationLedgerOutcome::Ambiguous => {
+                        return Err(Error::MutationAmbiguous(grant.source_path.clone()));
+                    }
                 }
                 record.before_bytes
             } else {
@@ -572,6 +602,7 @@ impl Core {
             return STATUS_LIMIT;
         }
         record.workspace_authorization = None;
+        record.promotion_authorization = None;
         record.workspace_buffers[index].resize(length, 0);
         STATUS_OK
     }
@@ -603,6 +634,7 @@ impl Core {
             return STATUS_UNDECLARED;
         }
         record.workspace_authorization = None;
+        record.promotion_authorization = None;
         let Some(bytes) = record.workspace_buffers.get_mut(index) else {
             return STATUS_UNDECLARED;
         };
@@ -663,25 +695,33 @@ impl Core {
             self.limits.max_mutation_record_bytes,
         );
         let status = publication.as_ref().err().map(workspace_status);
-        if publication.is_ok()
-            || publication_has_live_effect(
-                &grant,
-                &before_bytes,
-                &result_bytes,
-                self.limits.max_mutation_record_bytes,
-            )
-        {
+        if let Some(ownership) = publication_ownership(
+            &grant,
+            &before_bytes,
+            &result_bytes,
+            self.limits.max_mutation_record_bytes,
+        ) {
             let effect = self.allocate_effect();
-            self.fibers
-                .get_mut(&fiber)
-                .expect("workspace owner checked above")
-                .accumulator
-                .push(Inverse::RestoreWorkspace {
+            let inverse = match ownership {
+                PublicationOwnership::Restore => Inverse::RestoreWorkspace {
                     effect,
                     grant,
                     before_bytes,
                     result_bytes,
-                });
+                },
+                PublicationOwnership::Promoted(approver) => Inverse::VerifyPromotedWorkspace {
+                    effect,
+                    grant,
+                    before_bytes,
+                    result_bytes,
+                    approver,
+                },
+            };
+            self.fibers
+                .get_mut(&fiber)
+                .expect("workspace owner checked above")
+                .accumulator
+                .push(inverse);
             self.trace.push(TraceEvent::EffectApplied {
                 fiber,
                 effect,
@@ -689,6 +729,93 @@ impl Core {
             });
         }
         status.unwrap_or(STATUS_OK)
+    }
+
+    pub(crate) fn host_promote_workspace(&mut self, fiber: FiberId, index: u64) -> i32 {
+        let Ok(index) = usize::try_from(index) else {
+            return STATUS_INVALID;
+        };
+        let (grant, before_bytes, result_bytes, approver, inverse_index, is_promoted) = {
+            let Some(record) = self.fibers.get_mut(&fiber) else {
+                return STATUS_INVALID;
+            };
+            if record.state != InternalState::Activating
+                || !record
+                    .spec
+                    .artifact
+                    .manifest
+                    .requests(HostCapability::WorkspacePromote)
+            {
+                return STATUS_UNDECLARED;
+            }
+            let Some(workspace) = record.spec.workspaces.get(index) else {
+                return STATUS_UNDECLARED;
+            };
+            let Some(authorization) = record.promotion_authorization.take() else {
+                return STATUS_DENIED;
+            };
+            if authorization.index != index
+                || authorization.operation != workspace.grant.operation
+                || !record
+                    .committed
+                    .values()
+                    .any(|committed| committed.fiber == authorization.provider)
+            {
+                return STATUS_DENIED;
+            }
+            let Some((inverse_index, is_promoted)) = record
+                .accumulator
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(inverse_index, inverse)| match inverse {
+                    Inverse::RestoreWorkspace { grant, .. } if grant == &workspace.grant => {
+                        Some((inverse_index, false))
+                    }
+                    Inverse::VerifyPromotedWorkspace { grant, .. } if grant == &workspace.grant => {
+                        Some((inverse_index, true))
+                    }
+                    _ => None,
+                })
+            else {
+                return STATUS_DENIED;
+            };
+            (
+                workspace.grant.clone(),
+                workspace.bytes.to_vec(),
+                record.workspace_buffers[index].clone(),
+                authorization.approver,
+                inverse_index,
+                is_promoted,
+            )
+        };
+        let promotion = promote_workspace(
+            &grant,
+            &before_bytes,
+            &result_bytes,
+            &approver,
+            self.replaying,
+            is_promoted,
+            self.limits.max_mutation_record_bytes,
+        );
+        if let Err(error) = promotion {
+            return workspace_status(&error);
+        }
+        if !is_promoted {
+            let record = self
+                .fibers
+                .get_mut(&fiber)
+                .expect("workspace owner checked above");
+            let effect = record.accumulator[inverse_index].effect();
+            record.accumulator[inverse_index] = Inverse::VerifyPromotedWorkspace {
+                effect,
+                grant,
+                before_bytes,
+                result_bytes,
+                approver,
+            };
+        }
+        STATUS_OK
     }
 }
 
@@ -740,6 +867,7 @@ fn publish_workspace(
                     result_sha256: grant.result_sha256.clone(),
                     before_bytes: before_bytes.to_vec(),
                     result_bytes: result_bytes.to_vec(),
+                    approver: None,
                     outcome: MutationLedgerOutcome::Started,
                 },
             )?;
@@ -770,12 +898,17 @@ fn publish_workspace(
         Some(MutationLedgerOutcome::Started) if source_sha256 == grant.result_sha256 => {
             ledger.append_outcome(grant.operation, MutationLedgerOutcome::Applied)
         }
-        Some(MutationLedgerOutcome::Started) => {
-            ledger.append_outcome(grant.operation, MutationLedgerOutcome::Ambiguous)?;
-            Err(Error::MutationAmbiguous(grant.source_path.clone()))
-        }
-        Some(MutationLedgerOutcome::Applied) if source_sha256 == grant.result_sha256 => Ok(()),
-        Some(MutationLedgerOutcome::Applied) => {
+        Some(
+            MutationLedgerOutcome::Applied
+            | MutationLedgerOutcome::PromotionIntent
+            | MutationLedgerOutcome::Promoted,
+        ) if source_sha256 == grant.result_sha256 => Ok(()),
+        Some(
+            MutationLedgerOutcome::Started
+            | MutationLedgerOutcome::Applied
+            | MutationLedgerOutcome::PromotionIntent
+            | MutationLedgerOutcome::Promoted,
+        ) => {
             ledger.append_outcome(grant.operation, MutationLedgerOutcome::Ambiguous)?;
             Err(Error::MutationAmbiguous(grant.source_path.clone()))
         }
@@ -790,31 +923,92 @@ fn publish_workspace(
     }
 }
 
-fn publication_has_live_effect(
+enum PublicationOwnership {
+    Restore,
+    Promoted(String),
+}
+
+fn publication_ownership(
     grant: &WorkspaceGrant,
     before_bytes: &[u8],
     result_bytes: &[u8],
     max_record_bytes: usize,
-) -> bool {
-    read_workspace_source(&grant.source_path, grant.max_bytes)
+) -> Option<PublicationOwnership> {
+    if !read_workspace_source(&grant.source_path, grant.max_bytes)
         .is_ok_and(|bytes| sha256_hex(&bytes) == grant.result_sha256)
-        && MutationLedger::open(&grant.ledger_path, max_record_bytes)
-            .and_then(|ledger| {
-                ledger
-                    .record(
-                        grant.operation,
-                        mutation_ledger_identity(grant, before_bytes, result_bytes),
-                    )
-                    .map(|record| {
-                        record.is_some_and(|record| {
-                            matches!(
-                                record.outcome,
-                                MutationLedgerOutcome::Started | MutationLedgerOutcome::Applied
-                            )
-                        })
-                    })
-            })
-            .unwrap_or(false)
+    {
+        return None;
+    }
+    MutationLedger::open(&grant.ledger_path, max_record_bytes)
+        .and_then(|ledger| {
+            ledger
+                .record(
+                    grant.operation,
+                    mutation_ledger_identity(grant, before_bytes, result_bytes),
+                )
+                .map(
+                    |record| match record.map(|record| (record.outcome, &record.approver)) {
+                        Some((
+                            MutationLedgerOutcome::Started
+                            | MutationLedgerOutcome::Applied
+                            | MutationLedgerOutcome::PromotionIntent,
+                            _,
+                        )) => Some(PublicationOwnership::Restore),
+                        Some((MutationLedgerOutcome::Promoted, Some(approver))) => {
+                            Some(PublicationOwnership::Promoted(approver.clone()))
+                        }
+                        _ => None,
+                    },
+                )
+        })
+        .unwrap_or(None)
+}
+
+fn promote_workspace(
+    grant: &WorkspaceGrant,
+    before_bytes: &[u8],
+    result_bytes: &[u8],
+    approver: &str,
+    replaying: bool,
+    has_promoted_inverse: bool,
+    max_record_bytes: usize,
+) -> Result<()> {
+    let mut ledger = MutationLedger::open(&grant.ledger_path, max_record_bytes)?;
+    let record = ledger
+        .record(
+            grant.operation,
+            mutation_ledger_identity(grant, before_bytes, result_bytes),
+        )?
+        .ok_or_else(|| Error::MutationCorrupt("promotion has no publication record".into()))?
+        .clone();
+    let source_bytes = read_workspace_source(&grant.source_path, grant.max_bytes)?;
+    if sha256_hex(&source_bytes) != grant.result_sha256 {
+        ledger.append_outcome(grant.operation, MutationLedgerOutcome::Ambiguous)?;
+        return Err(Error::MutationAmbiguous(grant.source_path.clone()));
+    }
+    match record.outcome {
+        MutationLedgerOutcome::Applied if !replaying && !has_promoted_inverse => {
+            ledger.append_promotion_intent(grant.operation, approver.to_owned())?;
+            ledger.append_outcome(grant.operation, MutationLedgerOutcome::Promoted)
+        }
+        MutationLedgerOutcome::Promoted
+            if has_promoted_inverse && record.approver.as_deref() == Some(approver) =>
+        {
+            Ok(())
+        }
+        MutationLedgerOutcome::Promoted => Err(Error::MutationCorrupt(format!(
+            "operation {} promotion approver changed",
+            grant.operation
+        ))),
+        MutationLedgerOutcome::Applied | MutationLedgerOutcome::PromotionIntent => {
+            Err(Error::MutationAmbiguous(grant.source_path.clone()))
+        }
+        MutationLedgerOutcome::Started
+        | MutationLedgerOutcome::Reverted
+        | MutationLedgerOutcome::Ambiguous => {
+            Err(Error::MutationAmbiguous(grant.source_path.clone()))
+        }
+    }
 }
 
 pub(crate) fn recover_workspace_publication(
@@ -834,7 +1028,9 @@ pub(crate) fn recover_workspace_publication(
     let source_bytes = read_workspace_source(&grant.source_path, grant.max_bytes)?;
     let source_sha256 = sha256_hex(&source_bytes);
     match outcome {
-        MutationLedgerOutcome::Applied | MutationLedgerOutcome::Started
+        MutationLedgerOutcome::Applied
+        | MutationLedgerOutcome::Started
+        | MutationLedgerOutcome::PromotionIntent
             if source_sha256 == grant.result_sha256 =>
         {
             match atomic_replace(
@@ -865,15 +1061,59 @@ pub(crate) fn recover_workspace_publication(
                 }
             }
         }
+        MutationLedgerOutcome::Started if source_sha256 == grant.before_sha256 => {
+            ledger.append_outcome(grant.operation, MutationLedgerOutcome::Reverted)
+        }
         MutationLedgerOutcome::Reverted if source_sha256 == grant.before_sha256 => Ok(()),
-        MutationLedgerOutcome::Applied | MutationLedgerOutcome::Started => {
+        MutationLedgerOutcome::Applied
+        | MutationLedgerOutcome::Started
+        | MutationLedgerOutcome::PromotionIntent => {
             ledger.append_outcome(grant.operation, MutationLedgerOutcome::Ambiguous)?;
             Err(Error::MutationAmbiguous(grant.source_path.clone()))
         }
+        MutationLedgerOutcome::Promoted => Err(Error::MutationCorrupt(
+            "restoration inverse remained armed after promotion commit".into(),
+        )),
         MutationLedgerOutcome::Reverted | MutationLedgerOutcome::Ambiguous => {
             Err(Error::MutationAmbiguous(grant.source_path.clone()))
         }
     }
+}
+
+pub(crate) fn verify_promoted_workspace(
+    grant: &WorkspaceGrant,
+    before_bytes: &[u8],
+    result_bytes: &[u8],
+    approver: &str,
+    max_record_bytes: usize,
+) -> Result<()> {
+    let mut ledger = MutationLedger::open(&grant.ledger_path, max_record_bytes)?;
+    let record = ledger
+        .record(
+            grant.operation,
+            mutation_ledger_identity(grant, before_bytes, result_bytes),
+        )?
+        .ok_or_else(|| Error::MutationCorrupt("promotion inverse has no ledger record".into()))?
+        .clone();
+    if record.approver.as_deref() != Some(approver) {
+        return Err(Error::MutationCorrupt(
+            "promotion inverse does not match the durable approver".into(),
+        ));
+    }
+    if record.outcome == MutationLedgerOutcome::Ambiguous {
+        return Err(Error::MutationAmbiguous(grant.source_path.clone()));
+    }
+    if record.outcome != MutationLedgerOutcome::Promoted {
+        return Err(Error::MutationCorrupt(
+            "promotion inverse does not match the durable commit".into(),
+        ));
+    }
+    let source_bytes = read_workspace_source(&grant.source_path, grant.max_bytes)?;
+    if sha256_hex(&source_bytes) == grant.result_sha256 {
+        return Ok(());
+    }
+    ledger.append_outcome(grant.operation, MutationLedgerOutcome::Ambiguous)?;
+    Err(Error::MutationAmbiguous(grant.source_path.clone()))
 }
 
 fn atomic_replace(

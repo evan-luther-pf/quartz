@@ -1,18 +1,36 @@
 {
-  "abi": 9,
+  "abi": 10,
   "module": "quartz.slice3.event-projection",
   "version": "0.1.0",
   "execution_mode": "wasm-component",
-  "requested_host_capabilities": ["event-count", "publish", "read-event", "set-state"],
+  "requested_host_capabilities": [
+    "event-count",
+    "publish",
+    "read-event",
+    "set-state"
+  ],
   "component": {
     "id": "event-projection",
     "config_schema": "u64",
     "max_activation_steps": 516,
     "inject": [
-      {"slot": 4, "kind": "callable", "namespace": "quartz.events", "interface": "stream", "min_revision": 1, "max_revision": 1}
+      {
+        "slot": 4,
+        "kind": "callable",
+        "namespace": "quartz.events",
+        "interface": "stream",
+        "min_revision": 1,
+        "max_revision": 1
+      }
     ],
     "provide": [
-      {"slot": 5, "kind": "value", "namespace": "quartz.events", "interface": "projection-sum", "revision": 1}
+      {
+        "slot": 5,
+        "kind": "value",
+        "namespace": "quartz.events",
+        "interface": "projection-sum",
+        "revision": 1
+      }
     ]
   }
 }

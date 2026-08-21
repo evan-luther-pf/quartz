@@ -1,24 +1,33 @@
 {
   "abi": 10,
-  "module": "quartz.slice7.repo-editor-b",
+  "module": "quartz.slice9.promotion-direct-editor",
   "version": "0.1.0",
   "execution_mode": "wasm-component",
   "requested_host_capabilities": [
     "invoke",
+    "workspace-promote",
     "workspace-publish",
     "workspace-read",
     "workspace-write"
   ],
   "component": {
-    "id": "repo-editor-b",
+    "id": "promotion-direct-editor",
     "config_schema": "u64",
-    "max_activation_steps": 1,
+    "max_activation_steps": 2,
     "inject": [
       {
         "slot": 12,
         "kind": "callable",
         "namespace": "quartz.repository",
         "interface": "mutation-authority",
+        "min_revision": 1,
+        "max_revision": 1
+      },
+      {
+        "slot": 13,
+        "kind": "callable",
+        "namespace": "quartz.repository",
+        "interface": "promotion-authority",
         "min_revision": 1,
         "max_revision": 1
       }

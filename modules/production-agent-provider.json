@@ -1,18 +1,37 @@
 {
-  "abi": 9,
+  "abi": 10,
   "module": "quartz.slice6.production-agent-provider",
   "version": "0.1.0",
   "execution_mode": "wasm-component",
-  "requested_host_capabilities": ["event-count", "exchange", "open-exchange", "publish-callable", "read-event"],
+  "requested_host_capabilities": [
+    "event-count",
+    "exchange",
+    "open-exchange",
+    "publish-callable",
+    "read-event"
+  ],
   "component": {
     "id": "production-agent-provider",
     "config_schema": "u64",
     "max_activation_steps": 1,
     "inject": [
-      {"slot": 4, "kind": "callable", "namespace": "quartz.events", "interface": "stream", "min_revision": 1, "max_revision": 1}
+      {
+        "slot": 4,
+        "kind": "callable",
+        "namespace": "quartz.events",
+        "interface": "stream",
+        "min_revision": 1,
+        "max_revision": 1
+      }
     ],
     "provide": [
-      {"slot": 10, "kind": "callable", "namespace": "quartz.agent", "interface": "provider", "revision": 1}
+      {
+        "slot": 10,
+        "kind": "callable",
+        "namespace": "quartz.agent",
+        "interface": "provider",
+        "revision": 1
+      }
     ]
   }
 }

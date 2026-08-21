@@ -10,7 +10,10 @@ use crate::{
     events::{EventStreamRegistration, PendingEvent},
     exchange::{ExchangeAdapter, ExchangeRegistration},
     journal::{DurablePayload, EventFact},
-    repository::{WorkspaceAuthorization, WorkspaceGrant, recover_workspace_publication},
+    repository::{
+        PromotionAuthorization, WorkspaceAuthorization, WorkspaceGrant,
+        recover_workspace_publication, verify_promoted_workspace,
+    },
     wasm_host::{
         GuestInstance, STATUS_COLLISION, STATUS_INVALID, STATUS_LIMIT, STATUS_OK,
         STATUS_UNDECLARED, STATUS_UNSATISFIED,
@@ -66,6 +69,7 @@ pub(crate) struct Fiber {
     pub(crate) inbound_response: Option<DurablePayload>,
     pub(crate) workspace_buffers: Vec<Vec<u8>>,
     pub(crate) workspace_authorization: Option<WorkspaceAuthorization>,
+    pub(crate) promotion_authorization: Option<PromotionAuthorization>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -132,6 +136,13 @@ pub(crate) enum Inverse {
         before_bytes: Vec<u8>,
         result_bytes: Vec<u8>,
     },
+    VerifyPromotedWorkspace {
+        effect: u64,
+        grant: WorkspaceGrant,
+        before_bytes: Vec<u8>,
+        result_bytes: Vec<u8>,
+        approver: String,
+    },
 }
 
 impl Inverse {
@@ -144,7 +155,8 @@ impl Inverse {
             | Self::CloseJournal { effect }
             | Self::CloseEventStream { effect }
             | Self::CloseExchange { effect }
-            | Self::RestoreWorkspace { effect, .. } => *effect,
+            | Self::RestoreWorkspace { effect, .. }
+            | Self::VerifyPromotedWorkspace { effect, .. } => *effect,
         }
     }
 
@@ -158,6 +170,7 @@ impl Inverse {
             Self::CloseEventStream { .. } => "event-stream",
             Self::CloseExchange { .. } => "exchange-ledger",
             Self::RestoreWorkspace { .. } => "workspace-publication",
+            Self::VerifyPromotedWorkspace { .. } => "workspace-promotion",
         }
     }
 }
@@ -397,6 +410,36 @@ impl Core {
                     return Err(error);
                 }
             }
+            Inverse::VerifyPromotedWorkspace {
+                effect,
+                grant,
+                before_bytes,
+                result_bytes,
+                approver,
+            } => {
+                if let Err(error) = verify_promoted_workspace(
+                    &grant,
+                    &before_bytes,
+                    &result_bytes,
+                    &approver,
+                    self.limits.max_mutation_record_bytes,
+                ) {
+                    self.fibers
+                        .get_mut(&fiber_id)
+                        .ok_or_else(|| {
+                            Error::Invariant("promoted workspace owner disappeared".into())
+                        })?
+                        .accumulator
+                        .push(Inverse::VerifyPromotedWorkspace {
+                            effect,
+                            grant,
+                            before_bytes,
+                            result_bytes,
+                            approver,
+                        });
+                    return Err(error);
+                }
+            }
         }
         self.trace.push(TraceEvent::EffectRecovered {
             fiber: fiber_id,
@@ -441,6 +484,7 @@ impl Core {
             || fiber.staged_usage.is_some()
             || fiber.inbound_response.is_some()
             || fiber.workspace_authorization.is_some()
+            || fiber.promotion_authorization.is_some()
         {
             return Err(Error::Invariant(
                 "removed fiber retained context effects".into(),
@@ -759,6 +803,7 @@ impl Fiber {
             inbound_response: None,
             workspace_buffers,
             workspace_authorization: None,
+            promotion_authorization: None,
         }
     }
 

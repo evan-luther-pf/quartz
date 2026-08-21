@@ -68,6 +68,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &required_path(args.next())?,
             )?;
         }
+        Some("--promote-edit") => {
+            run_promoted_edit_acceptance(
+                &PathBuf::from(env!("QUARTZ_FIXTURE_DIR")),
+                &required_path(args.next())?,
+            )?;
+        }
         Some("--production-model") => {
             let model = args.next().ok_or("production model name is required")?;
             let prompt = required_path(args.next())?;
@@ -371,6 +377,123 @@ fn proposal_editor_spec(
             ledger,
             operation,
             "reviewed candidate turn 1",
+            digest(b"alpha\n"),
+            digest(result),
+            64 * 1024,
+        )?]))
+}
+
+fn run_promoted_edit_acceptance(
+    fixtures: &Path,
+    directory: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(directory)?;
+    let source = directory.join("quartz-slice9-source.txt");
+    let prompt = directory.join("quartz-slice9-prompt.txt");
+    let journal = directory.join("quartz-slice9-composition.qj");
+    let events = journal.with_extension("qe");
+    let exchange = journal.with_extension("qx");
+    let mutation = directory.join("quartz-slice9-mutations.qm");
+    if [&source, &prompt, &journal, &events, &exchange, &mutation]
+        .into_iter()
+        .any(|path| path.exists())
+    {
+        return Err(format!(
+            "promoted editing smoke paths already exist in `{}`",
+            directory.display()
+        )
+        .into());
+    }
+    let before = b"alpha\n";
+    let candidate = b"alpha reviewed by Quartz\n";
+    fs::write(&source, before)?;
+    fs::write(&prompt, b"Return only the complete reviewed file bytes.")?;
+
+    let (response, provenance) =
+        run_exchange_turn(&prompt, &journal, Arc::new(ReviewedEditExchange))?;
+    assert_eq!(response, candidate);
+    assert_eq!(provenance, "smoke:reviewed-edit");
+    assert_eq!(fs::read(&source)?, before);
+    println!("promotion candidate committed durably; source unchanged");
+
+    let persistence = || {
+        ComponentSpec::new("event-store", artifact(fixtures, "event-store"))
+            .with_journal_paths(vec![journal.clone()])
+            .with_event_stream_paths(vec![events.clone()])
+    };
+    let tree = || -> Result<ComponentTree, Error> {
+        Ok(ComponentTree {
+            roots: vec![
+                ComponentSpec::new("root", artifact(fixtures, "root"))
+                    .with_config(3)
+                    .with_children(vec![
+                        ComponentSpec::new(
+                            "mutation-authority",
+                            artifact(fixtures, "mutation-authority"),
+                        )
+                        .with_config(9_001),
+                        ComponentSpec::new(
+                            "promotion-authority",
+                            artifact(fixtures, "promotion-authority-a"),
+                        )
+                        .with_config(9_001),
+                        promoted_editor_spec(
+                            fixtures,
+                            &source,
+                            &mutation,
+                            "promotion-editor-a",
+                            9_001,
+                            candidate,
+                        )?,
+                    ]),
+            ],
+        })
+    };
+
+    let mut runtime = Runtime::open_persistent(Limits::default(), persistence())?;
+    runtime.apply_tree(tree()?)?;
+    active_id(&runtime, "root/editor")?;
+    assert_eq!(fs::read(&source)?, candidate);
+    println!("separate authority durably promoted the exact reviewed candidate");
+    drop(runtime);
+
+    let mut restarted = Runtime::open_persistent(Limits::default(), persistence())?;
+    active_id(&restarted, "root/editor")?;
+    assert_eq!(fs::read(&source)?, candidate);
+    println!("fresh runtime reconstructed the promotion without republishing");
+    restarted.shutdown_persistent()?;
+    assert_eq!(fs::read(&source)?, candidate);
+    assert!(
+        restarted.is_observationally_clean(),
+        "promoted editing final context: {:?}",
+        restarted.observation()
+    );
+    println!("promotion subtree removed: approved source retained and context clean");
+
+    for path in [source, prompt, journal, events, exchange, mutation] {
+        fs::remove_file(path)?;
+    }
+    if directory.read_dir()?.next().is_none() {
+        fs::remove_dir(directory)?;
+    }
+    Ok(())
+}
+
+fn promoted_editor_spec(
+    fixtures: &Path,
+    source: &Path,
+    ledger: &Path,
+    editor: &str,
+    operation: u64,
+    result: &[u8],
+) -> Result<ComponentSpec, Error> {
+    Ok(ComponentSpec::new("editor", artifact(fixtures, editor))
+        .with_config(1)
+        .with_workspace_grants(vec![WorkspaceGrant::new(
+            source,
+            ledger,
+            operation,
+            "promoted reviewed candidate turn 1",
             digest(b"alpha\n"),
             digest(result),
             64 * 1024,

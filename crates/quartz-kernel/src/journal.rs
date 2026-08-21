@@ -14,12 +14,12 @@ const COMPOSITION_MAGIC: &[u8; 8] = b"QUARTZJ2";
 const EVENT_MAGIC: &[u8; 8] = b"QUARTZE2";
 const HEADER_LEN: usize = 12;
 const EXCHANGE_MAGIC: &[u8; 8] = b"QUARTZX1";
-const MUTATION_MAGIC: &[u8; 8] = b"QUARTZM1";
+const MUTATION_MAGIC: &[u8; 8] = b"QUARTZM2";
 const CHECKSUM_LEN: usize = 32;
 const COMPOSITION_SCHEMA_VERSION: u32 = 2;
 const EVENT_SCHEMA_VERSION: u32 = 2;
 const EXCHANGE_SCHEMA_VERSION: u32 = 1;
-const MUTATION_SCHEMA_VERSION: u32 = 1;
+const MUTATION_SCHEMA_VERSION: u32 = 2;
 
 type FramedPayloads = Vec<(u64, Vec<u8>)>;
 type DecodedLog = (u64, FramedPayloads, usize);
@@ -186,6 +186,7 @@ struct MutationPayload {
     result_sha256: String,
     before_bytes: Vec<u8>,
     result_bytes: Vec<u8>,
+    approver: Option<String>,
     outcome: MutationLedgerOutcome,
 }
 
@@ -194,6 +195,8 @@ struct MutationPayload {
 pub(crate) enum MutationLedgerOutcome {
     Started,
     Applied,
+    PromotionIntent,
+    Promoted,
     Reverted,
     Ambiguous,
 }
@@ -206,6 +209,7 @@ pub(crate) struct MutationLedgerRecord {
     pub(crate) result_sha256: String,
     pub(crate) before_bytes: Vec<u8>,
     pub(crate) result_bytes: Vec<u8>,
+    pub(crate) approver: Option<String>,
     pub(crate) outcome: MutationLedgerOutcome,
 }
 
@@ -644,6 +648,7 @@ impl MutationLedger {
                 result_sha256: payload.result_sha256,
                 before_bytes: payload.before_bytes,
                 result_bytes: payload.result_bytes,
+                approver: payload.approver,
                 outcome: payload.outcome,
             };
             validate_mutation_record(payload.operation, &record)?;
@@ -653,18 +658,7 @@ impl MutationLedger {
                 }
                 Some(previous)
                     if same_mutation(previous, &record)
-                        && matches!(
-                            (previous.outcome, record.outcome),
-                            (
-                                MutationLedgerOutcome::Started,
-                                MutationLedgerOutcome::Applied
-                                    | MutationLedgerOutcome::Reverted
-                                    | MutationLedgerOutcome::Ambiguous
-                            ) | (
-                                MutationLedgerOutcome::Applied,
-                                MutationLedgerOutcome::Reverted | MutationLedgerOutcome::Ambiguous
-                            )
-                        ) =>
+                        && valid_mutation_transition(previous, &record) =>
                 {
                     records.insert(payload.operation, record);
                 }
@@ -722,6 +716,30 @@ impl MutationLedger {
         self.records.get(&operation)
     }
 
+    pub(crate) fn append_promotion_intent(
+        &mut self,
+        operation: u64,
+        approver: String,
+    ) -> Result<()> {
+        let Some(previous) = self.records.get(&operation) else {
+            return Err(Error::MutationCorrupt(format!(
+                "unknown mutation operation {operation}"
+            )));
+        };
+        let mut record = previous.clone();
+        record.approver = Some(approver);
+        record.outcome = MutationLedgerOutcome::PromotionIntent;
+        if !valid_mutation_transition(previous, &record) {
+            return Err(Error::MutationCorrupt(format!(
+                "invalid promotion transition for operation {operation}"
+            )));
+        }
+        validate_mutation_record(operation, &record)?;
+        self.append(operation, &record)?;
+        self.records.insert(operation, record);
+        Ok(())
+    }
+
     pub(crate) fn append_outcome(
         &mut self,
         operation: u64,
@@ -737,24 +755,13 @@ impl MutationLedger {
                 "unknown mutation operation {operation}"
             )));
         };
-        if !matches!(
-            (previous.outcome, outcome),
-            (
-                MutationLedgerOutcome::Started,
-                MutationLedgerOutcome::Applied
-                    | MutationLedgerOutcome::Reverted
-                    | MutationLedgerOutcome::Ambiguous
-            ) | (
-                MutationLedgerOutcome::Applied,
-                MutationLedgerOutcome::Reverted | MutationLedgerOutcome::Ambiguous
-            )
-        ) {
+        let mut record = previous.clone();
+        record.outcome = outcome;
+        if !valid_mutation_transition(previous, &record) {
             return Err(Error::MutationCorrupt(format!(
                 "invalid terminal mutation transition for operation {operation}"
             )));
         }
-        let mut record = previous.clone();
-        record.outcome = outcome;
         self.append(operation, &record)?;
         self.records.insert(operation, record);
         Ok(())
@@ -770,6 +777,7 @@ impl MutationLedger {
             result_sha256: record.result_sha256.clone(),
             before_bytes: record.before_bytes.clone(),
             result_bytes: record.result_bytes.clone(),
+            approver: record.approver.clone(),
             outcome: record.outcome,
         })?;
         self.log.append(&payload)?;
@@ -778,6 +786,19 @@ impl MutationLedger {
 }
 
 fn validate_mutation_record(operation: u64, record: &MutationLedgerRecord) -> Result<()> {
+    let valid_approver = match record.outcome {
+        MutationLedgerOutcome::Started | MutationLedgerOutcome::Applied => {
+            record.approver.is_none()
+        }
+        MutationLedgerOutcome::PromotionIntent | MutationLedgerOutcome::Promoted => record
+            .approver
+            .as_ref()
+            .is_some_and(|identity| !identity.is_empty()),
+        MutationLedgerOutcome::Reverted | MutationLedgerOutcome::Ambiguous => record
+            .approver
+            .as_ref()
+            .is_none_or(|identity| !identity.is_empty()),
+    };
     if operation == 0
         || !record.source_path.is_absolute()
         || record.provenance.is_empty()
@@ -785,9 +806,10 @@ fn validate_mutation_record(operation: u64, record: &MutationLedgerRecord) -> Re
         || !valid_sha256(&record.result_sha256)
         || sha256_hex(&record.before_bytes) != record.before_sha256
         || sha256_hex(&record.result_bytes) != record.result_sha256
+        || !valid_approver
     {
         return Err(Error::MutationCorrupt(
-            "mutation record has invalid identity or bytes".into(),
+            "mutation record has invalid identity, bytes, or approver".into(),
         ));
     }
     Ok(())
@@ -800,6 +822,32 @@ fn same_mutation(left: &MutationLedgerRecord, right: &MutationLedgerRecord) -> b
         && left.result_sha256 == right.result_sha256
         && left.before_bytes == right.before_bytes
         && left.result_bytes == right.result_bytes
+}
+
+fn valid_mutation_transition(previous: &MutationLedgerRecord, next: &MutationLedgerRecord) -> bool {
+    same_mutation(previous, next)
+        && match (previous.outcome, next.outcome) {
+            (MutationLedgerOutcome::Started, MutationLedgerOutcome::Applied)
+            | (MutationLedgerOutcome::Applied, MutationLedgerOutcome::PromotionIntent)
+            | (MutationLedgerOutcome::PromotionIntent, MutationLedgerOutcome::Promoted) => {
+                previous.approver == next.approver
+                    || (previous.approver.is_none() && next.approver.is_some())
+            }
+            (
+                MutationLedgerOutcome::Started
+                | MutationLedgerOutcome::Applied
+                | MutationLedgerOutcome::PromotionIntent,
+                MutationLedgerOutcome::Reverted,
+            )
+            | (
+                MutationLedgerOutcome::Started
+                | MutationLedgerOutcome::Applied
+                | MutationLedgerOutcome::PromotionIntent
+                | MutationLedgerOutcome::Promoted,
+                MutationLedgerOutcome::Ambiguous,
+            ) => previous.approver == next.approver,
+            _ => false,
+        }
 }
 
 fn validate_exchange_payload(payload: &DurablePayload) -> Result<()> {
