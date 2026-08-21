@@ -63,6 +63,7 @@ pub(crate) struct ProposalGeneration {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Continuation {
+    pub(crate) sequence: u32,
     pub(crate) model: String,
     pub(crate) admission: Admission,
     pub(crate) current: Vec<ProposalGeneration>,
@@ -75,6 +76,7 @@ pub(crate) enum ContinuationResponse {
     Proposal {
         admitted_path_index: usize,
         proposal_index: usize,
+        revision: u32,
         proposal: Proposal,
     },
     Complete(String),
@@ -457,14 +459,16 @@ impl Revision {
 
 impl Continuation {
     pub(crate) fn new(
+        sequence: u32,
         model: &str,
         admission: &Admission,
         current: &[ProposalGeneration],
         command: &CommandFinished,
         repository_root: &Path,
     ) -> Result<Self, String> {
+        validate_continuation_sequence(sequence)?;
         validate_model(model)?;
-        validate_current_generations(admission, current)?;
+        validate_current_generations(admission, current, sequence)?;
         let paths = admission
             .files
             .iter()
@@ -489,6 +493,7 @@ impl Continuation {
             });
         }
         let continuation = Self {
+            sequence,
             model: model.to_owned(),
             admission: admission.clone(),
             current: current.to_vec(),
@@ -500,9 +505,9 @@ impl Continuation {
     }
 
     pub(crate) fn prompt_bytes(&self) -> Result<Vec<u8>, String> {
+        validate_continuation_sequence(self.sequence)?;
         validate_model(&self.model)?;
-        validate_current_generations(&self.admission, &self.current)?;
-        validate_continuation_sources(&self.admission, &self.command, &self.sources)?;
+        validate_current_generations(&self.admission, &self.current, self.sequence)?;
         let admitted_sources = self
             .sources
             .iter()
@@ -541,11 +546,13 @@ impl Continuation {
     }
 
     pub(crate) fn from_prompt(
+        sequence: u32,
         prompt: &[u8],
         admission: &Admission,
         current: &[ProposalGeneration],
         command: &CommandFinished,
     ) -> Result<Self, String> {
+        validate_continuation_sequence(sequence)?;
         if prompt.is_empty() || prompt.len() > MAX_CONTINUATION_PROMPT_BYTES {
             return Err(format!(
                 "durable continuation prompt must contain 1..={MAX_CONTINUATION_PROMPT_BYTES} bytes"
@@ -582,7 +589,7 @@ impl Continuation {
         }
         let model = string_field(object, "model", "continuation prompt")?.to_owned();
         validate_model(&model)?;
-        validate_current_generations(admission, current)?;
+        validate_current_generations(admission, current, sequence)?;
         let expected_generations = Value::Array(continuation_generations(current));
         if object.get("current_proposals") != Some(&expected_generations) {
             return Err("durable continuation current proposals changed".into());
@@ -631,6 +638,7 @@ impl Continuation {
         }
         validate_continuation_sources(admission, command, &sources)?;
         Ok(Self {
+            sequence,
             model,
             admission: admission.clone(),
             current: current.to_vec(),
@@ -707,9 +715,14 @@ pub(crate) fn parse_continuation_response(
                 .max()
                 .map_or(0, |index| index + 1)
         });
+    let revision = continuation
+        .sequence
+        .checked_add(1)
+        .ok_or_else(|| "continuation revision overflow".to_owned())?;
     Ok(ContinuationResponse::Proposal {
         admitted_path_index,
         proposal_index,
+        revision,
         proposal: Proposal {
             path: source.path.clone(),
             before_sha256: source.before_sha256.clone(),
@@ -738,9 +751,17 @@ fn continuation_generations(current: &[ProposalGeneration]) -> Vec<Value> {
         .collect()
 }
 
+fn validate_continuation_sequence(sequence: u32) -> Result<(), String> {
+    if sequence == 0 || sequence == u32::MAX {
+        return Err("continuation sequence must permit a positive proposal revision".into());
+    }
+    Ok(())
+}
+
 fn validate_current_generations(
     admission: &Admission,
     current: &[ProposalGeneration],
+    max_revision: u32,
 ) -> Result<(), String> {
     if current.is_empty() {
         return Err("continuation requires at least one current proposal".into());
@@ -760,7 +781,7 @@ fn validate_current_generations(
         if !proposal_indices.insert(generation.proposal_index)
             || !admitted_indices.insert(generation.admitted_path_index)
             || admitted.path != generation.proposal.path
-            || generation.revision > 1
+            || generation.revision > max_revision
             || generation.proposal.result_sha256 != sha256(&generation.proposal.content)
             || generation.proposal.before_sha256 != sha256(&generation.proposal.before)
         {
@@ -1070,32 +1091,40 @@ pub(crate) fn materialize_revision(
     Ok(candidate)
 }
 
-pub(crate) fn continuation_prompt_path(session: &Path) -> PathBuf {
-    session.join("continuation-1.prompt")
+pub(crate) fn continuation_prompt_path(session: &Path, sequence: u32) -> PathBuf {
+    session.join(format!("continuation-{sequence}.prompt"))
 }
 
-pub(crate) fn continuation_journal_path(session: &Path) -> PathBuf {
-    session.join("continuation-1.qj")
+pub(crate) fn continuation_journal_path(session: &Path, sequence: u32) -> PathBuf {
+    session.join(format!("continuation-{sequence}.qj"))
 }
 
-pub(crate) fn continuation_candidate_path(session: &Path, proposal_index: usize) -> PathBuf {
-    session.join(format!("proposal-{proposal_index}.revision-2.candidate"))
+pub(crate) fn continuation_candidate_path(
+    session: &Path,
+    proposal_index: usize,
+    revision: u32,
+) -> PathBuf {
+    session.join(format!(
+        "proposal-{proposal_index}.revision-{revision}.candidate"
+    ))
 }
 
-pub(crate) fn completion_summary_path(session: &Path) -> PathBuf {
-    session.join("completion-1.txt")
+pub(crate) fn completion_summary_path(session: &Path, sequence: u32) -> PathBuf {
+    session.join(format!("completion-{sequence}.txt"))
 }
 
 pub(crate) fn materialize_continuation_prompt(
     session: &Path,
+    sequence: u32,
     prompt: &[u8],
 ) -> Result<PathBuf, String> {
+    validate_continuation_sequence(sequence)?;
     if prompt.is_empty() || prompt.len() > MAX_CONTINUATION_PROMPT_BYTES {
         return Err(format!(
             "continuation prompt must contain 1..={MAX_CONTINUATION_PROMPT_BYTES} bytes"
         ));
     }
-    let path = continuation_prompt_path(session);
+    let path = continuation_prompt_path(session, sequence);
     atomic_write(&path, prompt)?;
     Ok(path)
 }
@@ -1105,63 +1134,68 @@ pub(crate) fn materialize_continuation_response(
     continuation: &Continuation,
     response: &ContinuationResponse,
 ) -> Result<(), String> {
+    validate_continuation_sequence(continuation.sequence)?;
     let (metadata, obsolete) = match response {
         ContinuationResponse::Proposal {
             admitted_path_index,
             proposal_index,
+            revision,
             proposal,
         } => {
-            let candidate = continuation_candidate_path(session, *proposal_index);
+            if *revision != continuation.sequence + 1 {
+                return Err("continued proposal revision does not match its sequence".into());
+            }
+            let candidate = continuation_candidate_path(session, *proposal_index, *revision);
             atomic_write(&candidate, &proposal.content)?;
             (
                 json!({
                     "schema": 1,
                     "outcome": "proposal",
+                    "continuation_sequence": continuation.sequence,
                     "model": continuation.model,
                     "command_attempt": continuation.command.attempt,
                     "command_started_sha256": continuation.command.command_started_sha256,
                     "admitted_path_index": admitted_path_index,
                     "proposal_index": proposal_index,
-                    "revision": 2,
+                    "revision": revision,
                     "path": proposal.path,
                     "before_sha256": proposal.before_sha256,
                     "result_sha256": proposal.result_sha256,
                     "candidate": candidate.file_name().expect("candidate file name").to_string_lossy(),
                 }),
-                completion_summary_path(session),
+                Some(completion_summary_path(session, continuation.sequence)),
             )
         }
         ContinuationResponse::Complete(summary) => {
-            let path = completion_summary_path(session);
+            let path = completion_summary_path(session, continuation.sequence);
             atomic_write(&path, summary.as_bytes())?;
             (
                 json!({
                     "schema": 1,
                     "outcome": "complete",
+                    "continuation_sequence": continuation.sequence,
                     "model": continuation.model,
                     "command_attempt": continuation.command.attempt,
                     "command_started_sha256": continuation.command.command_started_sha256,
                     "summary_sha256": sha256(summary.as_bytes()),
                     "summary": path.file_name().expect("summary file name").to_string_lossy(),
                 }),
-                continuation
-                    .current
-                    .iter()
-                    .map(|generation| {
-                        continuation_candidate_path(session, generation.proposal_index)
-                    })
-                    .find(|path| path.exists())
-                    .unwrap_or_else(|| session.join("no-continuation-candidate")),
+                None,
             )
         }
     };
-    if obsolete.exists() {
+    if let Some(obsolete) = obsolete
+        && obsolete.exists()
+    {
         fs::remove_file(&obsolete)
             .map_err(|error| format!("remove obsolete cache `{}`: {error}", obsolete.display()))?;
     }
     let metadata = serde_json::to_vec_pretty(&metadata)
         .map_err(|error| format!("serialize continuation metadata: {error}"))?;
-    atomic_write(&session.join("continuation-1.json"), &metadata)?;
+    atomic_write(
+        &session.join(format!("continuation-{}.json", continuation.sequence)),
+        &metadata,
+    )?;
     Ok(())
 }
 
@@ -1477,6 +1511,7 @@ mod tests {
         let prompt = continuation.prompt_bytes().unwrap();
         assert_eq!(
             Continuation::from_prompt(
+                continuation.sequence,
                 &prompt,
                 &continuation.admission,
                 &continuation.current,
@@ -1491,6 +1526,7 @@ mod tests {
         let ContinuationResponse::Proposal {
             admitted_path_index,
             proposal_index,
+            revision,
             proposal,
         } = response
         else {
@@ -1498,8 +1534,28 @@ mod tests {
         };
         assert_eq!(admitted_path_index, 1);
         assert_eq!(proposal_index, 1);
+        assert_eq!(revision, 2);
         assert_eq!(proposal.before, b"beta revised\n");
         assert_eq!(proposal.content, b"beta corrected\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn continuation_prompt_rejects_a_swapped_command_identity() {
+        let (root, continuation) = fixture_continuation(7);
+        let prompt = continuation.prompt_bytes().unwrap();
+        let mut other_command = continuation.command.clone();
+        other_command.attempt = 2;
+        assert!(
+            Continuation::from_prompt(
+                2,
+                &prompt,
+                &continuation.admission,
+                &continuation.current,
+                &other_command,
+            )
+            .is_err()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1560,7 +1616,7 @@ mod tests {
         let after = RepositoryIdentity::capture(&root, &paths).unwrap();
         let command = CommandFinished::new(&started, execution, after).unwrap();
         let continuation =
-            Continuation::new("test-model", &admission, &current, &command, &root).unwrap();
+            Continuation::new(1, "test-model", &admission, &current, &command, &root).unwrap();
         (root, continuation)
     }
 

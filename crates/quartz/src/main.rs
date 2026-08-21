@@ -1189,7 +1189,7 @@ fn run_multi_proposal(
             proposals: candidates,
             revision: None,
             command: None,
-            continuation: None,
+            continuations: Vec::new(),
         },
     )?;
     println!("response provenance: {provenance}");
@@ -1204,6 +1204,13 @@ fn run_proposal_revision(
     feedback: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let session = fs::canonicalize(session)?;
+    let state = reconstruct_proposal_session(&session)?;
+    if state.is_complete() {
+        return Err("proposal session is explicitly complete".into());
+    }
+    if state.command.is_some() || !state.continuations.is_empty() {
+        return Err("proposal rejection is available only before command cycles begin".into());
+    }
     let (admission, candidates) = reconstruct_base_proposals(&session)?;
     let journal = proposals::revision_journal_path(&session);
     let mut prompt_is_durable = false;
@@ -1286,7 +1293,7 @@ struct ProposalSession {
     proposals: Vec<proposals::Proposal>,
     revision: Option<ProposalRevisionState>,
     command: Option<CommandHistory>,
-    continuation: Option<ProposalContinuationState>,
+    continuations: Vec<ProposalContinuationState>,
 }
 
 enum ProposalRevisionState {
@@ -1343,75 +1350,99 @@ impl CommandHistory {
         }
     }
 
+    fn finished(
+        &self,
+        sequence: u32,
+    ) -> Result<&commands::CommandFinished, Box<dyn std::error::Error>> {
+        let index = usize::try_from(
+            sequence
+                .checked_sub(1)
+                .ok_or("continuation sequence must be positive")?,
+        )?;
+        self.attempts
+            .iter()
+            .filter_map(|attempt| match attempt {
+                CommandAttemptState::Finished { finished, .. } => Some(finished),
+                CommandAttemptState::Interrupted(_) => None,
+            })
+            .nth(index)
+            .ok_or_else(|| {
+                format!("continuation {sequence} has no matching finished command").into()
+            })
+    }
+
+    fn finished_count(&self) -> usize {
+        self.attempts
+            .iter()
+            .filter(|attempt| matches!(attempt, CommandAttemptState::Finished { .. }))
+            .count()
+    }
+
     fn next_attempt(&self) -> Result<u64, Box<dyn std::error::Error>> {
-        match self.attempts.last() {
-            Some(CommandAttemptState::Interrupted(started)) => started
-                .attempt
-                .checked_add(1)
-                .ok_or_else(|| "approved command attempt overflow".into()),
-            Some(CommandAttemptState::Finished { .. }) => {
-                Err("proposal session already has a terminal approved command".into())
-            }
-            None => Ok(1),
-        }
+        let attempt = match self.attempts.last() {
+            Some(CommandAttemptState::Interrupted(started)) => started.attempt,
+            Some(CommandAttemptState::Finished { started, .. }) => started.attempt,
+            None => return Ok(1),
+        };
+        attempt
+            .checked_add(1)
+            .ok_or_else(|| "approved command attempt overflow".into())
     }
 }
 
 impl ProposalSession {
+    fn is_complete(&self) -> bool {
+        matches!(
+            self.continuations.last(),
+            Some(ProposalContinuationState::Completed {
+                response: proposals::ContinuationResponse::Complete(_),
+                ..
+            })
+        )
+    }
+
+    fn next_continuation_sequence(&self) -> Result<u32, Box<dyn std::error::Error>> {
+        u32::try_from(self.continuations.len())?
+            .checked_add(1)
+            .ok_or_else(|| "continuation sequence overflow".into())
+    }
+
     fn current(
         &self,
         session: &Path,
         index: usize,
     ) -> Result<CurrentProposal<'_>, Box<dyn std::error::Error>> {
-        if let Some(ProposalContinuationState::Completed {
-            response:
-                proposals::ContinuationResponse::Proposal {
-                    proposal_index,
-                    proposal,
-                    ..
-                },
-            ..
-        }) = &self.continuation
-            && *proposal_index == index
-        {
-            return Ok(CurrentProposal {
-                proposal,
-                path: proposals::continuation_candidate_path(session, index),
-                revision: 2,
-            });
-        }
-        let original = self
-            .proposals
-            .get(index)
-            .ok_or_else(|| format!("proposal index {index} is absent"))?;
-        match &self.revision {
-            Some(ProposalRevisionState::Completed { request, proposal })
-                if request.proposal_index == index =>
+        for continuation in self.continuations.iter().rev() {
+            if let ProposalContinuationState::Completed {
+                response:
+                    proposals::ContinuationResponse::Proposal {
+                        proposal_index,
+                        revision,
+                        proposal,
+                        ..
+                    },
+                ..
+            } = continuation
+                && *proposal_index == index
             {
-                Ok(CurrentProposal {
+                return Ok(CurrentProposal {
                     proposal,
-                    path: proposals::revision_candidate_path(session, index),
-                    revision: 1,
-                })
+                    path: proposals::continuation_candidate_path(session, index, *revision),
+                    revision: *revision,
+                });
             }
-            Some(ProposalRevisionState::Pending(request))
-            | Some(ProposalRevisionState::Interrupted(request))
-                if request.proposal_index == index =>
-            {
-                Err(format!("proposal {index} was rejected and has no completed correction").into())
-            }
-            _ => Ok(CurrentProposal {
-                proposal: original,
-                path: proposals::candidate_path(session, index),
-                revision: 0,
-            }),
         }
+        self.current_without_continuation(session, index)
     }
 
     fn generations_before_continuation(
         &self,
         session: &Path,
+        sequence: u32,
     ) -> Result<Vec<proposals::ProposalGeneration>, Box<dyn std::error::Error>> {
+        if usize::try_from(sequence)? != self.continuations.len() + 1 {
+            return Err("continuation sequence does not follow reconstructed history".into());
+        }
         let mut generations = Vec::with_capacity(self.proposals.len());
         for index in 0..self.proposals.len() {
             let current = self.current_without_continuation(session, index)?;
@@ -1428,6 +1459,48 @@ impl ProposalSession {
                 proposal: current.proposal.clone(),
             });
         }
+        for continuation in &self.continuations {
+            match continuation {
+                ProposalContinuationState::Completed {
+                    response:
+                        proposals::ContinuationResponse::Proposal {
+                            admitted_path_index,
+                            proposal_index,
+                            revision,
+                            proposal,
+                        },
+                    ..
+                } => {
+                    let generation = proposals::ProposalGeneration {
+                        proposal_index: *proposal_index,
+                        admitted_path_index: *admitted_path_index,
+                        revision: *revision,
+                        proposal: proposal.clone(),
+                    };
+                    if let Some(existing) = generations
+                        .iter_mut()
+                        .find(|existing| existing.proposal_index == *proposal_index)
+                    {
+                        *existing = generation;
+                    } else {
+                        generations.push(generation);
+                    }
+                }
+                ProposalContinuationState::Completed {
+                    response: proposals::ContinuationResponse::Complete(_),
+                    ..
+                } => {
+                    return Err("explicit completion cannot precede another continuation".into());
+                }
+                ProposalContinuationState::Pending(_)
+                | ProposalContinuationState::Interrupted(_) => {
+                    return Err(
+                        "nonterminal continuation cannot precede another continuation".into(),
+                    );
+                }
+            }
+        }
+        generations.sort_by_key(|generation| generation.proposal_index);
         Ok(generations)
     }
 
@@ -1468,34 +1541,7 @@ impl ProposalSession {
         &self,
         session: &Path,
     ) -> Result<Vec<proposals::ProposalGeneration>, Box<dyn std::error::Error>> {
-        let mut generations = self.generations_before_continuation(session)?;
-        if let Some(ProposalContinuationState::Completed {
-            response:
-                proposals::ContinuationResponse::Proposal {
-                    admitted_path_index,
-                    proposal_index,
-                    proposal,
-                },
-            ..
-        }) = &self.continuation
-        {
-            let generation = proposals::ProposalGeneration {
-                proposal_index: *proposal_index,
-                admitted_path_index: *admitted_path_index,
-                revision: 2,
-                proposal: proposal.clone(),
-            };
-            if let Some(existing) = generations
-                .iter_mut()
-                .find(|existing| existing.proposal_index == *proposal_index)
-            {
-                *existing = generation;
-            } else {
-                generations.push(generation);
-            }
-        }
-        generations.sort_by_key(|generation| generation.proposal_index);
-        Ok(generations)
+        self.generations_before_continuation(session, self.next_continuation_sequence()?)
     }
 }
 
@@ -1557,69 +1603,139 @@ fn reconstruct_proposal_session(
         None
     };
     let command = read_command_history(&session)?;
+    let finished_count = command.as_ref().map_or(0, CommandHistory::finished_count);
     let mut state = ProposalSession {
         admission,
         proposals: candidates,
         revision,
         command,
-        continuation: None,
+        continuations: Vec::new(),
     };
-    let continuation_journal = proposals::continuation_journal_path(&session);
-    state.continuation = if continuation_journal.exists() {
+    for sequence_index in 1..=finished_count {
+        let sequence = u32::try_from(sequence_index)?;
+        let continuation_journal = proposals::continuation_journal_path(&session, sequence);
+        if !continuation_journal.exists() {
+            if proposals::continuation_prompt_path(&session, sequence).exists() {
+                return Err(format!(
+                    "continuation {sequence} prompt exists without durable turn evidence; rerun `--continue-task`"
+                )
+                .into());
+            }
+            if sequence_index < finished_count {
+                return Err(format!(
+                    "finished command {sequence} has no continuation before a later command"
+                )
+                .into());
+            }
+            break;
+        }
         let finished = state
             .command
             .as_ref()
             .ok_or("continuation exists without approved command evidence")?
-            .latest_finished()?;
-        let current = state.generations_before_continuation(&session)?;
-        match read_durable_proposal_turn(&continuation_journal)? {
+            .finished(sequence)?;
+        let current = state.generations_before_continuation(&session, sequence)?;
+        let continuation = match read_durable_proposal_turn(&continuation_journal)? {
             DurableProposalTurn::Pending {
                 prompt: Some(prompt),
             } => {
                 let request = proposals::Continuation::from_prompt(
+                    sequence,
                     &prompt,
                     &state.admission,
                     &current,
                     finished,
                 )?;
-                proposals::materialize_continuation_prompt(&session, &prompt)?;
-                Some(ProposalContinuationState::Pending(request))
+                proposals::materialize_continuation_prompt(&session, sequence, &prompt)?;
+                ProposalContinuationState::Pending(request)
             }
             DurableProposalTurn::Pending { prompt: None } => {
-                return Err("continuation journal has no durable continuation prompt".into());
+                return Err(format!(
+                    "continuation {sequence} journal has no durable continuation prompt"
+                )
+                .into());
             }
             DurableProposalTurn::Interrupted { prompt } => {
                 let request = proposals::Continuation::from_prompt(
+                    sequence,
                     &prompt,
                     &state.admission,
                     &current,
                     finished,
                 )?;
-                proposals::materialize_continuation_prompt(&session, &prompt)?;
-                Some(ProposalContinuationState::Interrupted(request))
+                proposals::materialize_continuation_prompt(&session, sequence, &prompt)?;
+                ProposalContinuationState::Interrupted(request)
             }
             DurableProposalTurn::Completed { prompt, response } => {
                 let request = proposals::Continuation::from_prompt(
+                    sequence,
                     &prompt,
                     &state.admission,
                     &current,
                     finished,
                 )?;
-                proposals::materialize_continuation_prompt(&session, &prompt)?;
+                proposals::materialize_continuation_prompt(&session, sequence, &prompt)?;
                 let response = proposals::parse_continuation_response(&response, &request)?;
                 proposals::materialize_continuation_response(&session, &request, &response)?;
-                Some(ProposalContinuationState::Completed { request, response })
+                ProposalContinuationState::Completed { request, response }
             }
-        }
-    } else if proposals::continuation_prompt_path(&session).exists() {
-        return Err(
-            "continuation prompt exists without durable turn evidence; rerun `--continue-task`"
-                .into(),
+        };
+        let permits_later_command = matches!(
+            continuation,
+            ProposalContinuationState::Completed {
+                response: proposals::ContinuationResponse::Proposal { .. },
+                ..
+            }
         );
-    } else {
-        None
-    };
+        state.continuations.push(continuation);
+        if sequence_index < finished_count && !permits_later_command {
+            return Err(format!(
+                "continuation {sequence} does not permit the later finished command"
+            )
+            .into());
+        }
+    }
+    validate_continuation_artifacts(&session, state.continuations.len())?;
     Ok(state)
+}
+
+fn validate_continuation_artifacts(
+    session: &Path,
+    reconstructed_count: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for entry in fs::read_dir(session)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let sequence = [
+            (".qj", "continuation-"),
+            (".prompt", "continuation-"),
+            (".json", "continuation-"),
+            (".txt", "completion-"),
+        ]
+        .into_iter()
+        .find_map(|(suffix, prefix)| {
+            name.strip_prefix(prefix)
+                .and_then(|value| value.strip_suffix(suffix))
+                .and_then(|value| value.parse::<usize>().ok())
+        });
+        if sequence.is_some_and(|sequence| sequence > reconstructed_count) {
+            return Err(format!("orphaned continuation artifact `{name}`").into());
+        }
+        if let Some((_, revision)) = name
+            .strip_prefix("proposal-")
+            .and_then(|value| value.split_once(".revision-"))
+            && let Some(revision) = revision.strip_suffix(".candidate")
+            && let Ok(revision) = revision.parse::<usize>()
+            && revision >= 2
+            && revision - 1 > reconstructed_count
+        {
+            return Err(format!("orphaned continuation candidate `{name}`").into());
+        }
+    }
+    Ok(())
 }
 
 fn display_proposals(
@@ -1680,6 +1796,7 @@ fn display_proposals(
         }
     }
     if let Some(command) = &state.command {
+        let mut continuation_index = 0;
         for attempt in &command.attempts {
             match attempt {
                 CommandAttemptState::Interrupted(started) => {
@@ -1706,50 +1823,80 @@ fn display_proposals(
                         String::from_utf8_lossy(&finished.stderr.bytes()?),
                         finished.stderr.truncated
                     );
+                    if let Some(continuation) = state.continuations.get(continuation_index) {
+                        display_continuation(session, state, continuation)?;
+                    }
+                    continuation_index += 1;
                 }
             }
         }
     }
-    match &state.continuation {
-        Some(ProposalContinuationState::Pending(request)) => {
-            println!("continuation 1: pending model={}", request.model);
-        }
-        Some(ProposalContinuationState::Interrupted(request)) => {
+    Ok(())
+}
+
+fn display_continuation(
+    session: &Path,
+    state: &ProposalSession,
+    continuation: &ProposalContinuationState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match continuation {
+        ProposalContinuationState::Pending(request) => {
             println!(
-                "continuation 1: interrupted/unknown model={}",
-                request.model
+                "continuation {}: pending model={}",
+                request.sequence, request.model
             );
         }
-        Some(ProposalContinuationState::Completed {
+        ProposalContinuationState::Interrupted(request) => {
+            println!(
+                "continuation {}: interrupted/unknown model={}",
+                request.sequence, request.model
+            );
+        }
+        ProposalContinuationState::Completed {
             request,
             response:
                 proposals::ContinuationResponse::Proposal {
                     proposal_index,
                     admitted_path_index,
+                    revision,
                     proposal,
                 },
-        }) => {
-            let path = proposals::continuation_candidate_path(session, *proposal_index);
+        } => {
+            let path = proposals::continuation_candidate_path(session, *proposal_index, *revision);
             if fs::read(&path)? != proposal.content {
-                return Err("materialized continuation proposal changed".into());
+                return Err(format!(
+                    "materialized continuation {} proposal changed",
+                    request.sequence
+                )
+                .into());
             }
+            let status = if state.current(session, *proposal_index)?.revision == *revision {
+                "current"
+            } else {
+                "superseded"
+            };
             println!(
-                "proposal {proposal_index} revision 2: current admitted_path_index={admitted_path_index}"
+                "proposal {proposal_index} revision {revision}: {status} admitted_path_index={admitted_path_index}"
             );
-            println!("  continuation_model={}", request.model);
+            println!(
+                "  continuation_sequence={} continuation_model={}",
+                request.sequence, request.model
+            );
             display_proposal(proposal, &path);
         }
-        Some(ProposalContinuationState::Completed {
+        ProposalContinuationState::Completed {
             request,
             response: proposals::ContinuationResponse::Complete(summary),
-        }) => {
-            println!("continuation 1: COMPLETE model={}", request.model);
+        } => {
+            println!(
+                "continuation {}: COMPLETE model={}",
+                request.sequence, request.model
+            );
             print!("{summary}");
             if !summary.ends_with('\n') {
                 println!();
             }
         }
-        None => {}
     }
     Ok(())
 }
@@ -1939,7 +2086,6 @@ fn read_command_history(
                 let started = commands::CommandStarted::from_bytes(&payload)?;
                 if started.attempt != attempt
                     || attempt != u64::try_from(attempts.len())?.saturating_add(1)
-                    || matches!(attempts.last(), Some(CommandAttemptState::Finished { .. }))
                 {
                     return Err("approved command starts have an invalid attempt sequence".into());
                 }
@@ -1975,16 +2121,38 @@ fn run_approved_command(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let session = fs::canonicalize(session)?;
     let state = reconstruct_proposal_session(&session)?;
-    if state.continuation.is_some() {
-        return Err("proposal session already has a model continuation".into());
+    if state.is_complete() {
+        return Err("proposal session is explicitly complete".into());
     }
+    match state.continuations.last() {
+        Some(ProposalContinuationState::Pending(_)) => {
+            return Err("pending continuation must finish before another command".into());
+        }
+        Some(ProposalContinuationState::Interrupted(_)) => {
+            return Err("interrupted/unknown continuation blocks later commands".into());
+        }
+        Some(ProposalContinuationState::Completed {
+            response: proposals::ContinuationResponse::Complete(_),
+            ..
+        }) => {
+            return Err("proposal session is explicitly complete".into());
+        }
+        Some(ProposalContinuationState::Completed {
+            response: proposals::ContinuationResponse::Proposal { .. },
+            ..
+        })
+        | None => {}
+    }
+    if let Some(history) = &state.command
+        && history.finished_count() != state.continuations.len()
+    {
+        return Err("latest finished command requires a model continuation".into());
+    }
+    require_current_proposals_promoted(&session, &state)?;
     let attempt = match &state.command {
         Some(history) => history.next_attempt()?,
         None => 1,
     };
-    if attempt == 1 {
-        require_current_proposals_promoted(&session, &state)?;
-    }
     let repository = repository_root()?;
     let admitted_paths = state
         .admission
@@ -2021,25 +2189,7 @@ fn run_proposal_continuation(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let session = fs::canonicalize(session)?;
     let state = reconstruct_proposal_session(&session)?;
-    if let Some(ProposalContinuationState::Completed { request, .. }) = &state.continuation {
-        if request.model != model {
-            return Err("durable continuation belongs to another model".into());
-        }
-        display_proposals(&session, &state)?;
-        println!("continuation turn reconstructed; no exchange emitted");
-        return Ok(());
-    }
-    if let Some(ProposalContinuationState::Interrupted(request)) = &state.continuation {
-        if request.model != model {
-            return Err("durable continuation belongs to another model".into());
-        }
-        return Err("continuation turn ended interrupted/unknown; it will not be retried".into());
-    }
-    state
-        .command
-        .as_ref()
-        .ok_or("proposal session has no approved command")?
-        .latest_finished()?;
+    validate_continuation_start(model, &state)?;
     let api_key = std::env::var("OPENAI_API_KEY")
         .map_err(|_| "OPENAI_API_KEY is required to start or resume --continue-task")?;
     run_proposal_continuation_with_adapter(
@@ -2049,26 +2199,15 @@ fn run_proposal_continuation(
     )
 }
 
-fn run_proposal_continuation_with_adapter(
+fn validate_continuation_start(
     model: &str,
-    session: &Path,
-    adapter: Arc<dyn ExchangeAdapter>,
+    state: &ProposalSession,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let session = fs::canonicalize(session)?;
-    let state = reconstruct_proposal_session(&session)?;
-    let current = state.generations_before_continuation(&session)?;
-    let finished = state
-        .command
-        .as_ref()
-        .ok_or("proposal session has no approved command")?
-        .latest_finished()?;
-    let request = match &state.continuation {
-        Some(ProposalContinuationState::Completed { request, .. }) => {
+    match state.continuations.last() {
+        Some(ProposalContinuationState::Pending(request)) => {
             if request.model != model {
                 return Err("durable continuation belongs to another model".into());
             }
-            display_proposals(&session, &state)?;
-            println!("continuation turn reconstructed; no exchange emitted");
             return Ok(());
         }
         Some(ProposalContinuationState::Interrupted(request)) => {
@@ -2079,24 +2218,59 @@ fn run_proposal_continuation_with_adapter(
                 "continuation turn ended interrupted/unknown; it will not be retried".into(),
             );
         }
-        Some(ProposalContinuationState::Pending(request)) => {
-            if request.model != model {
-                return Err("durable continuation belongs to another model".into());
-            }
-            request.clone()
+        Some(ProposalContinuationState::Completed {
+            response: proposals::ContinuationResponse::Complete(_),
+            ..
+        }) => return Err("proposal session is explicitly complete".into()),
+        Some(ProposalContinuationState::Completed {
+            response: proposals::ContinuationResponse::Proposal { .. },
+            ..
+        })
+        | None => {}
+    }
+    let history = state
+        .command
+        .as_ref()
+        .ok_or("proposal session has no approved command")?;
+    history.latest_finished()?;
+    if history.finished_count() != state.continuations.len() + 1 {
+        return Err("no finished command is awaiting a model continuation".into());
+    }
+    Ok(())
+}
+
+fn run_proposal_continuation_with_adapter(
+    model: &str,
+    session: &Path,
+    adapter: Arc<dyn ExchangeAdapter>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let session = fs::canonicalize(session)?;
+    let state = reconstruct_proposal_session(&session)?;
+    validate_continuation_start(model, &state)?;
+    let request = match state.continuations.last() {
+        Some(ProposalContinuationState::Pending(request)) => request.clone(),
+        _ => {
+            let sequence = state.next_continuation_sequence()?;
+            let current = state.generations_before_continuation(&session, sequence)?;
+            let finished = state
+                .command
+                .as_ref()
+                .ok_or("proposal session has no approved command")?
+                .finished(sequence)?;
+            proposals::Continuation::new(
+                sequence,
+                model,
+                &state.admission,
+                &current,
+                finished,
+                &repository_root()?,
+            )?
         }
-        None => proposals::Continuation::new(
-            model,
-            &state.admission,
-            &current,
-            finished,
-            &repository_root()?,
-        )?,
     };
     let prompt_bytes = request.prompt_bytes()?;
-    let prompt = proposals::continuation_prompt_path(&session);
-    proposals::materialize_continuation_prompt(&session, &prompt_bytes)?;
-    let journal = proposals::continuation_journal_path(&session);
+    let prompt = proposals::continuation_prompt_path(&session, request.sequence);
+    proposals::materialize_continuation_prompt(&session, request.sequence, &prompt_bytes)?;
+    let journal = proposals::continuation_journal_path(&session, request.sequence);
     let (response, provenance) =
         run_exchange_turn_with_limits(&prompt, &journal, adapter, proposal_limits())?;
     let response = proposals::parse_continuation_response(&response, &request)?;
@@ -2104,7 +2278,10 @@ fn run_proposal_continuation_with_adapter(
     let reconstructed = reconstruct_proposal_session(&session)?;
     display_proposals(&session, &reconstructed)?;
     println!("response provenance: {provenance}");
-    println!("continuation turn reconstructed; approved command was not rerun");
+    println!(
+        "continuation {} reconstructed; approved command was not rerun",
+        request.sequence
+    );
     Ok(())
 }
 
@@ -2174,6 +2351,9 @@ fn proposal_operation(index: usize, revision: u32) -> Result<u64, Box<dyn std::e
 fn run_proposal_promotion(session: &Path, index: usize) -> Result<(), Box<dyn std::error::Error>> {
     let session = fs::canonicalize(session)?;
     let state = reconstruct_proposal_session(&session)?;
+    if state.is_complete() {
+        return Err("proposal session is explicitly complete".into());
+    }
     let current = state.current(&session, index)?;
     let candidate = current.proposal;
     let candidate_path = current.path;
@@ -3132,8 +3312,9 @@ mod proposal_runtime_tests {
         let finished = history.latest_finished().unwrap();
         assert_eq!(finished.exit_code, Some(7));
         assert_eq!(finished.stderr.bytes().unwrap(), b"validation-failed");
-        let current = state.generations_before_continuation(&session).unwrap();
+        let current = state.generations_before_continuation(&session, 1).unwrap();
         let request = proposals::Continuation::new(
+            1,
             "test-model",
             &state.admission,
             &current,
@@ -3164,6 +3345,13 @@ mod proposal_runtime_tests {
         assert_eq!(fs::read(&sources[0]).unwrap(), b"alpha proposed\n");
         assert!(session.join("promotion-0.qj").is_file());
         assert!(!session.join("promotion-0-revision-2.qj").exists());
+        assert!(
+            run_approved_command(
+                &session,
+                vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+            )
+            .is_err()
+        );
         run_proposal_promotion(&session, 0).unwrap();
         assert_eq!(
             fs::read(&sources[0]).unwrap(),
@@ -3171,6 +3359,94 @@ mod proposal_runtime_tests {
         );
         assert!(session.join("promotion-0-revision-2.qj").is_file());
         assert!(session.join("promotion-0-revision-2.qm").is_file());
+        run_approved_command(
+            &session,
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf validation-passed".into(),
+            ],
+        )
+        .unwrap();
+        let after_second_command = reconstruct_proposal_session(&session).unwrap();
+        let history = after_second_command.command.as_ref().unwrap();
+        assert_eq!(history.attempts.len(), 2);
+        let second_finished = history.latest_finished().unwrap();
+        assert!(second_finished.succeeded());
+        let current = after_second_command
+            .generations_before_continuation(&session, 2)
+            .unwrap();
+        assert!(
+            proposals::Continuation::from_prompt(
+                2,
+                &request.prompt_bytes().unwrap(),
+                &after_second_command.admission,
+                &current,
+                second_finished,
+            )
+            .is_err()
+        );
+        let completion = proposals::Continuation::new(
+            2,
+            "test-model",
+            &after_second_command.admission,
+            &current,
+            second_finished,
+            &repository_root().unwrap(),
+        )
+        .unwrap();
+        run_proposal_continuation_with_adapter(
+            "test-model",
+            &session,
+            Arc::new(FixedExchange::success(
+                "second-command-complete",
+                completion.prompt_bytes().unwrap(),
+                b"COMPLETE\nCorrection validated successfully.\n".to_vec(),
+                Arc::new(AtomicU64::new(0)),
+            )),
+        )
+        .unwrap();
+        for (attempt, kind) in [
+            (1, commands::COMMAND_STARTED_KIND),
+            (1, commands::COMMAND_FINISHED_KIND),
+            (2, commands::COMMAND_STARTED_KIND),
+            (2, commands::COMMAND_FINISHED_KIND),
+        ] {
+            fs::remove_file(command_fact_path(&session, attempt, kind).unwrap()).unwrap();
+        }
+        fs::remove_file(proposals::continuation_prompt_path(&session, 1)).unwrap();
+        fs::remove_file(session.join("continuation-1.json")).unwrap();
+        fs::remove_file(proposals::continuation_candidate_path(&session, 0, 2)).unwrap();
+        fs::remove_file(proposals::continuation_prompt_path(&session, 2)).unwrap();
+        fs::remove_file(session.join("continuation-2.json")).unwrap();
+        fs::remove_file(proposals::completion_summary_path(&session, 2)).unwrap();
+        let complete = reconstruct_proposal_session(&session).unwrap();
+        assert!(complete.is_complete());
+        assert_eq!(complete.continuations.len(), 2);
+        assert!(matches!(
+            complete.continuations[0],
+            ProposalContinuationState::Completed {
+                response: proposals::ContinuationResponse::Proposal { revision: 2, .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            complete.continuations[1],
+            ProposalContinuationState::Completed {
+                response: proposals::ContinuationResponse::Complete(_),
+                ..
+            }
+        ));
+        assert!(
+            run_approved_command(
+                &session,
+                vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+            )
+            .is_err()
+        );
+        assert!(run_proposal_continuation("test-model", &session).is_err());
+        assert!(run_proposal_promotion(&session, 0).is_err());
+        assert!(run_proposal_revision("test-model", &session, 0, &root.join("unused")).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3195,9 +3471,12 @@ mod proposal_runtime_tests {
             .unwrap();
         assert!(finished.succeeded());
         assert_eq!(finished.stdout.bytes().unwrap(), b"validation-passed");
-        assert!(restarted.continuation.is_none());
-        let current = restarted.generations_before_continuation(&session).unwrap();
+        assert!(restarted.continuations.is_empty());
+        let current = restarted
+            .generations_before_continuation(&session, 1)
+            .unwrap();
         let request = proposals::Continuation::new(
+            1,
             "test-model",
             &restarted.admission,
             &current,
@@ -3218,19 +3497,20 @@ mod proposal_runtime_tests {
         )
         .unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 1);
-        fs::remove_file(proposals::continuation_prompt_path(&session)).unwrap();
-        fs::remove_file(proposals::completion_summary_path(&session)).unwrap();
+        fs::remove_file(proposals::continuation_prompt_path(&session, 1)).unwrap();
+        fs::remove_file(proposals::completion_summary_path(&session, 1)).unwrap();
         fs::remove_file(session.join("continuation-1.json")).unwrap();
-        run_proposal_continuation("test-model", &session).unwrap();
-        assert!(proposals::continuation_prompt_path(&session).is_file());
-        assert!(proposals::completion_summary_path(&session).is_file());
+        let reconstructed = reconstruct_proposal_session(&session).unwrap();
+        assert!(proposals::continuation_prompt_path(&session, 1).is_file());
+        assert!(proposals::completion_summary_path(&session, 1).is_file());
         assert!(matches!(
-            reconstruct_proposal_session(&session).unwrap().continuation,
+            reconstructed.continuations.last(),
             Some(ProposalContinuationState::Completed {
                 response: proposals::ContinuationResponse::Complete(_),
                 ..
             })
         ));
+        assert!(run_proposal_continuation("test-model", &session).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3287,7 +3567,98 @@ mod proposal_runtime_tests {
             renewed.command.as_ref().unwrap().attempts[1],
             CommandAttemptState::Finished { .. }
         ));
+        let current = renewed
+            .generations_before_continuation(&session, 1)
+            .unwrap();
+        let continuation = proposals::Continuation::new(
+            1,
+            "test-model",
+            &renewed.admission,
+            &current,
+            renewed.command.as_ref().unwrap().latest_finished().unwrap(),
+            &repository_root().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(continuation.sequence, 1);
+        assert_eq!(continuation.command.attempt, 2);
         assert!(!marker.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_later_continuation_is_terminal_and_never_retried() {
+        let (root, session, _) = promoted_session("interrupted-later-continuation");
+        run_approved_command(
+            &session,
+            vec!["/bin/sh".into(), "-c".into(), "exit 7".into()],
+        )
+        .unwrap();
+        let failed = reconstruct_proposal_session(&session).unwrap();
+        let failed_result = failed.command.as_ref().unwrap().latest_finished().unwrap();
+        let current = failed.generations_before_continuation(&session, 1).unwrap();
+        let correction = proposals::Continuation::new(
+            1,
+            "test-model",
+            &failed.admission,
+            &current,
+            failed_result,
+            &repository_root().unwrap(),
+        )
+        .unwrap();
+        run_proposal_continuation_with_adapter(
+            "test-model",
+            &session,
+            Arc::new(FixedExchange::success(
+                "first-cycle-correction",
+                correction.prompt_bytes().unwrap(),
+                b"PROPOSE 0\nalpha corrected before interruption\n".to_vec(),
+                Arc::new(AtomicU64::new(0)),
+            )),
+        )
+        .unwrap();
+        run_proposal_promotion(&session, 0).unwrap();
+        run_approved_command(
+            &session,
+            vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+        )
+        .unwrap();
+        let second = reconstruct_proposal_session(&session).unwrap();
+        let second_result = second.command.as_ref().unwrap().latest_finished().unwrap();
+        let current = second.generations_before_continuation(&session, 2).unwrap();
+        let continuation = proposals::Continuation::new(
+            2,
+            "test-model",
+            &second.admission,
+            &current,
+            second_result,
+            &repository_root().unwrap(),
+        )
+        .unwrap();
+        let calls = Arc::new(AtomicU64::new(0));
+        let adapter = Arc::new(FixedExchange::ambiguous(
+            "interrupted-second-continuation",
+            continuation.prompt_bytes().unwrap(),
+            calls.clone(),
+        ));
+        assert!(
+            run_proposal_continuation_with_adapter("test-model", &session, adapter.clone())
+                .is_err()
+        );
+        assert!(run_proposal_continuation_with_adapter("test-model", &session, adapter).is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let restarted = reconstruct_proposal_session(&session).unwrap();
+        assert_eq!(restarted.continuations.len(), 2);
+        assert!(matches!(
+            restarted.continuations[1],
+            ProposalContinuationState::Interrupted(ref request) if request.sequence == 2
+        ));
+        assert!(
+            run_approved_command(
+                &session,
+                vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+            )
+            .is_err()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -164,33 +164,29 @@ and unaffected sibling; ABI 10 promotion retained both exact digests after
 restart and recovered cleanly. The workspace test command passed 78 tests
 across 12 suites. No kernel, WIT, or dependency change was required.
 
-Proposal sessions now extend through one bounded host-approved command and one
-model continuation. The CLI synchronizes exact `CommandStarted` evidence before
-spawning the user-approved argv once, then commits terminal status, bounded
-stdout and stderr, timing, repository identity, and post-command admitted-file
-identity as `CommandFinished`. Restart reconstructs started-only attempts as
-interrupted/unknown and never reruns them. A continuation binds the terminal
-command facts and current source bytes, then accepts only one path-indexed
-complete-file correction or an explicit bounded completion summary. Command
-success alone does not complete the task, and stale proposal generations remain
-non-promotable.
+Proposal sessions now support repeatable bounded validation cycles. The CLI
+synchronizes each exact user-approved argv before spawning it once and commits
+terminal status, bounded output, timing, repository identity, and admitted-file
+identity. Each finished command is consumed by exactly one sequence-numbered
+continuation. A `PROPOSE` response creates revision `sequence + 1`; only a
+separately promoted current generation permits another command. Explicit
+`COMPLETE`, pending, or interrupted continuation state blocks later cycles.
 
-The live correction session then ran the exact user-approved argv `cargo test -p
-quartz --bin quartz` once and committed its successful 26-test output. After a
-process restart, one `gpt-5.4` continuation received those exact facts and
-returned explicit `COMPLETE` with a bounded summary. A later credential-free
-process reconstructed the command and completion without rerunning either
-external operation. The final workspace command passed 85 tests across 12
-suites; kernel source, WIT, and ABI remained unchanged.
+The repeat-cycle dogfood session committed a failed first command with stderr
+`REVISE_A`, received and separately promoted one `gpt-5.4` correction, committed
+a successful second byte-validation command, and received explicit `COMPLETE`.
+A credential-free process reconstructed both command results, both model
+decisions, the corrected current generation, and the completion summary in
+causal order without rerunning either external operation. The final focused
+command passed 28 tests; the workspace command passed 87 tests across 12 suites.
+Kernel source, WIT, ABI, and dependencies remained unchanged.
 
 ## Next boundary
 
-The bounded production loop deliberately stops after one host-approved command
-and one model decision. Quartz still has no model-selected tools, ambient shell
-authority, autonomous retry, or general multi-turn conversation. Any broader
-agent loop must preserve exact user authority, durable owed-work reconstruction,
-and interrupted/unknown handling rather than bypassing them with an in-process
-tool router.
+The next design boundary is model-proposed host capability use under explicit
+admission and approval. No tool invocation contract, model-selected execution
+authority, ambient shell access, autonomous retry, or general conversation loop
+is committed.
 
 ## Non-goals
 

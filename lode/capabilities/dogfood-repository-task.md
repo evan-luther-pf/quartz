@@ -482,3 +482,108 @@ the same credentialed task.
 - `cargo test -p quartz --bin quartz` passed 26 focused contracts.
   `cargo test --workspace --all-targets` passed 85 tests across 12 suites.
   Kernel source, WIT, and ABI remained unchanged.
+
+## Repeatable validation cycles
+
+### Problem
+
+A failed approved command can produce one corrected proposal, but the session
+then has no legal path to promote that correction, run another approved command,
+and obtain explicit completion. Treating the first continuation as the whole
+conversation leaves a corrected task permanently incomplete.
+
+### Observable behavior
+
+The existing `--run-approved-command`, `--continue-task`, and
+`--promote-proposal` commands form repeatable bounded cycles. Each terminal
+finished command is consumed by exactly one sequence-numbered continuation. A
+`PROPOSE` response creates the next proposal generation; after the user promotes
+that exact generation, another exact argv may be approved. A `COMPLETE` response
+closes the session and rejects later command, continuation, revision, and
+promotion attempts.
+
+An interrupted command may be followed only by a newly approved command
+attempt. An interrupted continuation remains interrupted/unknown and cannot be
+retried or bypassed by a later cycle.
+
+### Non-goals
+
+- Model-selected commands, automatic command execution, automatic proposal
+  promotion, automatic retries, or an unbounded autonomous loop.
+- Concurrent commands or continuations, shell-string parsing, background
+  processes, new admitted paths, or multiple proposals from one continuation.
+- A new command runner, kernel capability, component contract, WIT revision, or
+  durability mechanism.
+
+### Invariants
+
+- Command attempts and continuation sequences are distinct monotonic identities.
+  Continuation sequence `n` consumes the `n`th finished command; interrupted
+  command attempts do not consume a continuation sequence.
+- `continuation-n.qj` and its reconstructible caches bind sequence `n` to the
+  exact `CommandFinished` payload already present in the prompt. Moving or
+  swapping a prompt across sequences fails against the expected command digest.
+- Continuation sequence `n` may create proposal revision `n + 1`. Candidate,
+  promotion-journal, mutation-ledger, and operation identities include that
+  revision, so no earlier generation can satisfy the promotion gate.
+- A later command is legal only after every current generation has an exact
+  durable promotion and the immediately preceding continuation completed with
+  `PROPOSE`. A finished command awaiting continuation blocks another command.
+- A later continuation is legal only for the latest finished command and only
+  after every earlier continuation completed with `PROPOSE`. `COMPLETE`,
+  pending, or interrupted continuation state is terminal for further cycles.
+- Reconstruction applies completed proposal continuations in sequence order,
+  rejects gaps and orphaned artifacts, and derives the same current generation
+  set before parsing the next prompt.
+- Existing command bounds, prompt and response bounds, source bounds, explicit
+  approval semantics, irreversible-fact classification, and recovery behavior
+  remain unchanged.
+
+### Public contract
+
+No kernel, WIT, ABI, event schema, command-fact schema, or continuation-prompt
+schema changes. Continuation files generalize from the existing
+`continuation-1.*` names to `continuation-<sequence>.*`; generated candidates use
+`proposal-<index>.revision-<sequence+1>.candidate`. Existing sequence 1 records
+retain their exact paths and bytes.
+
+### Acceptance scenario
+
+1. Reconstruct promoted initial candidates and run one exact approved command
+   that fails.
+2. Restart, continue from that exact failure, and accept one corrected proposal.
+3. Separately approve and promote only that new generation.
+4. Run a second exact approved command that succeeds, then terminate.
+5. Restart and continue from the second command into explicit `COMPLETE`.
+6. Restart without credentials and reconstruct both command results, both model
+   decisions, the corrected current generation, and the completion summary
+   without rerunning any command or exchange.
+7. Reject stale promotion, post-completion command, and post-completion
+   continuation attempts.
+
+### Verification
+
+Focused contracts cover failed-command correction followed by successful
+completion, restart across multiple cycles, interruption of a later
+continuation, sequence/command identity tampering, and post-completion closure.
+
+- In `.quartz/dogfood-repeat-cycle/session`, one `gpt-5.4` turn proposed the two
+  exact fixture values; the user separately approved and promoted both.
+- The user approved exact argv `["/bin/sh", "-c", "printf REVISE_A >&2; exit
+  7"]`. Attempt 1 synchronized and finished once with exit code 7 in 17 ms and
+  retained stderr `REVISE_A`.
+- Continuation 1 consumed that failure and returned proposal 0 revision 2,
+  changing only `repeat-cycle-a.txt`. The user separately approved and promoted
+  that exact correction.
+- The user approved a second exact Python argv that compared both files'
+  complete bytes. Attempt 2 synchronized and finished once with exit code 0 in
+  46 ms and retained stdout `repeat-cycle validation passed`.
+- Continuation 2 consumed that success and returned explicit `COMPLETE`. A fresh
+  process without `OPENAI_API_KEY` reconstructed both commands and both model
+  decisions in causal order without rerunning either external operation.
+- The completed live session rejected another continuation without reading a
+  credential and rejected another promotion. Focused contracts also reject
+  commands and revisions after completion.
+- `cargo test -p quartz --bin quartz` passed 28 focused contracts.
+  `cargo test --workspace --all-targets` passed 87 tests across 12 suites.
+  Kernel source, WIT, ABI, and dependencies remained unchanged.

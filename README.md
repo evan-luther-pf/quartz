@@ -92,6 +92,13 @@ cargo run --release -p quartz -- \
   --run-approved-command /path/to/session -- cargo test -p quartz --bin quartz
 OPENAI_API_KEY="$OPENAI_API_KEY" cargo run --release -p quartz -- \
   --continue-task gpt-5.4 /path/to/session
+# If the continuation returned PROPOSE:
+cargo run --release -p quartz -- \
+  --promote-proposal /path/to/session 0
+cargo run --release -p quartz -- \
+  --run-approved-command /path/to/session -- cargo test -p quartz --bin quartz
+OPENAI_API_KEY="$OPENAI_API_KEY" cargo run --release -p quartz -- \
+  --continue-task gpt-5.4 /path/to/session
 ```
 
 The proposal command admits two or three exact UTF-8 files, commits one bounded
@@ -111,8 +118,11 @@ then commits the terminal status and output. A start without a finish
 reconstructs as interrupted/unknown and never runs during resume. A later
 invocation is a separate renewed approval.
 
-Continuation binds the exact command facts and post-command admitted sources
-into one durable model turn. Its strict response is either `PROPOSE
+Each finished command is consumed by one sequence-numbered continuation that
+binds the exact command facts, current proposal generations, and post-command
+admitted sources. Its strict response is either `PROPOSE
 <admitted-path-index>` followed by complete replacement bytes, or `COMPLETE`
-followed by a bounded summary. Command success alone never completes the task,
-and promotion after a correction resolves only revision 2.
+followed by a bounded summary. A correction must be separately promoted before
+another exact argv can run. Command success alone never completes the task;
+explicit `COMPLETE` closes the session against later commands, continuations,
+revisions, and promotions.
