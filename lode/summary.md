@@ -113,87 +113,57 @@ workspace buffers or approvals, restoration or promoted-verification effects,
 or live payload-read authority or module artifacts. Durable journal, event,
 candidate, exchange, and mutation-ledger records remain honestly external.
 
-The first dogfood repository task now crosses those boundaries without ABI or
-kernel changes. Credentialed production turns inspected the two package
-manifests and produced exact candidates adding `publish = false`. Review
-rejected candidates that also removed a final newline; corrected candidates
-were separately approved and durably promoted through existing workspace
-grants. The approved argv `["cargo", "test", "--workspace", "--all-targets"]`
-then passed all 62 contracts from the repository root. Its bounded exact result
-became a durable production-turn prompt and the model classified it as passed.
-No command runner, validation ledger, recorder component, retry protocol, or
-security-sandbox claim was added.
+The production CLI composes the credentialed exchange, durable event,
+workspace, mutation, promotion, and approved-command capabilities into one
+bounded repository task. It admits a small exact source set, reconstructs
+proposal generations without credentials, renders diffs for separate approval,
+promotes only current generations, synchronizes each user-approved command
+before one spawn, and commits bounded terminal evidence. One sequence-numbered
+continuation consumes each finished command and returns either one corrected
+candidate or explicit completion. Restart reconstructs repeated correction and
+validation cycles without rerunning a command or model exchange.
 
-The release CLI is now safe to discover: empty and `--help` invocations print
-usage, `--version` prints the package version, and the full architectural smoke
-runs only through `--acceptance`. One parser validates every preserved scenario
-command and rejects malformed or trailing arguments. Two independently
-reviewed candidates changed `main.rs` and README through the existing ABI 10
-workspace and promotion authorities, with restart reconstruction proven for
-each. The approved workspace test command passed 67 tests across 12 suites; its
-bounded result entered a durable production turn and the model returned
-`VALIDATION PASSED.` No kernel, dependency, or tracked-file addition was needed.
+The current implementation uses complete-file candidates, a two-or-three-source
+ceiling, host-only path selection, parallel ledgers, and filename-derived
+session state. These are implementation constraints, not permanent product
+invariants. Planned clean cutovers replace them with one append-only session
+log, digest-anchored ranged edits, and a host-admitted canonical path/digest
+manifest selected only by numeric index.
 
-The production CLI now admits two or three exact UTF-8 repository files and one
-task into a bounded immutable prompt, completes one credentialed model turn,
-and accepts only a strict JSON response containing at least two unique
-path-bound complete-file proposals. The durable prompt and assistant-message
-events reconstruct byte-identical candidate caches without credentials or a
-second exchange. The CLI renders exact bounded diffs, and each separately
-approved proposal publishes through the existing ABI 10 workspace, mutation,
-and promotion authorities with restart verification and clean withdrawal.
+The repository-task state machine, response grammar, candidate reconstruction,
+dispatch policy, and review sequencing are currently native executable code.
+They violate the host-residency rule in
+`architecture/component-contract.md`; credential custody, privileged
+filesystem/process operations, and terminal I/O are the only justified native
+parts of that path. The orchestrator must move behind the public component
+contract before the product surface expands.
 
-The live dogfood session inspected both package manifests in one `gpt-5.4`
-turn. It reconstructed both pending candidates offline, rendered their exact
-description-only diffs, and durably promoted each user-approved digest. The
-workspace test command then passed 74 tests across 12 suites. No kernel, WIT,
-package dependency, retry path, or atomic multi-file transaction was added.
-
-Proposal sessions now support one explicit correction turn. A revision binds
-the requested model, complete original admission, rejected proposal identity
-and bytes, and bounded feedback into a second durable prompt. Restart
-reconstructs the rejection, superseded generation, corrected current
-generation, and unaffected siblings without credentials; rerunning a completed
-revision emits no exchange. Promotion resolves only the current generation.
-
-The correction dogfood run rejected the first of two package-description
-proposals, committed exact feedback, and received one corrected candidate in a
-second `gpt-5.4` turn. A credential-free process reconstructed both turn
-histories and all proposal states. The user separately approved the correction
-and unaffected sibling; ABI 10 promotion retained both exact digests after
-restart and recovered cleanly. The workspace test command passed 78 tests
-across 12 suites. No kernel, WIT, or dependency change was required.
-
-Proposal sessions now support repeatable bounded validation cycles. The CLI
-synchronizes each exact user-approved argv before spawning it once and commits
-terminal status, bounded output, timing, repository identity, and admitted-file
-identity. Each finished command is consumed by exactly one sequence-numbered
-continuation. A `PROPOSE` response creates revision `sequence + 1`; only a
-separately promoted current generation permits another command. Explicit
-`COMPLETE`, pending, or interrupted continuation state blocks later cycles.
-
-The repeat-cycle dogfood session committed a failed first command with stderr
-`REVISE_A`, received and separately promoted one `gpt-5.4` correction, committed
-a successful second byte-validation command, and received explicit `COMPLETE`.
-A credential-free process reconstructed both command results, both model
-decisions, the corrected current generation, and the completion summary in
-causal order without rerunning either external operation. The final focused
-command passed 28 tests; the workspace command passed 87 tests across 12 suites.
-Kernel source, WIT, ABI, and dependencies remained unchanged.
+Focused repository-loop contracts pass 28 tests, and the workspace passes 87
+tests across 12 suites. The latest credentialed dogfood scenario exercised a
+failed command, one reviewed and promoted correction, a successful command,
+explicit completion, and credential-free causal reconstruction. Kernel source,
+WIT, ABI, module manifests, and package dependencies remained unchanged.
 
 ## Next boundary
 
-The next design boundary is model-proposed host capability use under explicit
-admission and approval. No tool invocation contract, model-selected execution
-authority, ambient shell access, autonomous retry, or general conversation loop
-is committed.
+The next boundary is one authoritative append-only session log. Proposal turns,
+revisions, command starts and terminals, continuations, approvals, rejections,
+promotions, and completion become facts in that log; task state is derived from
+facts rather than parallel ledgers or filenames. Started external work without
+a terminal fact remains interrupted/unknown. Crash injection must exercise every
+fsync boundary before this slice closes.
+
+Ranged edits, component-owned orchestration, an admitted path/digest manifest,
+and terminal diff review follow in that order. Tool invocation remains closed:
+no model-selected tool, executable, argument vector, ambient shell authority,
+automatic retry, or general conversation loop is committed.
 
 ## Non-goals
 
 - Streaming production responses, automatic model retries, model-selected
   tools, or unbounded conversation/session payloads.
-- Model-selected repository paths, directory mutation, or multi-file
-  transactions.
+- Model-authored path strings, ambient repository discovery, directory
+  mutation, or multi-file transactions.
 - Automatic edit approval, diff parsing, merge resolution, formatting, or Git
   operations.
 - TUI.

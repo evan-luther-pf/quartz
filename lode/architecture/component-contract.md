@@ -17,6 +17,31 @@ Each component artifact declares:
 
 Admission validates identity, compatibility, declared authority, and configuration before code becomes active. A component receives only its derived context and declared dependencies.
 
+## Native host residency
+
+Outside the irreducible context and lifecycle kernel, native resident behavior
+is admissible only when at least one of these conditions is true:
+
+1. credentials or operating-system handles cannot cross the sandbox boundary;
+2. the operation is privileged system I/O and therefore must cross an explicit
+   host capability;
+3. terminal I/O owns the human interaction boundary.
+
+Every resident must have one recorded justification naming the applicable
+condition. Being first-party, convenient, performance-sensitive without a
+measurement, or already implemented in Rust is not a justification. Product
+state machines, response validation, candidate lifecycle, retry or continuation
+policy, and review sequencing are components and use the same public contract
+as third-party modules.
+
+Current justified residents are the production adapter that retains credentials
+and network handles (condition 1); journal, event, exchange, mutation, and
+promotion storage, canonical filesystem admission and publication, and exact
+child-process spawning (condition 2); and CLI argument, rendering, and approval
+I/O (condition 3). The repository-task orchestrator currently resident in
+`crates/quartz/src/main.rs` has no valid condition; its correction boundary is
+recorded in `capabilities/dogfood-repository-task.md`.
+
 ## Effect contract
 
 `start` and `step` perform mutations through admitted context operations. Each

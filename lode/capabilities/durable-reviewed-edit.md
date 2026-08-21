@@ -10,7 +10,7 @@ A production-compatible provider response is committed as a bounded event payloa
 
 ## Non-goals
 
-- Model-selected paths, directory traversal, directory mutation, or multi-file transactions.
+- Ambient path strings, directory traversal, directory mutation, or multi-file transactions.
 - Automatic approval, semantic review, diff parsing, merge conflict resolution, formatting, Git staging, or commits.
 - Treating model output as executable code or granting a model ambient filesystem authority.
 - Streaming responses, automatic model retries, or retry after ambiguous external emission.
@@ -21,12 +21,29 @@ A production-compatible provider response is committed as a bounded event payloa
 - Durable event payload bytes remain host-owned and bounded by the existing event-stream record, per-payload, total-payload, and read-index limits.
 - Payload reads require explicit manifest capabilities and a committed event-stream provider view. They are available only during activation or callable dispatch, matching scalar event reads.
 - The proposal editor selects exactly one `agent-response` fact for its configured turn. Missing, duplicate, payload-free, or oversized candidates fail activation without touching a workspace source.
-- The host admits one canonical source path and exact candidate digest only after the candidate is durable. Model output never chooses the path or widens the workspace byte bound.
+- The current Slice 8 editor is admitted for one canonical source and exact
+  candidate digest only after the candidate is durable; it cannot widen the
+  workspace byte bound.
 - Copying payload bytes mutates only the editor fiber's private workspace buffer. Publication still requires the existing committed callable authority, exact operation/index approval, source-before digest, candidate-result digest, and durable mutation identity.
 - Candidate production and candidate application are separate runtime generations. Restart cannot change candidate bytes or provenance and cannot duplicate an already committed model exchange.
 - Without a separate promotion commit, editor replacement follows ordinary lifecycle order: the old restoration effect restores the source before the next generation reads the durable candidate and admits its workspace bytes.
 - Without promotion, removing the editor restores the original only while the source retains the published candidate digest. A committed promotion instead preserves and verifies the exact candidate under `durable-edit-promotion.md`. External drift is made durably ambiguous and is never overwritten.
 - Event facts, candidate payloads, exchange records, and mutation-ledger records remain honestly external. Live event access, workspace buffers, approvals, and workspace recovery effects are recovered.
+
+## Superseded implementation decisions
+
+Slice 8 treated full-file candidate bytes and host-only path selection as
+permanent safety properties. They are not architectural invariants. The
+implemented editor remains constrained that way until clean replacement:
+
+- ranged edits will bind a source digest, byte range, exact replacement bytes,
+  and expected result digest instead of copying a complete-file candidate;
+- a host-admitted manifest will retain canonical paths and digests, while the
+  model may select only numeric manifest indices. Model-authored path strings
+  and ambient filesystem discovery remain prohibited.
+
+There is no compatibility path: each later slice replaces the old candidate or
+selection representation and migrates all callers before deleting it.
 
 ## Public contract
 

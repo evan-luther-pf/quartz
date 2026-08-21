@@ -23,13 +23,13 @@
 - `capabilities/isolated-repository-editing.md` — bounded mutable workspaces,
   callable approval, durable publication identity, and guarded recovery.
 - `capabilities/durable-reviewed-edit.md` — restart-stable model-authored
-  candidates, explicit exact-byte approval, and bounded application to one
-  host-selected source.
+  candidates, explicit exact-byte approval, and the current single-source
+  application constraint scheduled for ranged-edit replacement.
 - `capabilities/durable-edit-promotion.md` — separate durable retention
   authority, restoration ownership transfer, and restart-safe promoted bytes.
-- `capabilities/dogfood-repository-task.md` — end-to-end credentialed edits,
-  resumable proposal correction, explicit review and promotion, exact
-  host-approved command evidence, and bounded correction or completion.
+- `capabilities/dogfood-repository-task.md` — current bounded repository-task
+  loop, repeatable correction and validation, durable-state debt, superseded
+  candidate/path constraints, and the native-orchestrator violation.
 
 ## Research
 
@@ -46,7 +46,8 @@ as one Rust workspace:
   and promotion authority, Wasmtime loading, replacement, and rollback.
 - `crates/quartz` — Slice 0 through Slice 9 executable scenarios, contract tests,
   and bounded proposal, correction, approved-command, and continuation
-  orchestration.
+  orchestration. Repository-task policy here is a recorded component-boundary
+  violation, not an approved native-host convention.
 - `wit/quartz-component.wit` — public component/host boundary.
 - `modules` — real WebAssembly component sources and embedded manifests used by
   the executable acceptance paths.

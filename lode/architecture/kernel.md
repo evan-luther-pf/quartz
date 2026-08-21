@@ -342,4 +342,12 @@ Untrusted component code requires WASM or process isolation; dependency declarat
 
 ## Kernel replacement
 
-The currently executing replacement mechanism cannot replace itself in-place. Kernel source changes use a supervised process handover with explicit state transfer and re-exec. This is the only non-component lifecycle boundary.
+Quartz does not implement kernel handover. Today, changing the executing kernel
+requires stopping the process and starting a new binary; no in-flight fiber,
+component, or external-operation state is transferred. A supervised process
+handover with explicit state transfer and re-exec is the only admissible future
+kernel-replacement boundary, because the executing replacement mechanism cannot
+replace itself in place. Implement it only when a real kernel change must
+preserve active runtime state across process generations. Until that gate is
+met, Quartz must not claim live kernel self-replacement or uninterrupted
+handover.
