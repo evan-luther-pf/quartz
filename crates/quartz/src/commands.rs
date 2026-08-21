@@ -1,4 +1,5 @@
-use serde_json::{Map, Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -16,59 +17,64 @@ pub(crate) const MAX_ARGV_BYTES: usize = 32 * 1024;
 const MAX_FACT_BYTES: usize = 256 * 1024;
 const MAX_ERROR_BYTES: usize = 4 * 1024;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RepositoryIdentity {
     pub(crate) canonical_root: String,
     pub(crate) canonical_root_sha256: String,
     pub(crate) files: Vec<RepositoryFileIdentity>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RepositoryFileIdentity {
-    pub(crate) path: String,
-    pub(crate) status: String,
     pub(crate) byte_len: Option<u64>,
+    pub(crate) path: String,
     pub(crate) sha256: Option<String>,
+    pub(crate) status: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CommandStarted {
-    schema: u32,
-    kind: String,
-    pub(crate) attempt: u64,
-    pub(crate) argv: Vec<String>,
-    pub(crate) repository: RepositoryIdentity,
-    pub(crate) cwd: String,
-    pub(crate) timeout_ms: u64,
-    pub(crate) stdout_limit_bytes: usize,
-    pub(crate) stderr_limit_bytes: usize,
     approval: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BoundedOutput {
-    pub(crate) encoding: String,
-    pub(crate) content: String,
-    pub(crate) truncated: bool,
-    pub(crate) read_error: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CommandFinished {
-    schema: u32,
+    pub(crate) argv: Vec<String>,
+    pub(crate) attempt: u64,
+    pub(crate) cwd: String,
     kind: String,
+    pub(crate) repository: RepositoryIdentity,
+    schema: u32,
+    pub(crate) stderr_limit_bytes: usize,
+    pub(crate) stdout_limit_bytes: usize,
+    pub(crate) timeout_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BoundedOutput {
+    pub(crate) content: String,
+    pub(crate) encoding: String,
+    pub(crate) read_error: Option<String>,
+    pub(crate) truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CommandFinished {
+    pub(crate) argv: Vec<String>,
     pub(crate) attempt: u64,
     pub(crate) command_started_sha256: String,
-    pub(crate) argv: Vec<String>,
-    pub(crate) repository: RepositoryIdentity,
-    pub(crate) exit_code: Option<i32>,
-    pub(crate) signal: Option<i32>,
-    pub(crate) timed_out: bool,
-    pub(crate) spawn_error: Option<String>,
-    pub(crate) stdout: BoundedOutput,
-    pub(crate) stderr: BoundedOutput,
     pub(crate) duration_ms: u64,
+    pub(crate) exit_code: Option<i32>,
+    kind: String,
+    pub(crate) repository: RepositoryIdentity,
     pub(crate) repository_after: RepositoryIdentity,
+    schema: u32,
+    pub(crate) signal: Option<i32>,
+    pub(crate) spawn_error: Option<String>,
+    pub(crate) stderr: BoundedOutput,
+    pub(crate) stdout: BoundedOutput,
+    pub(crate) timed_out: bool,
 }
 
 #[derive(Debug)]
@@ -161,66 +167,6 @@ impl RepositoryIdentity {
     }
 }
 
-impl RepositoryIdentity {
-    pub(crate) fn to_value(&self) -> Value {
-        json!({
-            "canonical_root": self.canonical_root,
-            "canonical_root_sha256": self.canonical_root_sha256,
-            "files": self.files.iter().map(RepositoryFileIdentity::to_value).collect::<Vec<_>>(),
-        })
-    }
-
-    fn from_value(value: &Value) -> Result<Self, String> {
-        let object = exact_object(
-            value,
-            &["canonical_root", "canonical_root_sha256", "files"],
-            "repository identity",
-        )?;
-        let files = object
-            .get("files")
-            .and_then(Value::as_array)
-            .ok_or_else(|| "repository identity files must be an array".to_owned())?
-            .iter()
-            .map(RepositoryFileIdentity::from_value)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self {
-            canonical_root: string_field(object, "canonical_root", "repository identity")?.into(),
-            canonical_root_sha256: string_field(
-                object,
-                "canonical_root_sha256",
-                "repository identity",
-            )?
-            .into(),
-            files,
-        })
-    }
-}
-
-impl RepositoryFileIdentity {
-    fn to_value(&self) -> Value {
-        json!({
-            "path": self.path,
-            "status": self.status,
-            "byte_len": self.byte_len,
-            "sha256": self.sha256,
-        })
-    }
-
-    fn from_value(value: &Value) -> Result<Self, String> {
-        let object = exact_object(
-            value,
-            &["path", "status", "byte_len", "sha256"],
-            "repository file identity",
-        )?;
-        Ok(Self {
-            path: string_field(object, "path", "repository file identity")?.into(),
-            status: string_field(object, "status", "repository file identity")?.into(),
-            byte_len: optional_u64_field(object, "byte_len", "repository file identity")?,
-            sha256: optional_string_field(object, "sha256", "repository file identity")?,
-        })
-    }
-}
-
 impl CommandStarted {
     pub(crate) fn new(
         attempt: u64,
@@ -249,58 +195,26 @@ impl CommandStarted {
     }
 
     pub(crate) fn to_bytes(&self) -> Result<Vec<u8>, String> {
-        encode_fact(&self.to_value(), "CommandStarted")
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|error| format!("serialize CommandStarted fact: {error}"))?;
+        if bytes.is_empty() || bytes.len() > MAX_FACT_BYTES {
+            return Err(format!(
+                "CommandStarted fact must contain 1..={MAX_FACT_BYTES} bytes"
+            ));
+        }
+        Ok(bytes)
     }
 
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
-        let value = decode_fact(bytes, "CommandStarted")?;
-        let object = exact_object(
-            &value,
-            &[
-                "schema",
-                "kind",
-                "attempt",
-                "argv",
-                "repository",
-                "cwd",
-                "timeout_ms",
-                "stdout_limit_bytes",
-                "stderr_limit_bytes",
-                "approval",
-            ],
-            "CommandStarted",
-        )?;
-        let started = Self {
-            schema: u32_field(object, "schema", "CommandStarted")?,
-            kind: string_field(object, "kind", "CommandStarted")?.into(),
-            attempt: u64_field(object, "attempt", "CommandStarted")?,
-            argv: string_array_field(object, "argv", "CommandStarted")?,
-            repository: RepositoryIdentity::from_value(
-                object.get("repository").expect("required key checked"),
-            )?,
-            cwd: string_field(object, "cwd", "CommandStarted")?.into(),
-            timeout_ms: u64_field(object, "timeout_ms", "CommandStarted")?,
-            stdout_limit_bytes: usize_field(object, "stdout_limit_bytes", "CommandStarted")?,
-            stderr_limit_bytes: usize_field(object, "stderr_limit_bytes", "CommandStarted")?,
-            approval: string_field(object, "approval", "CommandStarted")?.into(),
-        };
+        if bytes.is_empty() || bytes.len() > MAX_FACT_BYTES {
+            return Err(format!(
+                "durable CommandStarted fact must contain 1..={MAX_FACT_BYTES} bytes"
+            ));
+        }
+        let started: Self = serde_json::from_slice(bytes)
+            .map_err(|error| format!("invalid durable CommandStarted fact: {error}"))?;
         started.validate()?;
         Ok(started)
-    }
-
-    fn to_value(&self) -> Value {
-        json!({
-            "schema": self.schema,
-            "kind": self.kind,
-            "attempt": self.attempt,
-            "argv": self.argv,
-            "repository": self.repository.to_value(),
-            "cwd": self.cwd,
-            "timeout_ms": self.timeout_ms,
-            "stdout_limit_bytes": self.stdout_limit_bytes,
-            "stderr_limit_bytes": self.stderr_limit_bytes,
-            "approval": self.approval,
-        })
     }
 
     pub(crate) fn sha256(&self) -> Result<String, String> {
@@ -353,79 +267,30 @@ impl CommandFinished {
     }
 
     pub(crate) fn to_bytes(&self) -> Result<Vec<u8>, String> {
-        encode_fact(&self.to_value(), "CommandFinished")
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|error| format!("serialize CommandFinished fact: {error}"))?;
+        if bytes.is_empty() || bytes.len() > MAX_FACT_BYTES {
+            return Err(format!(
+                "CommandFinished fact must contain 1..={MAX_FACT_BYTES} bytes"
+            ));
+        }
+        Ok(bytes)
     }
 
     pub(crate) fn from_bytes(bytes: &[u8], started: &CommandStarted) -> Result<Self, String> {
-        let value = decode_fact(bytes, "CommandFinished")?;
-        let object = exact_object(
-            &value,
-            &[
-                "schema",
-                "kind",
-                "attempt",
-                "command_started_sha256",
-                "argv",
-                "repository",
-                "exit_code",
-                "signal",
-                "timed_out",
-                "spawn_error",
-                "stdout",
-                "stderr",
-                "duration_ms",
-                "repository_after",
-            ],
-            "CommandFinished",
-        )?;
-        let finished = Self {
-            schema: u32_field(object, "schema", "CommandFinished")?,
-            kind: string_field(object, "kind", "CommandFinished")?.into(),
-            attempt: u64_field(object, "attempt", "CommandFinished")?,
-            command_started_sha256: string_field(
-                object,
-                "command_started_sha256",
-                "CommandFinished",
-            )?
-            .into(),
-            argv: string_array_field(object, "argv", "CommandFinished")?,
-            repository: RepositoryIdentity::from_value(
-                object.get("repository").expect("required key checked"),
-            )?,
-            exit_code: optional_i32_field(object, "exit_code", "CommandFinished")?,
-            signal: optional_i32_field(object, "signal", "CommandFinished")?,
-            timed_out: bool_field(object, "timed_out", "CommandFinished")?,
-            spawn_error: optional_string_field(object, "spawn_error", "CommandFinished")?,
-            stdout: BoundedOutput::from_value(object.get("stdout").expect("required key checked"))?,
-            stderr: BoundedOutput::from_value(object.get("stderr").expect("required key checked"))?,
-            duration_ms: u64_field(object, "duration_ms", "CommandFinished")?,
-            repository_after: RepositoryIdentity::from_value(
-                object
-                    .get("repository_after")
-                    .expect("required key checked"),
-            )?,
-        };
+        if bytes.is_empty() || bytes.len() > MAX_FACT_BYTES {
+            return Err(format!(
+                "durable CommandFinished fact must contain 1..={MAX_FACT_BYTES} bytes"
+            ));
+        }
+        let finished: Self = serde_json::from_slice(bytes)
+            .map_err(|error| format!("invalid durable CommandFinished fact: {error}"))?;
         finished.validate(started)?;
         Ok(finished)
     }
 
     pub(crate) fn to_value(&self) -> Value {
-        json!({
-            "schema": self.schema,
-            "kind": self.kind,
-            "attempt": self.attempt,
-            "command_started_sha256": self.command_started_sha256,
-            "argv": self.argv,
-            "repository": self.repository.to_value(),
-            "exit_code": self.exit_code,
-            "signal": self.signal,
-            "timed_out": self.timed_out,
-            "spawn_error": self.spawn_error,
-            "stdout": self.stdout.to_value(),
-            "stderr": self.stderr.to_value(),
-            "duration_ms": self.duration_ms,
-            "repository_after": self.repository_after.to_value(),
-        })
+        serde_json::to_value(self).expect("validated command fact must serialize")
     }
 
     pub(crate) fn succeeded(&self) -> bool {
@@ -475,29 +340,6 @@ impl BoundedOutput {
             truncated: captured.truncated,
             read_error: captured.read_error,
         }
-    }
-
-    fn to_value(&self) -> Value {
-        json!({
-            "encoding": self.encoding,
-            "content": self.content,
-            "truncated": self.truncated,
-            "read_error": self.read_error,
-        })
-    }
-
-    fn from_value(value: &Value) -> Result<Self, String> {
-        let object = exact_object(
-            value,
-            &["encoding", "content", "truncated", "read_error"],
-            "bounded command output",
-        )?;
-        Ok(Self {
-            encoding: string_field(object, "encoding", "bounded command output")?.into(),
-            content: string_field(object, "content", "bounded command output")?.into(),
-            truncated: bool_field(object, "truncated", "bounded command output")?,
-            read_error: optional_string_field(object, "read_error", "bounded command output")?,
-        })
     }
 
     pub(crate) fn bytes(&self) -> Result<Vec<u8>, String> {
@@ -634,138 +476,6 @@ fn capture(mut reader: impl Read) -> CapturedBytes {
             }
         }
     }
-}
-
-fn encode_fact(value: &Value, label: &str) -> Result<Vec<u8>, String> {
-    let bytes = serde_json::to_vec_pretty(value)
-        .map_err(|error| format!("serialize {label} fact: {error}"))?;
-    if bytes.is_empty() || bytes.len() > MAX_FACT_BYTES {
-        return Err(format!(
-            "{label} fact must contain 1..={MAX_FACT_BYTES} bytes"
-        ));
-    }
-    Ok(bytes)
-}
-
-fn decode_fact(bytes: &[u8], label: &str) -> Result<Value, String> {
-    if bytes.is_empty() || bytes.len() > MAX_FACT_BYTES {
-        return Err(format!(
-            "durable {label} fact must contain 1..={MAX_FACT_BYTES} bytes"
-        ));
-    }
-    serde_json::from_slice(bytes).map_err(|error| format!("invalid durable {label} fact: {error}"))
-}
-
-fn exact_object<'a>(
-    value: &'a Value,
-    expected: &[&str],
-    label: &str,
-) -> Result<&'a Map<String, Value>, String> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| format!("{label} must be an object"))?;
-    if object.len() != expected.len() || expected.iter().any(|key| !object.contains_key(*key)) {
-        return Err(format!(
-            "{label} keys must be exactly `{}`",
-            expected.join(", ")
-        ));
-    }
-    Ok(object)
-}
-
-fn string_field<'a>(
-    object: &'a Map<String, Value>,
-    field: &str,
-    label: &str,
-) -> Result<&'a str, String> {
-    object
-        .get(field)
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("{label} `{field}` must be a string"))
-}
-
-fn optional_string_field(
-    object: &Map<String, Value>,
-    field: &str,
-    label: &str,
-) -> Result<Option<String>, String> {
-    match object.get(field).expect("required key checked") {
-        Value::Null => Ok(None),
-        Value::String(value) => Ok(Some(value.clone())),
-        _ => Err(format!("{label} `{field}` must be a string or null")),
-    }
-}
-
-fn u64_field(object: &Map<String, Value>, field: &str, label: &str) -> Result<u64, String> {
-    object
-        .get(field)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| format!("{label} `{field}` must be a non-negative integer"))
-}
-
-fn optional_u64_field(
-    object: &Map<String, Value>,
-    field: &str,
-    label: &str,
-) -> Result<Option<u64>, String> {
-    match object.get(field).expect("required key checked") {
-        Value::Null => Ok(None),
-        value => value
-            .as_u64()
-            .map(Some)
-            .ok_or_else(|| format!("{label} `{field}` must be a non-negative integer or null")),
-    }
-}
-
-fn u32_field(object: &Map<String, Value>, field: &str, label: &str) -> Result<u32, String> {
-    u32::try_from(u64_field(object, field, label)?)
-        .map_err(|_| format!("{label} `{field}` exceeds u32"))
-}
-
-fn usize_field(object: &Map<String, Value>, field: &str, label: &str) -> Result<usize, String> {
-    usize::try_from(u64_field(object, field, label)?)
-        .map_err(|_| format!("{label} `{field}` exceeds usize"))
-}
-
-fn optional_i32_field(
-    object: &Map<String, Value>,
-    field: &str,
-    label: &str,
-) -> Result<Option<i32>, String> {
-    match object.get(field).expect("required key checked") {
-        Value::Null => Ok(None),
-        value => value
-            .as_i64()
-            .and_then(|value| i32::try_from(value).ok())
-            .map(Some)
-            .ok_or_else(|| format!("{label} `{field}` must be an i32 or null")),
-    }
-}
-
-fn bool_field(object: &Map<String, Value>, field: &str, label: &str) -> Result<bool, String> {
-    object
-        .get(field)
-        .and_then(Value::as_bool)
-        .ok_or_else(|| format!("{label} `{field}` must be a boolean"))
-}
-
-fn string_array_field(
-    object: &Map<String, Value>,
-    field: &str,
-    label: &str,
-) -> Result<Vec<String>, String> {
-    object
-        .get(field)
-        .and_then(Value::as_array)
-        .ok_or_else(|| format!("{label} `{field}` must be an array"))?
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .map(str::to_owned)
-                .ok_or_else(|| format!("{label} `{field}` values must be strings"))
-        })
-        .collect()
 }
 
 fn validate_argv(argv: &[String]) -> Result<(), String> {
@@ -916,6 +626,54 @@ mod tests {
         assert_eq!(finished.stderr.bytes().unwrap(), b"failed");
         assert!(!finished.succeeded());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn serde_rejects_invalid_command_facts() {
+        let root = temporary_repository("invalid-fact");
+        let started =
+            CommandStarted::new(1, vec!["/bin/true".into()], &root, &["source.txt".into()])
+                .unwrap();
+        let mut value = serde_json::to_value(&started).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown".into(), Value::Bool(true));
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert!(CommandStarted::from_bytes(&bytes).is_err());
+        let mut value = serde_json::to_value(&started).unwrap();
+        value.as_object_mut().unwrap().remove("approval");
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert!(CommandStarted::from_bytes(&bytes).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn serialization_matches_legacy_bytes() {
+        let started = CommandStarted {
+            approval: "explicit-cli-invocation".into(),
+            argv: vec!["/bin/echo".into(), "hello".into()],
+            attempt: 1,
+            cwd: "/fixed/repository".into(),
+            kind: "CommandStarted".into(),
+            repository: RepositoryIdentity {
+                canonical_root: "/fixed/repository".into(),
+                canonical_root_sha256: sha256(b"/fixed/repository"),
+                files: vec![RepositoryFileIdentity {
+                    byte_len: Some(7),
+                    path: "source.txt".into(),
+                    sha256: Some(
+                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+                    ),
+                    status: "regular".into(),
+                }],
+            },
+            schema: 1,
+            stderr_limit_bytes: MAX_OUTPUT_BYTES,
+            stdout_limit_bytes: MAX_OUTPUT_BYTES,
+            timeout_ms: COMMAND_TIMEOUT_MS,
+        };
+        let expected = b"{\n  \"approval\": \"explicit-cli-invocation\",\n  \"argv\": [\n    \"/bin/echo\",\n    \"hello\"\n  ],\n  \"attempt\": 1,\n  \"cwd\": \"/fixed/repository\",\n  \"kind\": \"CommandStarted\",\n  \"repository\": {\n    \"canonical_root\": \"/fixed/repository\",\n    \"canonical_root_sha256\": \"15250920c2ea0f032234df7baf7a6737a6f3587be102adb71b08e0d56ae47af8\",\n    \"files\": [\n      {\n        \"byte_len\": 7,\n        \"path\": \"source.txt\",\n        \"sha256\": \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\n        \"status\": \"regular\"\n      }\n    ]\n  },\n  \"schema\": 1,\n  \"stderr_limit_bytes\": 32768,\n  \"stdout_limit_bytes\": 32768,\n  \"timeout_ms\": 120000\n}";
+        assert_eq!(started.to_bytes().unwrap(), expected);
     }
 
     fn temporary_repository(label: &str) -> std::path::PathBuf {
