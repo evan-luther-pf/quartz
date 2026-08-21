@@ -172,6 +172,27 @@ the stream is a reversible capability registration; recovery closes it but does
 not claim to erase committed facts. A projection component reads the bounded
 stream through its committed provider view and publishes ordinary coeffects.
 
+## Immutable snapshot and payload boundary
+
+Slice 5 admits immutable repository evidence without granting guest filesystem
+authority. A snapshot grant binds one canonical regular file, provenance, byte
+length, and SHA-256 identity. Admission reads and verifies the file before
+activation, stores the bytes in the prepared fiber, and repeats verification
+when restoring a persisted declaration. Guest code sees only numeric grant
+indices and may read bytes only during activation.
+
+An event may retain its ordinary scalar projection value while carrying one
+bounded durable payload. `resume-snapshot` selects one of the emitting fiber's
+admitted snapshots and queues its exact bytes, provenance, and digest through
+the existing transactional outbox. Event framing, record checksums, append
+ordering, replay deduplication, torn-tail repair, and fail-closed interior
+corruption behavior remain unchanged. Payload count, per-record bytes, total
+payload bytes, and snapshot grants are bounded independently.
+
+Snapshot access and event-stream registration are reversible capabilities.
+Committed payload facts are withheld external emissions: recovery closes live
+authority and clears pending work but does not claim to erase durable evidence.
+
 ## Self-modification
 
 The authoritative state is a declarative component tree. A running component—including the agent—may propose a tree patch through a governed composition capability. Reconciliation turns the accepted patch into fiber insertions, updates, disablement, and removal. Source changes become new module artifacts; the loader stages the artifact, reconstructs affected fibers, and rolls back to the previous artifact if activation fails.

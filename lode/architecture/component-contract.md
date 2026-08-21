@@ -57,7 +57,7 @@ so compiled code is retained only while a desired, staged, or live generation
 owns it. A process remains an optional isolation mode; it is not the composition
 model.
 
-The ABI 5 WIT contract exposes four lifecycle calls and thirteen capability
+The ABI 6 WIT contract exposes four lifecycle calls and sixteen capability
 imports:
 
 - `start(config)`, `step(instance)`, `invoke(instance, operation, arg0, arg1)`,
@@ -79,6 +79,10 @@ imports:
 - `resume-event` has the same grant, outbox, and commit enforcement as
   `append-event`, but may append the unique owed fact after historical event
   projection during restart.
+- `snapshot-len` and `snapshot-byte` expose only immutable bytes admitted to
+  that fiber by indexed canonical-file grant during activation;
+- `resume-snapshot` has replay-aware append enforcement and attaches one
+  admitted snapshot as a bounded durable event payload.
 
 Every binding declares `value` or `callable` kind as part of its versioned
 identity. Context-changing imports remain tracked by structural inverses.
@@ -130,6 +134,17 @@ fresh executable generation after every turn fact, reconstructs the unique owed
 action from the committed event stream, switches fixture tool generations
 between turns, verifies both exact transcripts, and performs a clean persistent
 shutdown.
+
+### Slice 5 verification
+
+`cargo test -p quartz --test slice5` exercises four durable repository contracts:
+exact two-turn reconstruction with governed inspector replacement, snapshot
+admission and authority failures, independent payload limits and corruption
+rejection, and restart-time snapshot drift rejection. `cargo run --release -p
+quartz` admits real `README.md` and `lode/summary.md` snapshots, starts a fresh
+process after every durable boundary, preserves the first transcript across
+inspector replacement, cites both canonical paths, and recovers all live
+authority on clean shutdown.
 
 ### Decision evidence
 

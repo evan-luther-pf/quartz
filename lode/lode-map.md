@@ -17,6 +17,7 @@
 - `capabilities/durable-composition.md` — append-only desired-tree facts, artifact identity, and restart recovery.
 - `capabilities/durable-events.md` — typed event facts, transactional outbox delivery, and bounded projection replay.
 - `capabilities/deterministic-agent-turn.md` — closed turn protocol, restart-safe owed work, deterministic provider/tool calls, and production-track readiness.
+- `capabilities/durable-repository-inspection.md` — immutable snapshot grants, durable byte evidence, and restart-safe real repository inspection.
 
 ## Research
 
@@ -25,9 +26,10 @@
 ## Implementation
 
 - `crates/quartz-kernel` — unified context, fibers, callable coeffects,
-  reconciliation, governed patches, durable composition and events, replay-aware
-  resumption, Wasmtime loading, replacement, and rollback.
-- `crates/quartz` — Slice 0 through Slice 4 executable scenarios and contract
+  reconciliation, governed patches, durable composition and payload-bearing
+  events, immutable snapshot admission, replay-aware resumption, Wasmtime
+  loading, replacement, and rollback.
+- `crates/quartz` — Slice 0 through Slice 5 executable scenarios and contract
   tests.
 - `wit/quartz-component.wit` — public component/host boundary.
 - `modules` — real WebAssembly component sources and embedded manifests used by

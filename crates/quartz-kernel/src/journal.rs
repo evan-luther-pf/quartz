@@ -11,11 +11,11 @@ use sha2::{Digest, Sha256};
 use crate::{ComponentTree, CompositionPatch, Error, Result};
 
 const COMPOSITION_MAGIC: &[u8; 8] = b"QUARTZJ2";
-const EVENT_MAGIC: &[u8; 8] = b"QUARTZE1";
+const EVENT_MAGIC: &[u8; 8] = b"QUARTZE2";
 const HEADER_LEN: usize = 12;
 const CHECKSUM_LEN: usize = 32;
 const COMPOSITION_SCHEMA_VERSION: u32 = 2;
-const EVENT_SCHEMA_VERSION: u32 = 1;
+const EVENT_SCHEMA_VERSION: u32 = 2;
 
 type FramedPayloads = Vec<(u64, Vec<u8>)>;
 type DecodedLog = (u64, FramedPayloads, usize);
@@ -38,6 +38,77 @@ impl EventGrant {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotGrant {
+    pub path: PathBuf,
+    pub provenance: String,
+    pub sha256: String,
+    pub byte_len: u64,
+}
+
+impl SnapshotGrant {
+    pub fn from_file(path: impl AsRef<Path>, provenance: impl Into<String>) -> Result<Self> {
+        let requested = path.as_ref();
+        let path = std::fs::canonicalize(requested).map_err(|source| Error::SnapshotIo {
+            operation: "canonicalize",
+            path: requested.to_path_buf(),
+            source,
+        })?;
+        let mut file = File::open(&path).map_err(|source| Error::SnapshotIo {
+            operation: "open",
+            path: path.clone(),
+            source,
+        })?;
+        let metadata = file.metadata().map_err(|source| Error::SnapshotIo {
+            operation: "inspect",
+            path: path.clone(),
+            source,
+        })?;
+        if !metadata.is_file() {
+            return Err(Error::SnapshotIo {
+                operation: "inspect",
+                path,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "snapshot source is not a regular file",
+                ),
+            });
+        }
+        let mut digest = Sha256::new();
+        let mut byte_len = 0_u64;
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let read = file.read(&mut buffer).map_err(|source| Error::SnapshotIo {
+                operation: "read",
+                path: path.clone(),
+                source,
+            })?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+            byte_len = byte_len
+                .checked_add(read as u64)
+                .ok_or_else(|| Error::Invariant("snapshot byte length overflow".into()))?;
+        }
+        Ok(Self {
+            path,
+            provenance: provenance.into(),
+            sha256: digest_hex(digest.finalize()),
+            byte_len,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DurablePayload {
+    pub provenance: String,
+    pub sha256: String,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventRecord {
@@ -46,6 +117,7 @@ pub struct EventRecord {
     pub actor_path: String,
     pub event: EventGrant,
     pub value: u64,
+    pub payload: Option<DurablePayload>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -55,6 +127,7 @@ pub(crate) struct EventFact {
     pub actor_path: String,
     pub event: EventGrant,
     pub value: u64,
+    pub payload: Option<DurablePayload>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -147,10 +220,20 @@ pub(crate) struct EventStream {
     records: Vec<EventRecord>,
     by_id: BTreeMap<u64, EventFact>,
     max_records: usize,
+    max_payload_records: usize,
+    max_payload_bytes: usize,
+    max_payload_total_bytes: usize,
 }
 
 impl EventStream {
-    pub(crate) fn open(path: &Path, max_record_bytes: usize, max_records: usize) -> Result<Self> {
+    pub(crate) fn open(
+        path: &Path,
+        max_record_bytes: usize,
+        max_records: usize,
+        max_payload_records: usize,
+        max_payload_bytes: usize,
+        max_payload_total_bytes: usize,
+    ) -> Result<Self> {
         let (log, payloads) = FramedLog::open(path, EVENT_MAGIC, max_record_bytes, LogKind::Event)?;
         if payloads.len() > max_records {
             return Err(Error::EventRecordLimit {
@@ -181,20 +264,27 @@ impl EventStream {
                     record.fact.id
                 )));
             }
+            validate_durable_payload(record.fact.payload.as_ref())?;
             records.push(EventRecord {
                 sequence,
                 id: record.fact.id,
                 actor_path: record.fact.actor_path,
                 event: record.fact.event,
                 value: record.fact.value,
+                payload: record.fact.payload,
             });
         }
-        Ok(Self {
+        let stream = Self {
             log,
             records,
             by_id,
             max_records,
-        })
+            max_payload_records,
+            max_payload_bytes,
+            max_payload_total_bytes,
+        };
+        stream.validate_payload_limits(stream.by_id.values())?;
+        Ok(stream)
     }
 
     pub(crate) fn sequence(&self) -> u64 {
@@ -242,6 +332,7 @@ impl EventStream {
                 fact: fact.clone(),
             })?;
             self.log.validate_payload(&payload)?;
+            validate_durable_payload(fact.payload.as_ref())?;
         }
         let actual = self.records.len() + new_records;
         if actual > self.max_records {
@@ -250,6 +341,13 @@ impl EventStream {
                 limit: self.max_records,
             });
         }
+        self.validate_payload_limits(
+            self.by_id.values().chain(
+                facts
+                    .iter()
+                    .filter(|fact| !self.by_id.contains_key(&fact.id)),
+            ),
+        )?;
         Ok(())
     }
 
@@ -276,9 +374,73 @@ impl EventStream {
             actor_path: fact.actor_path.clone(),
             event: fact.event.clone(),
             value: fact.value,
+            payload: fact.payload.clone(),
         });
         Ok(true)
     }
+
+    fn validate_payload_limits<'a>(
+        &self,
+        facts: impl Iterator<Item = &'a EventFact>,
+    ) -> Result<()> {
+        let mut count = 0;
+        let mut total = 0;
+        for payload in facts.filter_map(|fact| fact.payload.as_ref()) {
+            count += 1;
+            if payload.bytes.len() > self.max_payload_bytes {
+                return Err(Error::PayloadBytesLimit {
+                    actual: payload.bytes.len(),
+                    limit: self.max_payload_bytes,
+                });
+            }
+            total += payload.bytes.len();
+        }
+        if count > self.max_payload_records {
+            return Err(Error::PayloadCountLimit {
+                actual: count,
+                limit: self.max_payload_records,
+            });
+        }
+        if total > self.max_payload_total_bytes {
+            return Err(Error::PayloadTotalBytesLimit {
+                actual: total,
+                limit: self.max_payload_total_bytes,
+            });
+        }
+        Ok(())
+    }
+}
+
+fn validate_durable_payload(payload: Option<&DurablePayload>) -> Result<()> {
+    let Some(payload) = payload else {
+        return Ok(());
+    };
+    if payload.provenance.is_empty() {
+        return Err(Error::EventCorrupt(
+            "durable payload provenance is empty".into(),
+        ));
+    }
+    let actual = sha256_hex(&payload.bytes);
+    if payload.sha256 != actual {
+        return Err(Error::EventCorrupt(format!(
+            "durable payload checksum mismatch: expected {}, found {actual}",
+            payload.sha256
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    digest_hex(Sha256::digest(bytes))
+}
+
+fn digest_hex(digest: impl IntoIterator<Item = u8>) -> String {
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut output, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    output
 }
 
 #[derive(Clone, Copy)]

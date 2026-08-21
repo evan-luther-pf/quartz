@@ -1,0 +1,16 @@
+{
+  "abi": 6,
+  "module": "quartz.slice5.repo-inspector-a",
+  "version": "0.1.0",
+  "execution_mode": "wasm-component",
+  "requested_host_capabilities": ["publish-callable", "read-snapshot"],
+  "component": {
+    "id": "repo-inspector-a",
+    "config_schema": "u64",
+    "max_activation_steps": 1,
+    "inject": [],
+    "provide": [
+      {"slot": 11, "kind": "callable", "namespace": "quartz.agent", "interface": "repository-inspector", "revision": 1}
+    ]
+  }
+}

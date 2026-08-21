@@ -3,7 +3,7 @@ mod manifest;
 mod module;
 mod runtime;
 
-pub use journal::{EventGrant, EventRecord};
+pub use journal::{DurablePayload, EventGrant, EventRecord, SnapshotGrant};
 pub use manifest::{
     ABI_VERSION, BindingKind, ComponentDeclaration, HostCapability, InterfaceId, Manifest,
     ProvidedBinding, RequiredBinding, Requirement,
@@ -100,6 +100,29 @@ pub enum Error {
     EventRecordBytesLimit { actual: usize, limit: usize },
     #[error("event record count {actual} exceeds limit {limit}")]
     EventRecordLimit { actual: usize, limit: usize },
+    #[error("snapshot {operation} failed for {path}: {source}")]
+    SnapshotIo {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("snapshot digest mismatch for {path}: expected {expected}, found {actual}")]
+    SnapshotDigestMismatch {
+        path: PathBuf,
+        expected: String,
+        actual: String,
+    },
+    #[error("snapshot grant count {actual} exceeds limit {limit}")]
+    SnapshotGrantLimit { actual: usize, limit: usize },
+    #[error("snapshot byte size {actual} exceeds limit {limit}")]
+    SnapshotBytesLimit { actual: usize, limit: usize },
+    #[error("durable payload count {actual} exceeds limit {limit}")]
+    PayloadCountLimit { actual: usize, limit: usize },
+    #[error("durable payload byte size {actual} exceeds limit {limit}")]
+    PayloadBytesLimit { actual: usize, limit: usize },
+    #[error("total durable payload bytes {actual} exceeds limit {limit}")]
+    PayloadTotalBytesLimit { actual: usize, limit: usize },
     #[error("persistent composition error: {0}")]
     Persistence(String),
     #[error("runtime invariant violated: {0}")]

@@ -1,16 +1,16 @@
 {
   "abi": 6,
-  "module": "quartz.slice1.governor",
+  "module": "quartz.slice5.repo-agent-provider",
   "version": "0.1.0",
   "execution_mode": "wasm-component",
   "requested_host_capabilities": ["publish-callable"],
   "component": {
-    "id": "governor",
+    "id": "repo-agent-provider",
     "config_schema": "u64",
     "max_activation_steps": 1,
     "inject": [],
     "provide": [
-      {"slot": 2, "kind": "callable", "namespace": "quartz.composition", "interface": "patch-authority", "revision": 1}
+      {"slot": 10, "kind": "callable", "namespace": "quartz.agent", "interface": "deterministic-provider", "revision": 1}
     ]
   }
 }

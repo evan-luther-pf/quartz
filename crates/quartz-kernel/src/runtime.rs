@@ -1,6 +1,8 @@
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, VecDeque},
+    fs,
+    io::Read,
     path::PathBuf,
     rc::{Rc, Weak},
     sync::Arc,
@@ -15,7 +17,8 @@ use wasmtime::{
 use crate::{
     BindingKind, Error, HostCapability, InterfaceId, Result,
     journal::{
-        EventFact, EventGrant, EventRecord, EventStream, Journal, JournalEffect, JournalSnapshot,
+        DurablePayload, EventFact, EventGrant, EventRecord, EventStream, Journal, JournalEffect,
+        JournalSnapshot, SnapshotGrant, sha256_hex,
     },
     module::{Artifact, ModuleLoader},
 };
@@ -45,6 +48,7 @@ pub struct ComponentSpec {
     pub journal_paths: Vec<PathBuf>,
     pub event_stream_paths: Vec<PathBuf>,
     pub event_grants: Vec<EventGrant>,
+    pub snapshot_grants: Vec<SnapshotGrant>,
 }
 
 impl ComponentSpec {
@@ -59,6 +63,7 @@ impl ComponentSpec {
             journal_paths: Vec::new(),
             event_stream_paths: Vec::new(),
             event_grants: Vec::new(),
+            snapshot_grants: Vec::new(),
         }
     }
 
@@ -94,6 +99,11 @@ impl ComponentSpec {
 
     pub fn with_event_grants(mut self, grants: Vec<EventGrant>) -> Self {
         self.event_grants = grants;
+        self
+    }
+
+    pub fn with_snapshot_grants(mut self, grants: Vec<SnapshotGrant>) -> Self {
+        self.snapshot_grants = grants;
         self
     }
 }
@@ -157,6 +167,11 @@ pub struct Limits {
     pub max_journal_record_bytes: usize,
     pub max_event_record_bytes: usize,
     pub max_event_records: usize,
+    pub max_snapshot_grants: usize,
+    pub max_snapshot_bytes: usize,
+    pub max_payload_records: usize,
+    pub max_payload_bytes: usize,
+    pub max_payload_total_bytes: usize,
 }
 
 impl Default for Limits {
@@ -167,8 +182,13 @@ impl Default for Limits {
             max_activation_steps: 1024,
             max_reconciliation_steps: 100_000,
             max_journal_record_bytes: 1024 * 1024,
-            max_event_record_bytes: 64 * 1024,
+            max_event_record_bytes: 256 * 1024,
             max_event_records: 512,
+            max_snapshot_grants: 8,
+            max_snapshot_bytes: 64 * 1024,
+            max_payload_records: 64,
+            max_payload_bytes: 64 * 1024,
+            max_payload_total_bytes: 512 * 1024,
         }
     }
 }
@@ -304,8 +324,14 @@ struct PreparedSpec {
     journal_paths: Vec<PathBuf>,
     event_stream_paths: Vec<PathBuf>,
     event_grants: Vec<EventGrant>,
+    snapshots: Vec<PreparedSnapshot>,
 }
 
+#[derive(Clone)]
+struct PreparedSnapshot {
+    grant: SnapshotGrant,
+    bytes: Arc<[u8]>,
+}
 #[derive(Clone)]
 enum PreparedPatch {
     AddRoot {
@@ -344,8 +370,8 @@ struct PendingEvent {
     actor: FiberId,
     index: usize,
     value: u64,
+    payload: Option<DurablePayload>,
 }
-
 #[derive(Clone, Copy)]
 struct PatchAuthorization {
     provider: FiberId,
@@ -1397,12 +1423,15 @@ impl Runtime {
         }
         let requests_append = artifact.manifest.requests(HostCapability::AppendEvent);
         let requests_resume = artifact.manifest.requests(HostCapability::ResumeEvent);
-        if requests_append && requests_resume {
+        let requests_resume_snapshot = artifact.manifest.requests(HostCapability::ResumeSnapshot);
+        if requests_append && (requests_resume || requests_resume_snapshot) {
             return Err(Error::Manifest(format!(
-                "component `{path}` cannot request both append-event and resume-event"
+                "component `{path}` cannot mix ordinary and replay-aware event append authority"
             )));
         }
-        if (requests_append || requests_resume) != !spec.event_grants.is_empty() {
+        if (requests_append || requests_resume || requests_resume_snapshot)
+            != !spec.event_grants.is_empty()
+        {
             return Err(Error::Manifest(format!(
                 "component `{path}` must pair event append authority with admitted event grants"
             )));
@@ -1420,6 +1449,14 @@ impl Runtime {
                 )));
             }
         }
+        let requests_snapshot_read = artifact.manifest.requests(HostCapability::ReadSnapshot);
+        if (requests_snapshot_read || requests_resume_snapshot) != !spec.snapshot_grants.is_empty()
+        {
+            return Err(Error::Manifest(format!(
+                "component `{path}` must pair snapshot authority with admitted snapshot grants"
+            )));
+        }
+        let snapshots = self.prepare_snapshots(path, &spec.snapshot_grants)?;
         if artifact.manifest.component.max_activation_steps > self.limits.max_activation_steps {
             return Err(Error::ActivationLimit(
                 artifact.manifest.component.id.clone(),
@@ -1447,9 +1484,99 @@ impl Runtime {
             journal_paths: spec.journal_paths,
             event_stream_paths: spec.event_stream_paths,
             event_grants: spec.event_grants,
+            snapshots,
         })
     }
 
+    fn prepare_snapshots(
+        &self,
+        component_path: &str,
+        grants: &[SnapshotGrant],
+    ) -> Result<Vec<PreparedSnapshot>> {
+        if grants.len() > self.limits.max_snapshot_grants {
+            return Err(Error::SnapshotGrantLimit {
+                actual: grants.len(),
+                limit: self.limits.max_snapshot_grants,
+            });
+        }
+        let mut identities = BTreeSet::new();
+        let mut snapshots = Vec::with_capacity(grants.len());
+        for grant in grants {
+            if grant.provenance.is_empty() || !identities.insert(grant.clone()) {
+                return Err(Error::Manifest(format!(
+                    "component `{component_path}` has an invalid or duplicate snapshot grant"
+                )));
+            }
+            let canonical = fs::canonicalize(&grant.path).map_err(|source| Error::SnapshotIo {
+                operation: "canonicalize",
+                path: grant.path.clone(),
+                source,
+            })?;
+            if canonical != grant.path {
+                return Err(Error::Manifest(format!(
+                    "component `{component_path}` snapshot path `{}` is not canonical",
+                    grant.path.display()
+                )));
+            }
+            let file = fs::File::open(&canonical).map_err(|source| Error::SnapshotIo {
+                operation: "open",
+                path: canonical.clone(),
+                source,
+            })?;
+            let metadata = file.metadata().map_err(|source| Error::SnapshotIo {
+                operation: "inspect",
+                path: canonical.clone(),
+                source,
+            })?;
+            if !metadata.is_file() {
+                return Err(Error::SnapshotIo {
+                    operation: "inspect",
+                    path: canonical,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "snapshot source is not a regular file",
+                    ),
+                });
+            }
+            let declared_len = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+            if declared_len > self.limits.max_snapshot_bytes {
+                return Err(Error::SnapshotBytesLimit {
+                    actual: declared_len,
+                    limit: self.limits.max_snapshot_bytes,
+                });
+            }
+            let read_limit = u64::try_from(self.limits.max_snapshot_bytes)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1);
+            let mut bytes = Vec::with_capacity(declared_len);
+            file.take(read_limit)
+                .read_to_end(&mut bytes)
+                .map_err(|source| Error::SnapshotIo {
+                    operation: "read",
+                    path: grant.path.clone(),
+                    source,
+                })?;
+            if bytes.len() > self.limits.max_snapshot_bytes {
+                return Err(Error::SnapshotBytesLimit {
+                    actual: bytes.len(),
+                    limit: self.limits.max_snapshot_bytes,
+                });
+            }
+            let actual = sha256_hex(&bytes);
+            if grant.byte_len != bytes.len() as u64 || grant.sha256 != actual {
+                return Err(Error::SnapshotDigestMismatch {
+                    path: grant.path.clone(),
+                    expected: grant.sha256.clone(),
+                    actual,
+                });
+            }
+            snapshots.push(PreparedSnapshot {
+                grant: grant.clone(),
+                bytes: Arc::from(bytes),
+            });
+        }
+        Ok(snapshots)
+    }
     fn prepare_patch(&self, patch: CompositionPatch, actor_path: &str) -> Result<PreparedPatch> {
         if self
             .persistent_root
@@ -1575,6 +1702,7 @@ impl Runtime {
             actor_path,
             event,
             value: request.value,
+            payload: request.payload,
         };
         let mut staged = core.event_outbox.clone();
         staged.push(fact.clone());
@@ -3127,6 +3255,9 @@ impl Core {
             &path,
             self.limits.max_event_record_bytes,
             self.limits.max_event_records,
+            self.limits.max_payload_records,
+            self.limits.max_payload_bytes,
+            self.limits.max_payload_total_bytes,
         ) {
             Ok(stream) => stream,
             Err(error) => {
@@ -3159,6 +3290,7 @@ impl Core {
         index: u64,
         value: u64,
         resumable: bool,
+        snapshot_index: Option<u64>,
     ) -> i32 {
         if value > i64::MAX as u64 {
             return STATUS_INVALID;
@@ -3166,11 +3298,13 @@ impl Core {
         let Ok(index) = usize::try_from(index) else {
             return STATUS_INVALID;
         };
-        let (actor_path, grant) = {
+        let (actor_path, grant, payload) = {
             let Some(record) = self.fibers.get(&fiber) else {
                 return STATUS_INVALID;
             };
-            let capability = if resumable {
+            let capability = if snapshot_index.is_some() {
+                HostCapability::ResumeSnapshot
+            } else if resumable {
                 HostCapability::ResumeEvent
             } else {
                 HostCapability::AppendEvent
@@ -3193,7 +3327,22 @@ impl Core {
             {
                 return STATUS_UNSATISFIED;
             }
-            (record.path.clone(), grant.clone())
+            let payload = if let Some(snapshot_index) = snapshot_index {
+                let Ok(snapshot_index) = usize::try_from(snapshot_index) else {
+                    return STATUS_INVALID;
+                };
+                let Some(snapshot) = record.spec.snapshots.get(snapshot_index) else {
+                    return STATUS_UNDECLARED;
+                };
+                Some(DurablePayload {
+                    provenance: snapshot.grant.provenance.clone(),
+                    sha256: snapshot.grant.sha256.clone(),
+                    bytes: snapshot.bytes.to_vec(),
+                })
+            } else {
+                None
+            };
+            (record.path.clone(), grant.clone(), payload)
         };
         if self.replaying && !resumable {
             return STATUS_BUSY;
@@ -3212,6 +3361,7 @@ impl Core {
                 actor_path: record.path.clone(),
                 event: event.clone(),
                 value: pending.value,
+                payload: pending.payload.clone(),
             });
         }
         staged.push(EventFact {
@@ -3219,15 +3369,18 @@ impl Core {
             actor_path,
             event: grant,
             value,
+            payload: payload.clone(),
         });
         let Some(stream) = self.event_stream.as_ref() else {
             return STATUS_UNSATISFIED;
         };
         if let Err(error) = stream.stream.validate(&staged) {
             return match error {
-                Error::EventRecordLimit { .. } | Error::EventRecordBytesLimit { .. } => {
-                    STATUS_LIMIT
-                }
+                Error::EventRecordLimit { .. }
+                | Error::EventRecordBytesLimit { .. }
+                | Error::PayloadCountLimit { .. }
+                | Error::PayloadBytesLimit { .. }
+                | Error::PayloadTotalBytesLimit { .. } => STATUS_LIMIT,
                 error => {
                     self.event_failure = Some(error);
                     STATUS_INVALID
@@ -3238,8 +3391,58 @@ impl Core {
             actor: fiber,
             index,
             value,
+            payload,
         });
         STATUS_OK
+    }
+
+    fn host_snapshot_len(&self, fiber: FiberId, index: u64) -> i64 {
+        let Some(record) = self.fibers.get(&fiber) else {
+            return -(STATUS_INVALID as i64);
+        };
+        if record.state != InternalState::Activating
+            || !record
+                .spec
+                .artifact
+                .manifest
+                .requests(HostCapability::ReadSnapshot)
+        {
+            return -(STATUS_UNDECLARED as i64);
+        }
+        let Ok(index) = usize::try_from(index) else {
+            return -(STATUS_INVALID as i64);
+        };
+        record
+            .spec
+            .snapshots
+            .get(index)
+            .map_or(-(STATUS_UNDECLARED as i64), |snapshot| {
+                snapshot.bytes.len() as i64
+            })
+    }
+
+    fn host_snapshot_byte(&self, fiber: FiberId, index: u64, offset: u64) -> i32 {
+        let Some(record) = self.fibers.get(&fiber) else {
+            return -STATUS_INVALID;
+        };
+        if record.state != InternalState::Activating
+            || !record
+                .spec
+                .artifact
+                .manifest
+                .requests(HostCapability::ReadSnapshot)
+        {
+            return -STATUS_UNDECLARED;
+        }
+        let (Ok(index), Ok(offset)) = (usize::try_from(index), usize::try_from(offset)) else {
+            return -STATUS_INVALID;
+        };
+        record
+            .spec
+            .snapshots
+            .get(index)
+            .and_then(|snapshot| snapshot.bytes.get(offset))
+            .map_or(-STATUS_INVALID, |byte| i32::from(*byte))
     }
 
     fn host_event_count(&self, fiber: FiberId) -> i64 {
@@ -3437,7 +3640,7 @@ fn link_host(linker: &mut Linker<HostState>) -> Result<()> {
             "append-event",
             |store: StoreContextMut<'_, HostState>, (index, value): (u64, u64)| {
                 Ok((with_core(store, |core, fiber| {
-                    core.host_append_event(fiber, index, value, false)
+                    core.host_append_event(fiber, index, value, false, None)
                 }),))
             },
         )
@@ -3448,7 +3651,41 @@ fn link_host(linker: &mut Linker<HostState>) -> Result<()> {
             "resume-event",
             |store: StoreContextMut<'_, HostState>, (index, value): (u64, u64)| {
                 Ok((with_core(store, |core, fiber| {
-                    core.host_append_event(fiber, index, value, true)
+                    core.host_append_event(fiber, index, value, true, None)
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
+            "snapshot-len",
+            |store: StoreContextMut<'_, HostState>, (index,): (u64,)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_snapshot_len(fiber, index)
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
+            "snapshot-byte",
+            |store: StoreContextMut<'_, HostState>, (index, offset): (u64, u64)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_snapshot_byte(fiber, index, offset)
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
+            "resume-snapshot",
+            |store: StoreContextMut<'_, HostState>,
+             (event_index, snapshot_index, value): (u64, u64, u64)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_append_event(fiber, event_index, value, true, Some(snapshot_index))
                 }),))
             },
         )
@@ -3604,6 +3841,11 @@ fn same_spec(left: &PreparedSpec, right: &PreparedSpec) -> bool {
         && left.journal_paths == right.journal_paths
         && left.event_stream_paths == right.event_stream_paths
         && left.event_grants == right.event_grants
+        && left
+            .snapshots
+            .iter()
+            .map(|snapshot| &snapshot.grant)
+            .eq(right.snapshots.iter().map(|snapshot| &snapshot.grant))
         && left.children.len() == right.children.len()
         && left
             .children
@@ -3735,6 +3977,11 @@ impl PreparedSpec {
             journal_paths: self.journal_paths.clone(),
             event_stream_paths: self.event_stream_paths.clone(),
             event_grants: self.event_grants.clone(),
+            snapshot_grants: self
+                .snapshots
+                .iter()
+                .map(|snapshot| snapshot.grant.clone())
+                .collect(),
         }
     }
 }

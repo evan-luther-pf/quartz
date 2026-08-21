@@ -1,6 +1,6 @@
 use quartz_kernel::{
     ComponentSpec, ComponentTree, CompositionPatch, Error, EventGrant, FiberState, Limits, Runtime,
-    TraceEvent,
+    SnapshotGrant, TraceEvent,
 };
 use std::{
     fs,
@@ -356,8 +356,9 @@ enum AgentPhase {
 
 fn run_agent_acceptance(fixtures: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let journal =
-        std::env::temp_dir().join(format!("quartz-slice4-smoke-{}.qj", std::process::id()));
+        std::env::temp_dir().join(format!("quartz-slice5-smoke-{}.qj", std::process::id()));
     let events = journal.with_extension("qe");
+    let (source_a, source_b) = repository_sources()?;
     for path in [&journal, &events] {
         if path.exists() {
             fs::remove_file(path)?;
@@ -375,7 +376,9 @@ fn run_agent_acceptance(fixtures: &Path) -> Result<(), Box<dyn std::error::Error
     run_agent_process(&executable, "--agent-verify", None, &journal)?;
     fs::remove_file(&journal)?;
     fs::remove_file(&events)?;
-    assert!(fixtures.join("agent-loop.wasm").is_file());
+    assert!(source_a.is_file());
+    assert!(source_b.is_file());
+    assert!(fixtures.join("repo-agent-loop.wasm").is_file());
     Ok(())
 }
 
@@ -400,6 +403,7 @@ fn run_agent_process(
 fn run_agent_phase(journal: &Path, phase: AgentPhase) -> Result<(), Box<dyn std::error::Error>> {
     let fixtures = PathBuf::from(env!("QUARTZ_FIXTURE_DIR"));
     let events = journal.with_extension("qe");
+    let (source_a, source_b) = repository_sources()?;
     let mut runtime = Runtime::open_persistent(
         Limits::default(),
         ComponentSpec::new("event-store", artifact(&fixtures, "event-store"))
@@ -409,9 +413,9 @@ fn run_agent_phase(journal: &Path, phase: AgentPhase) -> Result<(), Box<dyn std:
     match phase {
         AgentPhase::Start => {
             assert!(runtime.events().is_empty());
-            runtime.apply_tree(agent_tree(&fixtures, "agent-tool-a"))?;
+            runtime.apply_tree(agent_tree(&fixtures, &source_a, &source_b, false, false))?;
             assert_eq!(runtime.events().len(), 1);
-            println!("agent boundary 1: public prompt committed");
+            println!("agent boundary 1: public repository question committed");
         }
         AgentPhase::Resume(expected) => {
             assert_eq!(runtime.events().len(), expected);
@@ -425,75 +429,138 @@ fn run_agent_phase(journal: &Path, phase: AgentPhase) -> Result<(), Box<dyn std:
         AgentPhase::Replace => {
             assert_eq!(runtime.events().len(), 8);
             let base_revision = runtime.composition_revision();
-            let controller_config = (base_revision + 1) << 32;
-            runtime.apply_tree(agent_tool_replacement_tree(&fixtures, controller_config))?;
+            runtime.apply_tree(agent_replacement_tree(
+                &fixtures,
+                &source_a,
+                &source_b,
+                base_revision,
+                false,
+            ))?;
             assert_eq!(runtime.events().len(), 8);
             assert_eq!(runtime.state_value("y-controller", 700), Some(0));
-            runtime.apply_tree(agent_second_prompt_tree(&fixtures, controller_config))?;
+            runtime.apply_tree(agent_replacement_tree(
+                &fixtures,
+                &source_a,
+                &source_b,
+                base_revision,
+                true,
+            ))?;
             assert_eq!(runtime.events().len(), 9);
-            println!("agent boundary 9: tool generation B active; second prompt committed");
+            println!("agent boundary 9: inspector B active; second repository question committed");
         }
         AgentPhase::Verify => {
-            let actual = runtime
-                .events()
+            let records = runtime.events();
+            assert_eq!(
+                records.iter().map(|event| event.value).collect::<Vec<_>>(),
+                expected_agent_facts()
+            );
+            let payloads = records
                 .iter()
-                .map(|event| event.value)
+                .filter_map(|event| event.payload.as_ref())
                 .collect::<Vec<_>>();
-            assert_eq!(actual, expected_agent_facts());
-            assert_eq!(runtime.state_value("a-loop", 912), Some(202));
-            assert_eq!(runtime.state_value("a-loop", 913), Some(2002));
+            assert_eq!(payloads.len(), 2);
+            assert_eq!(
+                payloads[0].provenance,
+                fs::canonicalize(&source_a)?.display().to_string()
+            );
+            assert_eq!(
+                payloads[1].provenance,
+                fs::canonicalize(&source_b)?.display().to_string()
+            );
+            println!(
+                "agent answer 6002 cites {} and {}; two exact transcripts reconstructed",
+                payloads[0].provenance, payloads[1].provenance
+            );
             runtime.shutdown_persistent()?;
             assert!(runtime.is_observationally_clean());
-            println!("agent restart: two exact transcripts reconstructed; shutdown clean");
+            println!("agent inspection authority recovered; shutdown clean");
         }
     }
     Ok(())
 }
 
-fn agent_tree(fixtures: &Path, tool: &str) -> ComponentTree {
-    let event_grant = || EventGrant::new("quartz.agent", "turn", 1);
-    ComponentTree {
-        roots: vec![
-            ComponentSpec::new("a-loop", artifact(fixtures, "agent-loop"))
+fn agent_tree(
+    fixtures: &Path,
+    source_a: &Path,
+    source_b: &Path,
+    inspector_b: bool,
+    second_prompt: bool,
+) -> ComponentTree {
+    let event_grant = || EventGrant::new("quartz.agent", "repository-turn", 2);
+    let all_snapshots = || vec![snapshot_grant(source_a), snapshot_grant(source_b)];
+    let (tool, config, tool_snapshots) = if inspector_b {
+        (
+            "repo-inspector-b",
+            fnv1a(&fs::read(source_b).expect("read repository B")),
+            all_snapshots(),
+        )
+    } else {
+        (
+            "repo-inspector-a",
+            fnv1a(&fs::read(source_a).expect("read repository A")),
+            vec![snapshot_grant(source_a)],
+        )
+    };
+    let mut roots = vec![
+        ComponentSpec::new("a-loop", artifact(fixtures, "repo-agent-loop"))
+            .with_event_grants(vec![event_grant()])
+            .with_snapshot_grants(all_snapshots()),
+        ComponentSpec::new("b-gateway", artifact(fixtures, "agent-gateway")),
+        ComponentSpec::new("c-provider", artifact(fixtures, "repo-agent-provider")),
+        ComponentSpec::new("d-tool", artifact(fixtures, tool))
+            .with_config(config)
+            .with_snapshot_grants(tool_snapshots),
+        ComponentSpec::new("e-governor", artifact(fixtures, "governor")),
+        ComponentSpec::new("z-client", artifact(fixtures, "agent-client"))
+            .with_config(1)
+            .with_event_grants(vec![event_grant()]),
+    ];
+    if second_prompt {
+        roots.push(
+            ComponentSpec::new("zz-client", artifact(fixtures, "agent-client"))
+                .with_config(2)
                 .with_event_grants(vec![event_grant()]),
-            ComponentSpec::new("b-gateway", artifact(fixtures, "agent-gateway")),
-            ComponentSpec::new("c-provider", artifact(fixtures, "agent-provider")).with_config(1),
-            ComponentSpec::new("d-tool", artifact(fixtures, tool))
-                .with_config(if tool.ends_with('a') { 1 } else { 2 }),
-            ComponentSpec::new("e-governor", artifact(fixtures, "governor")).with_config(0),
-            ComponentSpec::new("z-client", artifact(fixtures, "agent-client"))
-                .with_config(1)
-                .with_event_grants(vec![event_grant()]),
-        ],
+        );
     }
+    ComponentTree { roots }
 }
 
-fn agent_tool_replacement_tree(fixtures: &Path, controller_config: u64) -> ComponentTree {
-    let mut tree = agent_tree(fixtures, "agent-tool-a");
-    tree.roots
-        .push(agent_replacement_controller(fixtures, controller_config));
-    tree
-}
-
-fn agent_second_prompt_tree(fixtures: &Path, controller_config: u64) -> ComponentTree {
-    let mut tree = agent_tree(fixtures, "agent-tool-b");
-    tree.roots
-        .push(agent_replacement_controller(fixtures, controller_config));
+fn agent_replacement_tree(
+    fixtures: &Path,
+    source_a: &Path,
+    source_b: &Path,
+    base_revision: u64,
+    replaced: bool,
+) -> ComponentTree {
+    let mut tree = agent_tree(fixtures, source_a, source_b, replaced, replaced);
     tree.roots.push(
-        ComponentSpec::new("zz-client", artifact(fixtures, "agent-client"))
-            .with_config(2)
-            .with_event_grants(vec![EventGrant::new("quartz.agent", "turn", 1)]),
+        ComponentSpec::new("y-controller", artifact(fixtures, "durable-controller"))
+            .with_config((base_revision + 1) << 32)
+            .with_patches(vec![CompositionPatch::replace(
+                "d-tool",
+                ComponentSpec::new("d-tool", artifact(fixtures, "repo-inspector-b"))
+                    .with_config(fnv1a(&fs::read(source_b).expect("read repository B")))
+                    .with_snapshot_grants(vec![snapshot_grant(source_a), snapshot_grant(source_b)]),
+            )]),
     );
     tree
 }
 
-fn agent_replacement_controller(fixtures: &Path, config: u64) -> ComponentSpec {
-    ComponentSpec::new("y-controller", artifact(fixtures, "durable-controller"))
-        .with_config(config)
-        .with_patches(vec![CompositionPatch::replace(
-            "d-tool",
-            ComponentSpec::new("d-tool", artifact(fixtures, "agent-tool-b")).with_config(2),
-        )])
+fn snapshot_grant(path: &Path) -> SnapshotGrant {
+    SnapshotGrant::from_file(
+        path,
+        fs::canonicalize(path)
+            .expect("canonical snapshot")
+            .display()
+            .to_string(),
+    )
+    .expect("admit immutable repository snapshot")
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
 }
 
 fn expected_agent_facts() -> Vec<u64> {
@@ -501,23 +568,27 @@ fn expected_agent_facts() -> Vec<u64> {
         (1, 1, 0, 1),
         (2, 1, 17, 1),
         (3, 1, 18, 1),
-        (4, 1, 18, 101),
-        (2, 1, 19, 2),
-        (5, 1, 19, 1001),
-        (6, 1, 19, 7),
+        (4, 1, 18, 5001),
+        (2, 1, 19, 5001),
+        (5, 1, 0, 6001),
+        (6, 1, 0, 1),
         (7, 1, 0, 1),
         (1, 2, 0, 2),
         (2, 2, 33, 1),
         (3, 2, 34, 1),
-        (4, 2, 34, 202),
-        (2, 2, 35, 2),
-        (5, 2, 35, 2002),
-        (6, 2, 35, 7),
+        (4, 2, 34, 5002),
+        (2, 2, 35, 5002),
+        (5, 2, 0, 6002),
+        (6, 2, 0, 1),
         (7, 2, 0, 1),
     ]
     .into_iter()
     .map(|(kind, turn, invocation, data)| (kind << 56) | (turn << 48) | (invocation << 32) | data)
     .collect()
+}
+fn repository_sources() -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
+    let root = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))?;
+    Ok((root.join("README.md"), root.join("lode/summary.md")))
 }
 
 fn required_path(value: Option<String>) -> Result<PathBuf, Box<dyn std::error::Error>> {
