@@ -3,11 +3,10 @@
 ## Problem
 
 Quartz can produce durable model responses, review and promote repository edits,
-run one explicitly approved command, and continue from its exact result. Those
-parts now form one useful repository-task loop, but the implementation has two
-architectural debts: session truth is split across parallel ledgers and filename
-conventions, and product orchestration is resident in the native executable
-rather than a component.
+run explicitly approved commands, and continue from their exact results. One
+authoritative session log now binds those operations into a reconstructible
+repository-task loop. The remaining architectural debt is product orchestration
+resident in the native executable rather than a component.
 
 ## Observable behavior
 
@@ -20,10 +19,10 @@ is one strict JSON object containing at least two unique, path-bound complete-fi
 candidates selected from the admitted sources. Proposal production never mutates
 the repository.
 
-`quartz --resume-proposals <session-dir>` reconstructs proposal state from
-committed facts without credentials or another exchange. It renders every
-candidate as an exact diff and identifies current, superseded, rejected, pending,
-interrupted, and completed state.
+`quartz --resume-proposals <session-dir>` reconstructs proposal state from the
+ordered facts in `<session-dir>/session.qe` without credentials or another
+exchange. It renders every candidate as an exact diff and identifies current,
+superseded, rejected, interrupted, and completed state.
 
 `quartz --revise-proposal <model> <session-dir> <index> <feedback-path>` records
 one explicit bounded rejection and may emit one correction exchange for the
@@ -43,8 +42,9 @@ the exact UTF-8 argument vector as a renewed user approval. Every current
 candidate must already be promoted. Quartz synchronizes `CommandStarted` before
 spawning the vector once in the canonical repository root, drains both pipes,
 and synchronizes one bounded terminal result. A started-only attempt reconstructs
-as interrupted/unknown and is never run again. Another command requires another
-explicit approval and receives another monotonic attempt identity.
+as interrupted/unknown, is never run again, and blocks all later session facts.
+A later command is legal only after a completed nonterminal continuation and
+requires another explicit approval with another monotonic attempt identity.
 
 `quartz --continue-task <model> <session-dir>` consumes the latest unconsumed
 finished command in sequence order and performs one bounded production exchange.
@@ -78,7 +78,7 @@ behavior that belongs behind the public component contract:
 
 - the proposal and continuation session state machine;
 - strict model-response grammar and candidate validation;
-- reconstruction of candidate generations from durable facts and filenames;
+- reconstruction of candidate generations from durable session facts;
 - command and continuation dispatch policy;
 - review presentation and action sequencing.
 
@@ -148,31 +148,75 @@ aliases, or permanent translation layers.
   external emissions. Recovery withdraws live capabilities without claiming to
   erase committed history or retained promoted bytes.
 
-## Current durable representation
+## Session log contract
 
-The current implementation reconstructs one logical task from the proposal turn
-journal, event stream, exchange ledger, revision and continuation journals,
-command facts, promotion journals, mutation ledgers, and sequence-bearing cache
-filenames. Checksums and cross-record identities reject many mismatches, but the
-parallel ledgers and filename-derived state are not one authoritative session
-history. Slice B replaces them with one append-only session log and derived
-state. Crash injection must cover fsync boundaries; a started external operation
-without a terminal fact remains interrupted/unknown.
+One `session.qe` file is the authoritative task history. It uses the existing
+bounded `QUARTZE2` event framing and contains only
+`quartz.session/fact@1` payloads. Monotonic fact IDs and checksummed frames
+establish order. Every payload is strict, versioned, independently bounded, and
+binds the identities and bytes needed to validate its predecessor.
+
+The closed fact set is:
+
+- initial proposal turn started and completed;
+- proposal rejection and revision turn started and completed;
+- exact candidate approval, promotion started, and promotion completed;
+- approved command started and finished;
+- continuation started and either completed with one proposal or completed the
+  task with an explicit summary.
+
+The session reducer consumes facts in ID order and is the only source of task
+state. Proposal turns, generations, current selection, rejections, approvals,
+promotions, command attempts, continuation sequences, and completion are never
+inferred from cache filenames, directory contents, composition journals, event
+payload caches, exchange ledgers, promotion journals, or mutation ledgers.
+Those operation-specific ledgers may remain as bounded idempotency and recovery
+evidence at privileged I/O boundaries, but they cannot authorize a task action
+or supply missing session history.
+
+Each external operation has a synchronized started fact before emission and at
+most one exact terminal fact. A model turn, promotion, or command with a started
+fact and no terminal fact derives as interrupted/unknown and is never emitted
+again. Non-external decisions such as rejection and approval may be followed
+only by their uniquely determined next fact. Invalid transitions, identity
+reuse, sequence gaps, duplicate terminal facts, stale generations, and facts
+after completion fail closed.
+
+Prompt, response, feedback, command, result, and completion bytes live in fact
+payloads. Files materialized beside the log are disposable caches: restart may
+rebuild or replace them from facts, and deleting or adding one cannot change
+derived state. Appending one fact synchronizes its complete frame before
+returning. A torn final frame is removed on open; interior corruption fails
+closed.
+
+The cutover deleted task-state readers and writers for parallel proposal,
+revision, command, and continuation journals. Operation journals remain only at
+the model-exchange and repository-mutation boundaries. A child-process crash
+harness aborts after one, two, and three returned session-log appends and proves
+that every returned prefix reopens with its exact monotonic IDs. Reducer
+contracts separately prove interrupted initial, revision, promotion, command,
+and later-continuation operations remain terminal and cannot append later facts.
 
 ## Public contract
 
-No new kernel, WIT, event-schema, command-fact, or permanent command-runner
-contract is introduced by the current loop. It composes:
+ABI 10 and WIT remain unchanged. The kernel exposes the existing event framing
+to justified host storage code as `DurableEventLog`: open one admitted path
+under explicit `Limits`, observe committed `EventRecord` values, and append one
+exact event plus optional `DurablePayload`. It is a synchronized wrapper over
+the same event-stream implementation, not another ledger format or product
+state machine.
 
-- `quartz.agent/repository-turn@2` for bounded production exchanges;
-- `quartz.command/approved@1` facts for exact command attempts;
-- ABI 10 snapshot, payload-read, workspace, callable mutation, publication, and
-  promotion capabilities.
+The repository task uses `quartz.session/fact@1` as its sole task event schema.
+The existing `quartz.agent/repository-turn@2` component protocol and exchange
+ledgers still bound actual model emission; ABI 10 workspace, callable mutation,
+publication, and promotion capabilities still bound actual source mutation.
+Their results enter task state only after an exact session fact commits.
 
 Each command argument is non-empty and capped at 4 KiB; total argument bytes are
 capped at 32 KiB. Candidate bytes are UTF-8 and capped at 32 KiB. Rejection
-feedback and completion summaries are UTF-8 and capped at 4 KiB. Prompt,
-response, payload, workspace, and ledger limits remain independently enforced.
+feedback and completion summaries are UTF-8 and capped at 4 KiB. Individual
+session facts, the total session log, prompt, response, workspace, and
+operation-ledger records remain independently bounded.
 
 ## Acceptance scenario
 
@@ -195,15 +239,21 @@ response, payload, workspace, and ledger limits remain independently enforced.
 
 ## Verification
 
-The latest focused contracts cover failed-command correction followed by
-successful completion, restart across repeated cycles, later-command and
-later-continuation interruption, sequence and command identity tampering, stale
-promotion, and post-completion closure. The credentialed dogfood scenario
-exercised the full acceptance path through one failed command, one reviewed and
-promoted correction, one successful command, explicit completion, and
-credential-free reconstruction without rerunning either external operation.
+Focused contracts cover exact chronological reconstruction, failed-command
+correction followed by successful completion, restart across repeated cycles,
+every started-only external-operation class, sequence and terminal-identity
+tampering, cache deletion, stale promotion, and post-completion closure.
 
-`cargo test -p quartz --bin quartz` passes 28 focused contracts.
-`cargo test --workspace --all-targets` passes 87 tests across 12 suites. Kernel
-source, WIT, ABI, module manifests, and package dependencies were unchanged by
-that implementation.
+The credentialed Slice B dogfood session emitted one failed command, one
+reviewed and promoted correction, one successful command, and explicit
+completion. Credential-free restart reconstructed both command results, both
+model decisions, promotions, and completion after all materialized candidate,
+prompt, response-metadata, and completion-summary caches were deleted. Attempts
+to command, revise, promote, or continue after completion each exited 2 without
+emitting work.
+
+`cargo test -p quartz --bin quartz` passes 34 focused contracts.
+`cargo test --workspace --all-targets` passes 93 tests across 12 suites. WIT,
+component ABI 10, and module manifests are unchanged. The kernel adds only the
+schema-agnostic `DurableEventLog` wrapper described in `durable-events.md`;
+`quartz` adds a direct workspace `serde` dependency for strict session facts.

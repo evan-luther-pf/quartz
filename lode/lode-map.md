@@ -28,8 +28,9 @@
 - `capabilities/durable-edit-promotion.md` — separate durable retention
   authority, restoration ownership transfer, and restart-safe promoted bytes.
 - `capabilities/dogfood-repository-task.md` — current bounded repository-task
-  loop, repeatable correction and validation, durable-state debt, superseded
-  candidate/path constraints, and the native-orchestrator violation.
+  loop, authoritative append-only session facts, repeatable correction and
+  validation, superseded candidate/path constraints, and the native-orchestrator
+  violation.
 
 ## Research
 

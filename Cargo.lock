@@ -897,6 +897,7 @@ name = "quartz"
 version = "0.1.0"
 dependencies = [
  "quartz-kernel",
+ "serde",
  "serde_json",
  "sha2",
  "ureq",

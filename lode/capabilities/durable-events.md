@@ -47,15 +47,22 @@ provider fiber. Count and read return non-negative values or a negative Quartz
 status.
 
 The event stream uses the same framed-log implementation as composition
-persistence with eight-byte magic `QUARTZE1`. Each frame contains a monotonic
+persistence with eight-byte magic `QUARTZE2`. Each frame contains a monotonic
 sequence, bounded JSON payload length, schema-versioned payload, and SHA-256
-checksum. An `EventRecord` contains durable ID, actor path, type identity, and
-value.
+checksum. An `EventRecord` contains durable ID, actor path, type identity,
+scalar value, and an optional exact durable payload.
 
 The composition journal snapshot carries the next event ID and staged outbox.
 Fresh startup or recovery drains the outbox before declaring application roots.
 `Runtime::events` is an observation API for committed records; components use
 the capability imports.
+
+`DurableEventLog` exposes the same event-stream implementation to justified
+native storage boundaries without requiring a composition runtime. Opening
+binds one path and explicit `Limits`; `records` returns committed facts; and
+`append` assigns the next monotonic ID, validates all bounds and payload
+identity, synchronizes one frame, and returns only after that fact is durable.
+It adds no new framing, task schema, ambient path authority, or component ABI.
 
 ## Acceptance scenario
 
@@ -67,4 +74,7 @@ the capability imports.
 6. Restart again; the persisted projection reconstructs 37 without duplicate append.
 7. Commit an empty application tree and recover the storage component, leaving a clean context.
 
-Contract tests cover cold projection reconstruction, failed and denied append omission, sequence continuity, outbox retry idempotence, torn-tail repair, interior-corruption rejection, record bounds, and clean shutdown.
+Contract tests cover cold projection reconstruction, failed and denied append
+omission, sequence continuity, outbox retry idempotence, torn-tail repair,
+interior-corruption rejection, record bounds, clean shutdown, and child-process
+abort after returned native-log appends.

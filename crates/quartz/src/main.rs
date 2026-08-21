@@ -1,6 +1,7 @@
 mod commands;
 mod openai;
 mod proposals;
+mod session;
 
 use quartz_kernel::{
     ComponentSpec, ComponentTree, CompositionPatch, Error, EventGrant, ExchangeAdapter,
@@ -38,12 +39,12 @@ Commands:
   --reviewed-edit <directory>
   --promote-edit <directory>
   --production-model <model> <prompt> <journal>
-  --propose <model> <task> <session> <source> <source> [source]
-  --resume-proposals <session>
-  --revise-proposal <model> <session> <index> <feedback>
-  --promote-proposal <session> <index>
-  --run-approved-command <session> -- <executable> [arg ...]
-  --continue-task <model> <session>
+  --propose <model> <task> <session-dir> <source> <source> [source]
+  --resume-proposals <session-dir>
+  --revise-proposal <model> <session-dir> <index> <feedback>
+  --promote-proposal <session-dir> <index>
+  --run-approved-command <session-dir> -- <executable> [arg ...]
+  --continue-task <model> <session-dir>
 ";
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1171,27 +1172,38 @@ fn run_multi_proposal(
     }
     let session = fs::canonicalize(session)?;
     let admission = proposals::Admission::from_files(&repository_root()?, task, sources)?;
+    let prompt_bytes = admission.prompt_bytes()?;
+    let prompt_text = String::from_utf8(prompt_bytes.clone())?;
     let prompt = session.join("admission.prompt");
     let journal = session.join("turn.qj");
-    fs::write(&prompt, admission.prompt_bytes()?)?;
+    fs::write(&prompt, &prompt_bytes)?;
 
     let api_key =
         std::env::var("OPENAI_API_KEY").map_err(|_| "OPENAI_API_KEY is required for --propose")?;
     let adapter = Arc::new(openai::OpenAiResponses::new(api_key, model.to_owned())?);
+    let mut session_log = session::SessionLog::open(&session)?;
+    if !session_log.facts().is_empty() {
+        return Err("proposal session already has durable facts".into());
+    }
+    let prompt_sha256 = session::sha256(&prompt_bytes);
+    session_log.append(session::SessionFact::ModelStarted {
+        turn: session::ModelTurn::Initial,
+        model: model.to_owned(),
+        prompt_sha256: prompt_sha256.clone(),
+        prompt: prompt_text,
+    })?;
     let (response, provenance) =
         run_exchange_turn_with_limits(&prompt, &journal, adapter, proposal_limits())?;
-    let candidates = proposals::parse_response(&response, &admission)?;
-    proposals::materialize(&session, &candidates)?;
-    display_proposals(
-        &session,
-        &ProposalSession {
-            admission,
-            proposals: candidates,
-            revision: None,
-            command: None,
-            continuations: Vec::new(),
-        },
-    )?;
+    let response = String::from_utf8(response)?;
+    session_log.append(session::SessionFact::ModelCompleted {
+        turn: session::ModelTurn::Initial,
+        prompt_sha256,
+        response_sha256: session::sha256(response.as_bytes()),
+        response,
+        provenance: provenance.clone(),
+    })?;
+    let state = reconstruct_proposal_session(&session)?;
+    display_proposals(&session, &state)?;
     println!("response provenance: {provenance}");
     println!("proposal turn reconstructed; no source changed");
     Ok(())
@@ -1211,65 +1223,84 @@ fn run_proposal_revision(
     if state.command.is_some() || !state.continuations.is_empty() {
         return Err("proposal rejection is available only before command cycles begin".into());
     }
-    let (admission, candidates) = reconstruct_base_proposals(&session)?;
-    let journal = proposals::revision_journal_path(&session);
-    let mut prompt_is_durable = false;
-    let expected = if journal.exists() {
-        match read_durable_proposal_turn(&journal)? {
-            DurableProposalTurn::Completed { prompt, response } => {
-                let durable = proposals::Revision::from_prompt(&prompt, &admission, &candidates)?;
-                validate_revision_selector(&durable, model, index)?;
-                proposals::parse_revision_response(&response, &durable)?;
-                let state = reconstruct_proposal_session(&session)?;
-                display_proposals(&session, &state)?;
-                println!("revision turn reconstructed; no exchange emitted");
-                return Ok(());
-            }
-            DurableProposalTurn::Interrupted { prompt } => {
-                let durable = proposals::Revision::from_prompt(&prompt, &admission, &candidates)?;
-                validate_revision_selector(&durable, model, index)?;
-                return Err(
-                    "revision turn ended interrupted/unknown; it will not be retried".into(),
-                );
-            }
-            DurableProposalTurn::Pending {
-                prompt: Some(prompt),
-            } => {
-                prompt_is_durable = true;
-                let durable = proposals::Revision::from_prompt(&prompt, &admission, &candidates)?;
-                validate_revision_selector(&durable, model, index)?;
-                durable
-            }
-            DurableProposalTurn::Pending { prompt: None } => proposals::Revision::new(
-                model,
-                &fs::read(feedback)?,
-                &admission,
-                &candidates,
-                index,
-            )?,
+    match &state.revision {
+        Some(ProposalRevisionState::Completed { request, .. }) => {
+            validate_revision_selector(request, model, index)?;
+            display_proposals(&session, &state)?;
+            println!("revision turn reconstructed; no exchange emitted");
+            return Ok(());
         }
-    } else {
-        proposals::Revision::new(model, &fs::read(feedback)?, &admission, &candidates, index)?
+        Some(ProposalRevisionState::Interrupted(request)) => {
+            validate_revision_selector(request, model, index)?;
+            return Err("revision turn ended interrupted/unknown; it will not be retried".into());
+        }
+        _ => {}
+    }
+
+    let feedback_bytes = fs::read(feedback)?;
+    let expected = match &state.revision {
+        Some(ProposalRevisionState::Pending(request)) => {
+            validate_revision_selector(request, model, index)?;
+            if request.feedback.as_bytes() != feedback_bytes {
+                return Err("durable rejection feedback changed".into());
+            }
+            request.clone()
+        }
+        None => proposals::Revision::new(
+            model,
+            &feedback_bytes,
+            &state.admission,
+            &state.proposals,
+            index,
+        )?,
+        Some(ProposalRevisionState::Interrupted(_))
+        | Some(ProposalRevisionState::Completed { .. }) => unreachable!("handled above"),
     };
     let prompt_bytes = expected.prompt_bytes()?;
-    let prompt_path = proposals::revision_prompt_path(&session);
-    if prompt_is_durable {
-        proposals::materialize_revision_prompt(&session, &prompt_bytes)?;
-    } else if prompt_path.exists() {
-        if fs::read(&prompt_path)? != prompt_bytes {
-            return Err("revision prompt cache changed or describes another rejection".into());
-        }
-    } else {
-        proposals::materialize_revision_prompt(&session, &prompt_bytes)?;
-    }
+    let prompt_text = String::from_utf8(prompt_bytes.clone())?;
+    let prompt_path = proposals::materialize_revision_prompt(&session, &prompt_bytes)?;
+    let journal = proposals::revision_journal_path(&session);
 
     let api_key = std::env::var("OPENAI_API_KEY")
         .map_err(|_| "OPENAI_API_KEY is required to start or resume --revise-proposal")?;
     let adapter = Arc::new(openai::OpenAiResponses::new(api_key, model.to_owned())?);
+    let mut session_log = session::SessionLog::open(&session)?;
+    if state.revision.is_none() {
+        session_log.append(session::SessionFact::ProposalRejected {
+            proposal_index: index,
+            revision: 0,
+            candidate_sha256: state
+                .current(&session, index)?
+                .proposal
+                .result_sha256
+                .clone(),
+            model: model.to_owned(),
+            feedback: expected.feedback.clone(),
+        })?;
+    }
+    let prompt_sha256 = session::sha256(&prompt_bytes);
+    session_log.append(session::SessionFact::ModelStarted {
+        turn: session::ModelTurn::Revision {
+            proposal_index: index,
+            revision: 1,
+        },
+        model: model.to_owned(),
+        prompt_sha256: prompt_sha256.clone(),
+        prompt: prompt_text,
+    })?;
     let (response, provenance) =
         run_exchange_turn_with_limits(&prompt_path, &journal, adapter, proposal_limits())?;
-    let corrected = proposals::parse_revision_response(&response, &expected)?;
-    proposals::materialize_revision(&session, &expected, &corrected)?;
+    let response = String::from_utf8(response)?;
+    session_log.append(session::SessionFact::ModelCompleted {
+        turn: session::ModelTurn::Revision {
+            proposal_index: index,
+            revision: 1,
+        },
+        prompt_sha256,
+        response_sha256: session::sha256(response.as_bytes()),
+        response,
+        provenance: provenance.clone(),
+    })?;
     let state = reconstruct_proposal_session(&session)?;
     display_proposals(&session, &state)?;
     println!("response provenance: {provenance}");
@@ -1292,6 +1323,7 @@ struct ProposalSession {
     admission: proposals::Admission,
     proposals: Vec<proposals::Proposal>,
     revision: Option<ProposalRevisionState>,
+    promotions: Vec<ProposalPromotionState>,
     command: Option<CommandHistory>,
     continuations: Vec<ProposalContinuationState>,
 }
@@ -1306,7 +1338,6 @@ enum ProposalRevisionState {
 }
 
 enum ProposalContinuationState {
-    Pending(proposals::Continuation),
     Interrupted(proposals::Continuation),
     Completed {
         request: proposals::Continuation,
@@ -1314,10 +1345,32 @@ enum ProposalContinuationState {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ProposalPromotionState {
+    Approved {
+        proposal_index: usize,
+        revision: u32,
+        candidate_sha256: String,
+    },
+    Interrupted {
+        proposal_index: usize,
+        revision: u32,
+        candidate_sha256: String,
+        operation: u64,
+    },
+    Promoted {
+        proposal_index: usize,
+        revision: u32,
+        candidate_sha256: String,
+        operation: u64,
+    },
+}
+
 struct CommandHistory {
     attempts: Vec<CommandAttemptState>,
 }
 
+#[derive(Clone)]
 enum CommandAttemptState {
     Interrupted(commands::CommandStarted),
     Finished {
@@ -1327,15 +1380,18 @@ enum CommandAttemptState {
 }
 
 struct CurrentProposal<'a> {
+    proposal_index: usize,
     proposal: &'a proposals::Proposal,
     path: PathBuf,
     revision: u32,
 }
 
-enum DurableProposalTurn {
-    Pending { prompt: Option<Vec<u8>> },
-    Interrupted { prompt: Vec<u8> },
-    Completed { prompt: Vec<u8>, response: Vec<u8> },
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PromotionStatus {
+    Absent,
+    Approved,
+    Interrupted,
+    Promoted,
 }
 
 impl CommandHistory {
@@ -1426,6 +1482,7 @@ impl ProposalSession {
                 && *proposal_index == index
             {
                 return Ok(CurrentProposal {
+                    proposal_index: index,
                     proposal,
                     path: proposals::continuation_candidate_path(session, index, *revision),
                     revision: *revision,
@@ -1492,8 +1549,7 @@ impl ProposalSession {
                 } => {
                     return Err("explicit completion cannot precede another continuation".into());
                 }
-                ProposalContinuationState::Pending(_)
-                | ProposalContinuationState::Interrupted(_) => {
+                ProposalContinuationState::Interrupted(_) => {
                     return Err(
                         "nonterminal continuation cannot precede another continuation".into(),
                     );
@@ -1518,6 +1574,7 @@ impl ProposalSession {
                 if request.proposal_index == index =>
             {
                 Ok(CurrentProposal {
+                    proposal_index: index,
                     proposal,
                     path: proposals::revision_candidate_path(session, index),
                     revision: 1,
@@ -1530,6 +1587,7 @@ impl ProposalSession {
                 Err(format!("proposal {index} was rejected and has no completed correction").into())
             }
             _ => Ok(CurrentProposal {
+                proposal_index: index,
                 proposal: original,
                 path: proposals::candidate_path(session, index),
                 revision: 0,
@@ -1537,28 +1595,99 @@ impl ProposalSession {
         }
     }
 
-    fn current_generations(
-        &self,
-        session: &Path,
-    ) -> Result<Vec<proposals::ProposalGeneration>, Box<dyn std::error::Error>> {
-        self.generations_before_continuation(session, self.next_continuation_sequence()?)
+    fn promotion_status(&self, current: &CurrentProposal<'_>) -> PromotionStatus {
+        self.promotions
+            .iter()
+            .rev()
+            .find_map(|state| match state {
+                ProposalPromotionState::Approved {
+                    proposal_index,
+                    revision,
+                    candidate_sha256,
+                } if *proposal_index == current.proposal_index
+                    && *revision == current.revision
+                    && *candidate_sha256 == current.proposal.result_sha256 =>
+                {
+                    Some(PromotionStatus::Approved)
+                }
+                ProposalPromotionState::Interrupted {
+                    proposal_index,
+                    revision,
+                    candidate_sha256,
+                    ..
+                } if *proposal_index == current.proposal_index
+                    && *revision == current.revision
+                    && *candidate_sha256 == current.proposal.result_sha256 =>
+                {
+                    Some(PromotionStatus::Interrupted)
+                }
+                ProposalPromotionState::Promoted {
+                    proposal_index,
+                    revision,
+                    candidate_sha256,
+                    ..
+                } if *proposal_index == current.proposal_index
+                    && *revision == current.revision
+                    && *candidate_sha256 == current.proposal.result_sha256 =>
+                {
+                    Some(PromotionStatus::Promoted)
+                }
+                _ => None,
+            })
+            .unwrap_or(PromotionStatus::Absent)
     }
 }
 
 fn reconstruct_base_proposals(
     session: &Path,
 ) -> Result<(proposals::Admission, Vec<proposals::Proposal>), Box<dyn std::error::Error>> {
-    let (prompt, response) = match read_durable_proposal_turn(&session.join("turn.qj"))? {
-        DurableProposalTurn::Completed { prompt, response } => (prompt, response),
-        DurableProposalTurn::Pending { .. } => {
-            return Err("initial proposal turn is not terminal".into());
-        }
-        DurableProposalTurn::Interrupted { .. } => {
-            return Err("initial proposal turn ended interrupted/unknown".into());
-        }
+    let log = session::SessionLog::open(session)?;
+    reconstruct_base_proposals_from_facts(session, log.facts())
+}
+
+fn reconstruct_base_proposals_from_facts(
+    session: &Path,
+    facts: &[session::RecordedFact],
+) -> Result<(proposals::Admission, Vec<proposals::Proposal>), Box<dyn std::error::Error>> {
+    let Some(started) = facts.first() else {
+        return Err("proposal session has no durable facts".into());
     };
-    let admission = proposals::Admission::from_prompt(&prompt)?;
-    let candidates = proposals::parse_response(&response, &admission)?;
+    let (prompt, prompt_sha256) = match &started.fact {
+        session::SessionFact::ModelStarted {
+            turn: session::ModelTurn::Initial,
+            model,
+            prompt_sha256,
+            prompt,
+        } => {
+            if model.is_empty() {
+                return Err("initial proposal model is empty".into());
+            }
+            validate_session_text(prompt, prompt_sha256, "initial proposal prompt")?;
+            (prompt.as_bytes(), prompt_sha256)
+        }
+        _ => return Err("session fact 1 is not an initial proposal start".into()),
+    };
+    let Some(completed) = facts.get(1) else {
+        return Err("initial proposal turn ended interrupted/unknown".into());
+    };
+    let response = match &completed.fact {
+        session::SessionFact::ModelCompleted {
+            turn: session::ModelTurn::Initial,
+            prompt_sha256: completed_prompt,
+            response_sha256,
+            response,
+            provenance,
+        } => {
+            if completed_prompt != prompt_sha256 || provenance.is_empty() {
+                return Err("initial proposal completion does not bind its start".into());
+            }
+            validate_session_text(response, response_sha256, "initial proposal response")?;
+            response.as_bytes()
+        }
+        _ => return Err("initial proposal start has no matching completion".into()),
+    };
+    let admission = proposals::Admission::from_prompt(prompt)?;
+    let candidates = proposals::parse_response(response, &admission)?;
     proposals::materialize(session, &candidates)?;
     Ok((admission, candidates))
 }
@@ -1567,172 +1696,436 @@ fn reconstruct_proposal_session(
     session: &Path,
 ) -> Result<ProposalSession, Box<dyn std::error::Error>> {
     let session = fs::canonicalize(session)?;
-    let (admission, candidates) = reconstruct_base_proposals(&session)?;
-    let revision_journal = proposals::revision_journal_path(&session);
-    let revision = if revision_journal.exists() {
-        match read_durable_proposal_turn(&revision_journal)? {
-            DurableProposalTurn::Pending {
-                prompt: Some(prompt),
-            } => {
-                let request = proposals::Revision::from_prompt(&prompt, &admission, &candidates)?;
-                proposals::materialize_revision_prompt(&session, &prompt)?;
-                Some(ProposalRevisionState::Pending(request))
-            }
-            DurableProposalTurn::Pending { prompt: None } => {
-                return Err("revision journal has no durable rejection prompt".into());
-            }
-            DurableProposalTurn::Interrupted { prompt } => {
-                let request = proposals::Revision::from_prompt(&prompt, &admission, &candidates)?;
-                proposals::materialize_revision_prompt(&session, &prompt)?;
-                Some(ProposalRevisionState::Interrupted(request))
-            }
-            DurableProposalTurn::Completed { prompt, response } => {
-                let request = proposals::Revision::from_prompt(&prompt, &admission, &candidates)?;
-                proposals::materialize_revision_prompt(&session, &prompt)?;
-                let proposal = proposals::parse_revision_response(&response, &request)?;
-                proposals::materialize_revision(&session, &request, &proposal)?;
-                Some(ProposalRevisionState::Completed { request, proposal })
-            }
-        }
-    } else if proposals::revision_prompt_path(&session).exists() {
-        return Err(
-            "revision prompt exists without durable turn evidence; rerun `--revise-proposal`"
-                .into(),
-        );
-    } else {
-        None
-    };
-    let command = read_command_history(&session)?;
-    let finished_count = command.as_ref().map_or(0, CommandHistory::finished_count);
+    let log = session::SessionLog::open(&session)?;
+    let (admission, candidates) = reconstruct_base_proposals_from_facts(&session, log.facts())?;
     let mut state = ProposalSession {
         admission,
         proposals: candidates,
-        revision,
-        command,
+        revision: None,
+        promotions: Vec::new(),
+        command: None,
         continuations: Vec::new(),
     };
-    for sequence_index in 1..=finished_count {
-        let sequence = u32::try_from(sequence_index)?;
-        let continuation_journal = proposals::continuation_journal_path(&session, sequence);
-        if !continuation_journal.exists() {
-            if proposals::continuation_prompt_path(&session, sequence).exists() {
-                return Err(format!(
-                    "continuation {sequence} prompt exists without durable turn evidence; rerun `--continue-task`"
-                )
-                .into());
-            }
-            if sequence_index < finished_count {
-                return Err(format!(
-                    "finished command {sequence} has no continuation before a later command"
-                )
-                .into());
-            }
-            break;
+    let mut cursor = 2;
+    while let Some(record) = log.facts().get(cursor) {
+        if let Some(ProposalRevisionState::Pending(expected)) = &state.revision {
+            let expected = expected.clone();
+            let request = match &record.fact {
+                session::SessionFact::ModelStarted {
+                    turn:
+                        session::ModelTurn::Revision {
+                            proposal_index,
+                            revision,
+                        },
+                    model,
+                    prompt_sha256,
+                    prompt,
+                } if *proposal_index == expected.proposal_index && *revision == 1 => {
+                    validate_session_text(prompt, prompt_sha256, "revision prompt")?;
+                    let request = proposals::Revision::from_prompt(
+                        prompt.as_bytes(),
+                        &state.admission,
+                        &state.proposals,
+                    )?;
+                    validate_revision_selector(&request, model, *proposal_index)?;
+                    if request != expected {
+                        return Err("revision start changed the durable rejection".into());
+                    }
+                    proposals::materialize_revision_prompt(&session, prompt.as_bytes())?;
+                    request
+                }
+                _ => return Err("proposal rejection is not followed by its revision start".into()),
+            };
+            state.revision = Some(ProposalRevisionState::Interrupted(request));
+            cursor += 1;
+            continue;
         }
-        let finished = state
+        if let Some(ProposalRevisionState::Interrupted(expected)) = &state.revision {
+            let expected = expected.clone();
+            let prompt = expected.prompt_bytes()?;
+            let prompt_sha256 = session::sha256(&prompt);
+            match &record.fact {
+                session::SessionFact::ModelCompleted {
+                    turn:
+                        session::ModelTurn::Revision {
+                            proposal_index,
+                            revision,
+                        },
+                    prompt_sha256: completed_prompt,
+                    response_sha256,
+                    response,
+                    provenance,
+                } if *proposal_index == expected.proposal_index && *revision == 1 => {
+                    if *completed_prompt != prompt_sha256 || provenance.is_empty() {
+                        return Err("revision completion does not bind its start".into());
+                    }
+                    validate_session_text(response, response_sha256, "revision response")?;
+                    let proposal =
+                        proposals::parse_revision_response(response.as_bytes(), &expected)?;
+                    proposals::materialize_revision(&session, &expected, &proposal)?;
+                    state.revision = Some(ProposalRevisionState::Completed {
+                        request: expected,
+                        proposal,
+                    });
+                    cursor += 1;
+                    continue;
+                }
+                _ => return Err("interrupted revision is followed by another session fact".into()),
+            }
+        }
+        if let Some(ProposalPromotionState::Approved {
+            proposal_index,
+            revision,
+            candidate_sha256,
+        }) = state.promotions.last()
+        {
+            match &record.fact {
+                session::SessionFact::PromotionStarted {
+                    proposal_index: started_index,
+                    revision: started_revision,
+                    candidate_sha256: started_candidate,
+                    operation,
+                } if started_index == proposal_index
+                    && started_revision == revision
+                    && started_candidate == candidate_sha256
+                    && *operation == proposal_operation(*proposal_index, *revision)? =>
+                {
+                    state.promotions.push(ProposalPromotionState::Interrupted {
+                        proposal_index: *proposal_index,
+                        revision: *revision,
+                        candidate_sha256: candidate_sha256.clone(),
+                        operation: *operation,
+                    });
+                    cursor += 1;
+                    continue;
+                }
+                _ => return Err("proposal approval is not followed by its promotion start".into()),
+            }
+        }
+        if let Some(ProposalPromotionState::Interrupted {
+            proposal_index,
+            revision,
+            candidate_sha256,
+            operation,
+        }) = state.promotions.last()
+        {
+            match &record.fact {
+                session::SessionFact::ProposalPromoted {
+                    proposal_index: completed_index,
+                    revision: completed_revision,
+                    candidate_sha256: completed_candidate,
+                    operation: completed_operation,
+                } if completed_index == proposal_index
+                    && completed_revision == revision
+                    && completed_candidate == candidate_sha256
+                    && completed_operation == operation =>
+                {
+                    state.promotions.push(ProposalPromotionState::Promoted {
+                        proposal_index: *proposal_index,
+                        revision: *revision,
+                        candidate_sha256: candidate_sha256.clone(),
+                        operation: *operation,
+                    });
+                    cursor += 1;
+                    continue;
+                }
+                _ => return Err("interrupted promotion is followed by another session fact".into()),
+            }
+        }
+        if let Some(CommandAttemptState::Interrupted(started)) = state
             .command
             .as_ref()
-            .ok_or("continuation exists without approved command evidence")?
-            .finished(sequence)?;
-        let current = state.generations_before_continuation(&session, sequence)?;
-        let continuation = match read_durable_proposal_turn(&continuation_journal)? {
-            DurableProposalTurn::Pending {
-                prompt: Some(prompt),
+            .and_then(|history| history.attempts.last())
+            .cloned()
+        {
+            match &record.fact {
+                session::SessionFact::CommandFinished {
+                    attempt,
+                    start_sha256,
+                    payload_sha256,
+                    payload,
+                } if *attempt == started.attempt && *start_sha256 == started.sha256()? => {
+                    validate_session_text(payload, payload_sha256, "CommandFinished payload")?;
+                    let finished =
+                        commands::CommandFinished::from_bytes(payload.as_bytes(), &started)?;
+                    let history = state.command.as_mut().expect("history checked above");
+                    let last = history.attempts.last_mut().expect("attempt checked above");
+                    *last = CommandAttemptState::Finished { started, finished };
+                    cursor += 1;
+                    continue;
+                }
+                _ => {
+                    return Err(
+                        "interrupted approved command is followed by another session fact".into(),
+                    );
+                }
+            }
+        }
+        if let Some(ProposalContinuationState::Interrupted(expected)) = state.continuations.last() {
+            let expected = expected.clone();
+            let prompt = expected.prompt_bytes()?;
+            let prompt_sha256 = session::sha256(&prompt);
+            match &record.fact {
+                session::SessionFact::ModelCompleted {
+                    turn: session::ModelTurn::Continuation { sequence },
+                    prompt_sha256: completed_prompt,
+                    response_sha256,
+                    response,
+                    provenance,
+                } if *sequence == expected.sequence => {
+                    if *completed_prompt != prompt_sha256 || provenance.is_empty() {
+                        return Err("continuation completion does not bind its start".into());
+                    }
+                    validate_session_text(response, response_sha256, "continuation response")?;
+                    let response =
+                        proposals::parse_continuation_response(response.as_bytes(), &expected)?;
+                    if matches!(response, proposals::ContinuationResponse::Complete(_)) {
+                        return Err("explicit completion requires a task-completed fact".into());
+                    }
+                    proposals::materialize_continuation_response(&session, &expected, &response)?;
+                    *state
+                        .continuations
+                        .last_mut()
+                        .expect("continuation checked above") =
+                        ProposalContinuationState::Completed {
+                            request: expected,
+                            response,
+                        };
+                    cursor += 1;
+                    continue;
+                }
+                session::SessionFact::TaskCompleted {
+                    sequence,
+                    prompt_sha256: completed_prompt,
+                    response_sha256,
+                    response,
+                    provenance,
+                } if *sequence == expected.sequence => {
+                    if *completed_prompt != prompt_sha256 || provenance.is_empty() {
+                        return Err("task completion does not bind its continuation start".into());
+                    }
+                    validate_session_text(response, response_sha256, "completion response")?;
+                    let response =
+                        proposals::parse_continuation_response(response.as_bytes(), &expected)?;
+                    if !matches!(response, proposals::ContinuationResponse::Complete(_)) {
+                        return Err(
+                            "task-completed fact does not contain explicit completion".into()
+                        );
+                    }
+                    proposals::materialize_continuation_response(&session, &expected, &response)?;
+                    *state
+                        .continuations
+                        .last_mut()
+                        .expect("continuation checked above") =
+                        ProposalContinuationState::Completed {
+                            request: expected,
+                            response,
+                        };
+                    cursor += 1;
+                    continue;
+                }
+                _ => {
+                    return Err(
+                        "interrupted continuation is followed by another session fact".into(),
+                    );
+                }
+            }
+        }
+
+        match &record.fact {
+            session::SessionFact::ProposalRejected {
+                proposal_index,
+                revision,
+                candidate_sha256,
+                model,
+                feedback,
             } => {
+                if state.is_complete()
+                    || state.command.is_some()
+                    || !state.continuations.is_empty()
+                    || state.revision.is_some()
+                    || *revision != 0
+                {
+                    return Err("proposal rejection is not legal in the derived state".into());
+                }
+                let current = state.current(&session, *proposal_index)?;
+                if current.revision != *revision
+                    || current.proposal.result_sha256 != *candidate_sha256
+                {
+                    return Err("proposal rejection names a stale generation".into());
+                }
+                let request = proposals::Revision::new(
+                    model,
+                    feedback.as_bytes(),
+                    &state.admission,
+                    &state.proposals,
+                    *proposal_index,
+                )?;
+                state.revision = Some(ProposalRevisionState::Pending(request));
+            }
+            session::SessionFact::ProposalApproved {
+                proposal_index,
+                revision,
+                candidate_sha256,
+            } => {
+                if state.is_complete() {
+                    return Err("proposal approval follows explicit completion".into());
+                }
+                let current = state.current(&session, *proposal_index)?;
+                if current.revision != *revision
+                    || current.proposal.result_sha256 != *candidate_sha256
+                    || state.promotion_status(&current) != PromotionStatus::Absent
+                {
+                    return Err("proposal approval names a stale or consumed generation".into());
+                }
+                state.promotions.push(ProposalPromotionState::Approved {
+                    proposal_index: *proposal_index,
+                    revision: *revision,
+                    candidate_sha256: candidate_sha256.clone(),
+                });
+            }
+            session::SessionFact::CommandStarted {
+                attempt,
+                payload_sha256,
+                payload,
+            } => {
+                validate_new_command_fact(&state, &session)?;
+                validate_session_text(payload, payload_sha256, "CommandStarted payload")?;
+                let started = commands::CommandStarted::from_bytes(payload.as_bytes())?;
+                let expected_attempt = state
+                    .command
+                    .as_ref()
+                    .map_or(Ok(1), CommandHistory::next_attempt)?;
+                if *attempt != expected_attempt || started.attempt != *attempt {
+                    return Err("approved command attempt does not follow session history".into());
+                }
+                state
+                    .command
+                    .get_or_insert_with(|| CommandHistory {
+                        attempts: Vec::new(),
+                    })
+                    .attempts
+                    .push(CommandAttemptState::Interrupted(started));
+            }
+            session::SessionFact::ModelStarted {
+                turn: session::ModelTurn::Continuation { sequence },
+                model,
+                prompt_sha256,
+                prompt,
+            } => {
+                validate_continuation_fact_start(&state, &session, *sequence)?;
+                validate_session_text(prompt, prompt_sha256, "continuation prompt")?;
+                let finished = state
+                    .command
+                    .as_ref()
+                    .ok_or("continuation exists without command history")?
+                    .finished(*sequence)?;
+                let current = state.generations_before_continuation(&session, *sequence)?;
                 let request = proposals::Continuation::from_prompt(
-                    sequence,
-                    &prompt,
+                    *sequence,
+                    prompt.as_bytes(),
                     &state.admission,
                     &current,
                     finished,
                 )?;
-                proposals::materialize_continuation_prompt(&session, sequence, &prompt)?;
-                ProposalContinuationState::Pending(request)
+                if request.model != *model {
+                    return Err("continuation start belongs to another model".into());
+                }
+                proposals::materialize_continuation_prompt(&session, *sequence, prompt.as_bytes())?;
+                state
+                    .continuations
+                    .push(ProposalContinuationState::Interrupted(request));
             }
-            DurableProposalTurn::Pending { prompt: None } => {
-                return Err(format!(
-                    "continuation {sequence} journal has no durable continuation prompt"
-                )
-                .into());
-            }
-            DurableProposalTurn::Interrupted { prompt } => {
-                let request = proposals::Continuation::from_prompt(
-                    sequence,
-                    &prompt,
-                    &state.admission,
-                    &current,
-                    finished,
-                )?;
-                proposals::materialize_continuation_prompt(&session, sequence, &prompt)?;
-                ProposalContinuationState::Interrupted(request)
-            }
-            DurableProposalTurn::Completed { prompt, response } => {
-                let request = proposals::Continuation::from_prompt(
-                    sequence,
-                    &prompt,
-                    &state.admission,
-                    &current,
-                    finished,
-                )?;
-                proposals::materialize_continuation_prompt(&session, sequence, &prompt)?;
-                let response = proposals::parse_continuation_response(&response, &request)?;
-                proposals::materialize_continuation_response(&session, &request, &response)?;
-                ProposalContinuationState::Completed { request, response }
-            }
-        };
-        let permits_later_command = matches!(
-            continuation,
-            ProposalContinuationState::Completed {
-                response: proposals::ContinuationResponse::Proposal { .. },
-                ..
-            }
-        );
-        state.continuations.push(continuation);
-        if sequence_index < finished_count && !permits_later_command {
+            _ => return Err(format!("session fact {} is not legal here", record.id).into()),
+        }
+        cursor += 1;
+    }
+    Ok(state)
+}
+
+fn validate_session_text(value: &str, digest: &str, label: &str) -> Result<(), String> {
+    if session::sha256(value.as_bytes()) != digest {
+        return Err(format!("{label} digest mismatch"));
+    }
+    Ok(())
+}
+
+fn validate_new_command_fact(
+    state: &ProposalSession,
+    session: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if state.is_complete() {
+        return Err("proposal session is explicitly complete".into());
+    }
+    if matches!(
+        state.continuations.last(),
+        Some(ProposalContinuationState::Interrupted(_))
+    ) {
+        return Err("latest continuation is not terminal".into());
+    }
+    if matches!(
+        state
+            .command
+            .as_ref()
+            .and_then(|history| history.attempts.last()),
+        Some(CommandAttemptState::Interrupted(_))
+    ) {
+        return Err("latest approved command is interrupted/unknown".into());
+    }
+    let finished = state
+        .command
+        .as_ref()
+        .map_or(0, CommandHistory::finished_count);
+    if finished > state.continuations.len() {
+        return Err("latest finished command has no continuation".into());
+    }
+    for index in 0..state.proposals.len() {
+        let current = state.current(session, index)?;
+        if state.promotion_status(&current) != PromotionStatus::Promoted {
             return Err(format!(
-                "continuation {sequence} does not permit the later finished command"
+                "proposal {index} revision {} is not durably promoted",
+                current.revision
             )
             .into());
         }
     }
-    validate_continuation_artifacts(&session, state.continuations.len())?;
-    Ok(state)
+    Ok(())
 }
 
-fn validate_continuation_artifacts(
+fn validate_continuation_fact_start(
+    state: &ProposalSession,
     session: &Path,
-    reconstructed_count: usize,
+    sequence: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for entry in fs::read_dir(session)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        let sequence = [
-            (".qj", "continuation-"),
-            (".prompt", "continuation-"),
-            (".json", "continuation-"),
-            (".txt", "completion-"),
-        ]
-        .into_iter()
-        .find_map(|(suffix, prefix)| {
-            name.strip_prefix(prefix)
-                .and_then(|value| value.strip_suffix(suffix))
-                .and_then(|value| value.parse::<usize>().ok())
-        });
-        if sequence.is_some_and(|sequence| sequence > reconstructed_count) {
-            return Err(format!("orphaned continuation artifact `{name}`").into());
-        }
-        if let Some((_, revision)) = name
-            .strip_prefix("proposal-")
-            .and_then(|value| value.split_once(".revision-"))
-            && let Some(revision) = revision.strip_suffix(".candidate")
-            && let Ok(revision) = revision.parse::<usize>()
-            && revision >= 2
-            && revision - 1 > reconstructed_count
-        {
-            return Err(format!("orphaned continuation candidate `{name}`").into());
+    if state.is_complete() {
+        return Err("proposal session is explicitly complete".into());
+    }
+    if sequence != state.next_continuation_sequence()? {
+        return Err("continuation sequence does not follow session history".into());
+    }
+    validate_new_command_fact_for_continuation(state, session)?;
+    let finished = state
+        .command
+        .as_ref()
+        .ok_or("continuation requires approved command evidence")?;
+    if finished.finished_count() != usize::try_from(sequence)? {
+        return Err("continuation does not consume the latest finished command".into());
+    }
+    Ok(())
+}
+
+fn validate_new_command_fact_for_continuation(
+    state: &ProposalSession,
+    session: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for index in 0..state.proposals.len() {
+        let current = state.current(session, index)?;
+        if state.promotion_status(&current) != PromotionStatus::Promoted {
+            return Err(format!(
+                "proposal {index} revision {} is not durably promoted",
+                current.revision
+            )
+            .into());
         }
     }
     Ok(())
@@ -1840,12 +2233,6 @@ fn display_continuation(
     continuation: &ProposalContinuationState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match continuation {
-        ProposalContinuationState::Pending(request) => {
-            println!(
-                "continuation {}: pending model={}",
-                request.sequence, request.model
-            );
-        }
         ProposalContinuationState::Interrupted(request) => {
             println!(
                 "continuation {}: interrupted/unknown model={}",
@@ -1909,246 +2296,13 @@ fn display_proposal(candidate: &proposals::Proposal, path: &Path) {
     print!("{}", proposals::render_diff(candidate));
 }
 
-fn read_durable_proposal_turn(
-    journal: &Path,
-) -> Result<DurableProposalTurn, Box<dyn std::error::Error>> {
-    let fixtures = PathBuf::from(env!("QUARTZ_FIXTURE_DIR"));
-    let events = journal.with_extension("qe");
-    let mut runtime = Runtime::open_persistent(
-        proposal_limits(),
-        ComponentSpec::new("event-store", artifact(&fixtures, "event-store"))
-            .with_journal_paths(vec![journal.to_path_buf()])
-            .with_event_stream_paths(vec![events]),
-    )?;
-    let records = runtime.events();
-    let payload = |kind| -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
-        let matches: Vec<_> = records
-            .iter()
-            .filter(|event| event.value >> 56 == kind && ((event.value >> 48) & 0xff) == 1)
-            .collect();
-        if matches.len() > 1 {
-            return Err(format!(
-                "durable proposal turn has {} facts of kind {kind}; expected at most one",
-                matches.len()
-            )
-            .into());
-        }
-        matches
-            .first()
-            .map(|event| {
-                event
-                    .payload
-                    .as_ref()
-                    .map(|payload| payload.bytes.clone())
-                    .ok_or_else(|| {
-                        format!("durable proposal fact kind {kind} has no payload").into()
-                    })
-            })
-            .transpose()
-    };
-    let prompt = payload(1)?;
-    let response = payload(5)?;
-    let stop_count = records
-        .iter()
-        .filter(|event| event.value >> 56 == 7 && ((event.value >> 48) & 0xff) == 1)
-        .count();
-    let interrupted_count = records
-        .iter()
-        .filter(|event| event.value >> 56 == 8 && ((event.value >> 48) & 0xff) == 1)
-        .count();
-    runtime.shutdown_persistent()?;
-    if !runtime.is_observationally_clean() {
-        return Err("proposal reconstruction authority did not recover".into());
-    }
-    match (stop_count, interrupted_count, prompt, response) {
-        (0, 0 | 1, prompt, _) => Ok(DurableProposalTurn::Pending { prompt }),
-        (1, 0, Some(prompt), Some(response)) => {
-            Ok(DurableProposalTurn::Completed { prompt, response })
-        }
-        (1, 1, Some(prompt), None) => Ok(DurableProposalTurn::Interrupted { prompt }),
-        _ => Err("durable proposal turn has an invalid terminal fact sequence".into()),
-    }
-}
-
-fn command_journal_path(session: &Path) -> PathBuf {
-    session.join("command.qj")
-}
-
-fn command_fact_path(session: &Path, attempt: u64, kind: u64) -> Result<PathBuf, String> {
-    let label = match kind {
-        commands::COMMAND_STARTED_KIND => "started",
-        commands::COMMAND_FINISHED_KIND => "finished",
-        _ => return Err(format!("unsupported command fact kind {kind}")),
-    };
-    Ok(session.join(format!("command-{attempt}-{label}.json")))
-}
-
-fn command_event_value(kind: u64, attempt: u64) -> Result<u64, String> {
-    if kind > 0xff || attempt == 0 || attempt >= (1_u64 << 56) {
-        return Err("command event value is out of range".into());
-    }
-    Ok((kind << 56) | attempt)
-}
-
-fn append_command_fact(
-    session: &Path,
-    kind: u64,
-    attempt: u64,
-    bytes: &[u8],
-) -> Result<(), Box<dyn std::error::Error>> {
-    let fixtures = PathBuf::from(env!("QUARTZ_FIXTURE_DIR"));
-    let journal = command_journal_path(session);
-    let events = journal.with_extension("qe");
-    let fact = command_fact_path(session, attempt, kind)?;
-    commands::materialize_fact(&fact, bytes)?;
-    let value = command_event_value(kind, attempt)?;
-    let mut runtime = Runtime::open_persistent(
-        proposal_limits(),
-        ComponentSpec::new("event-store", artifact(&fixtures, "event-store"))
-            .with_journal_paths(vec![journal])
-            .with_event_stream_paths(vec![events]),
-    )?;
-    runtime.apply_tree(ComponentTree {
-        roots: vec![
-            ComponentSpec::new("command-fact", artifact(&fixtures, "candidate-appender"))
-                .with_config(value)
-                .with_event_grants(vec![EventGrant::new(
-                    commands::COMMAND_EVENT_NAMESPACE,
-                    commands::COMMAND_EVENT_NAME,
-                    commands::COMMAND_EVENT_REVISION,
-                )])
-                .with_snapshot_grants(vec![SnapshotGrant::from_file(
-                    &fact,
-                    format!("Command fact {kind} attempt {attempt}"),
-                )?]),
-        ],
-    })?;
-    let matching = runtime
-        .events()
-        .into_iter()
-        .filter(|event| event.value == value)
-        .collect::<Vec<_>>();
-    if matching.len() != 1
-        || matching[0]
-            .payload
-            .as_ref()
-            .is_none_or(|payload| payload.bytes != bytes)
-    {
-        return Err("approved command fact did not commit exactly once".into());
-    }
-    runtime.shutdown_persistent()?;
-    if !runtime.is_observationally_clean() {
-        return Err("approved command fact authority did not recover".into());
-    }
-    Ok(())
-}
-
-fn read_command_history(
-    session: &Path,
-) -> Result<Option<CommandHistory>, Box<dyn std::error::Error>> {
-    let journal = command_journal_path(session);
-    if !journal.exists() {
-        return Ok(None);
-    }
-    let fixtures = PathBuf::from(env!("QUARTZ_FIXTURE_DIR"));
-    let events = journal.with_extension("qe");
-    let mut runtime = Runtime::open_persistent(
-        proposal_limits(),
-        ComponentSpec::new("event-store", artifact(&fixtures, "event-store"))
-            .with_journal_paths(vec![journal])
-            .with_event_stream_paths(vec![events]),
-    )?;
-    let records = runtime.events();
-    runtime.shutdown_persistent()?;
-    if !runtime.is_observationally_clean() {
-        return Err("approved command reconstruction authority did not recover".into());
-    }
-    let mut attempts = Vec::new();
-    for record in records {
-        if record.event
-            != EventGrant::new(
-                commands::COMMAND_EVENT_NAMESPACE,
-                commands::COMMAND_EVENT_NAME,
-                commands::COMMAND_EVENT_REVISION,
-            )
-        {
-            return Err("approved command stream contains another event identity".into());
-        }
-        let kind = record.value >> 56;
-        let attempt = record.value & ((1_u64 << 56) - 1);
-        let payload = record
-            .payload
-            .ok_or("approved command event has no durable payload")?
-            .bytes;
-        commands::materialize_fact(&command_fact_path(session, attempt, kind)?, &payload)?;
-        match kind {
-            commands::COMMAND_STARTED_KIND => {
-                let started = commands::CommandStarted::from_bytes(&payload)?;
-                if started.attempt != attempt
-                    || attempt != u64::try_from(attempts.len())?.saturating_add(1)
-                {
-                    return Err("approved command starts have an invalid attempt sequence".into());
-                }
-                attempts.push(CommandAttemptState::Interrupted(started));
-            }
-            commands::COMMAND_FINISHED_KIND => {
-                let Some(CommandAttemptState::Interrupted(started)) = attempts.last() else {
-                    return Err("CommandFinished has no matching CommandStarted".into());
-                };
-                if started.attempt != attempt {
-                    return Err("CommandFinished attempt does not match the latest start".into());
-                }
-                let finished = commands::CommandFinished::from_bytes(&payload, started)?;
-                let started = started.clone();
-                *attempts.last_mut().expect("matching start exists") =
-                    CommandAttemptState::Finished { started, finished };
-            }
-            _ => {
-                return Err(format!("approved command stream has unknown fact kind {kind}").into());
-            }
-        }
-    }
-    if attempts.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(CommandHistory { attempts }))
-    }
-}
-
 fn run_approved_command(
     session: &Path,
     argv: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let session = fs::canonicalize(session)?;
     let state = reconstruct_proposal_session(&session)?;
-    if state.is_complete() {
-        return Err("proposal session is explicitly complete".into());
-    }
-    match state.continuations.last() {
-        Some(ProposalContinuationState::Pending(_)) => {
-            return Err("pending continuation must finish before another command".into());
-        }
-        Some(ProposalContinuationState::Interrupted(_)) => {
-            return Err("interrupted/unknown continuation blocks later commands".into());
-        }
-        Some(ProposalContinuationState::Completed {
-            response: proposals::ContinuationResponse::Complete(_),
-            ..
-        }) => {
-            return Err("proposal session is explicitly complete".into());
-        }
-        Some(ProposalContinuationState::Completed {
-            response: proposals::ContinuationResponse::Proposal { .. },
-            ..
-        })
-        | None => {}
-    }
-    if let Some(history) = &state.command
-        && history.finished_count() != state.continuations.len()
-    {
-        return Err("latest finished command requires a model continuation".into());
-    }
-    require_current_proposals_promoted(&session, &state)?;
+    validate_new_command_fact(&state, &session)?;
     let attempt = match &state.command {
         Some(history) => history.next_attempt()?,
         None => 1,
@@ -2162,22 +2316,25 @@ fn run_approved_command(
         .collect::<Vec<_>>();
     let started = commands::CommandStarted::new(attempt, argv, &repository, &admitted_paths)?;
     let started_bytes = started.to_bytes()?;
-    append_command_fact(
-        &session,
-        commands::COMMAND_STARTED_KIND,
+    let started_payload = String::from_utf8(started_bytes)?;
+    let mut session_log = session::SessionLog::open(&session)?;
+    session_log.append(session::SessionFact::CommandStarted {
         attempt,
-        &started_bytes,
-    )?;
+        payload_sha256: session::sha256(started_payload.as_bytes()),
+        payload: started_payload,
+    })?;
+
     let execution = commands::execute(&started);
     let repository_after = commands::RepositoryIdentity::capture(&repository, &admitted_paths)?;
     let finished = commands::CommandFinished::new(&started, execution, repository_after)?;
     let finished_bytes = finished.to_bytes()?;
-    append_command_fact(
-        &session,
-        commands::COMMAND_FINISHED_KIND,
+    let finished_payload = String::from_utf8(finished_bytes)?;
+    session_log.append(session::SessionFact::CommandFinished {
         attempt,
-        &finished_bytes,
-    )?;
+        start_sha256: started.sha256()?,
+        payload_sha256: session::sha256(finished_payload.as_bytes()),
+        payload: finished_payload,
+    })?;
     let reconstructed = reconstruct_proposal_session(&session)?;
     display_proposals(&session, &reconstructed)?;
     Ok(())
@@ -2204,12 +2361,6 @@ fn validate_continuation_start(
     state: &ProposalSession,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match state.continuations.last() {
-        Some(ProposalContinuationState::Pending(request)) => {
-            if request.model != model {
-                return Err("durable continuation belongs to another model".into());
-            }
-            return Ok(());
-        }
         Some(ProposalContinuationState::Interrupted(request)) => {
             if request.model != model {
                 return Err("durable continuation belongs to another model".into());
@@ -2247,34 +2398,56 @@ fn run_proposal_continuation_with_adapter(
     let session = fs::canonicalize(session)?;
     let state = reconstruct_proposal_session(&session)?;
     validate_continuation_start(model, &state)?;
-    let request = match state.continuations.last() {
-        Some(ProposalContinuationState::Pending(request)) => request.clone(),
-        _ => {
-            let sequence = state.next_continuation_sequence()?;
-            let current = state.generations_before_continuation(&session, sequence)?;
-            let finished = state
-                .command
-                .as_ref()
-                .ok_or("proposal session has no approved command")?
-                .finished(sequence)?;
-            proposals::Continuation::new(
-                sequence,
-                model,
-                &state.admission,
-                &current,
-                finished,
-                &repository_root()?,
-            )?
-        }
-    };
+    let sequence = state.next_continuation_sequence()?;
+    let current = state.generations_before_continuation(&session, sequence)?;
+    let finished = state
+        .command
+        .as_ref()
+        .ok_or("proposal session has no approved command")?
+        .finished(sequence)?;
+    let request = proposals::Continuation::new(
+        sequence,
+        model,
+        &state.admission,
+        &current,
+        finished,
+        &repository_root()?,
+    )?;
     let prompt_bytes = request.prompt_bytes()?;
+    let prompt_text = String::from_utf8(prompt_bytes.clone())?;
     let prompt = proposals::continuation_prompt_path(&session, request.sequence);
     proposals::materialize_continuation_prompt(&session, request.sequence, &prompt_bytes)?;
     let journal = proposals::continuation_journal_path(&session, request.sequence);
+    let mut session_log = session::SessionLog::open(&session)?;
+    let prompt_sha256 = session::sha256(&prompt_bytes);
+    session_log.append(session::SessionFact::ModelStarted {
+        turn: session::ModelTurn::Continuation { sequence },
+        model: model.to_owned(),
+        prompt_sha256: prompt_sha256.clone(),
+        prompt: prompt_text,
+    })?;
     let (response, provenance) =
         run_exchange_turn_with_limits(&prompt, &journal, adapter, proposal_limits())?;
-    let response = proposals::parse_continuation_response(&response, &request)?;
-    proposals::materialize_continuation_response(&session, &request, &response)?;
+    let response_text = String::from_utf8(response)?;
+    let parsed = proposals::parse_continuation_response(response_text.as_bytes(), &request)?;
+    let response_sha256 = session::sha256(response_text.as_bytes());
+    let fact = match parsed {
+        proposals::ContinuationResponse::Complete(_) => session::SessionFact::TaskCompleted {
+            sequence,
+            prompt_sha256,
+            response_sha256,
+            response: response_text,
+            provenance: provenance.clone(),
+        },
+        proposals::ContinuationResponse::Proposal { .. } => session::SessionFact::ModelCompleted {
+            turn: session::ModelTurn::Continuation { sequence },
+            prompt_sha256,
+            response_sha256,
+            response: response_text,
+            provenance: provenance.clone(),
+        },
+    };
+    session_log.append(fact)?;
     let reconstructed = reconstruct_proposal_session(&session)?;
     display_proposals(&session, &reconstructed)?;
     println!("response provenance: {provenance}");
@@ -2282,40 +2455,6 @@ fn run_proposal_continuation_with_adapter(
         "continuation {} reconstructed; approved command was not rerun",
         request.sequence
     );
-    Ok(())
-}
-
-fn require_current_proposals_promoted(
-    session: &Path,
-    state: &ProposalSession,
-) -> Result<(), Box<dyn std::error::Error>> {
-    for generation in state.current_generations(session)? {
-        let current = state.current(session, generation.proposal_index)?;
-        if fs::read(&current.path)? != current.proposal.content {
-            return Err(format!(
-                "proposal {} current candidate cache changed",
-                generation.proposal_index
-            )
-            .into());
-        }
-        let (journal, mutation) =
-            proposal_promotion_paths(session, generation.proposal_index, generation.revision);
-        if !journal.is_file() || !mutation.is_file() {
-            return Err(format!(
-                "proposal {} revision {} has not been explicitly promoted",
-                generation.proposal_index, generation.revision
-            )
-            .into());
-        }
-        let source = proposals::resolve_source(&repository_root()?, &current.proposal.path)?;
-        if digest(&fs::read(source)?) != current.proposal.result_sha256 {
-            return Err(format!(
-                "proposal {} promoted source no longer matches its current generation",
-                generation.proposal_index
-            )
-            .into());
-        }
-    }
     Ok(())
 }
 
@@ -2355,8 +2494,21 @@ fn run_proposal_promotion(session: &Path, index: usize) -> Result<(), Box<dyn st
         return Err("proposal session is explicitly complete".into());
     }
     let current = state.current(&session, index)?;
+    match state.promotion_status(&current) {
+        PromotionStatus::Promoted => {
+            display_proposals(&session, &state)?;
+            println!("proposal {index} promotion reconstructed; no mutation emitted");
+            return Ok(());
+        }
+        PromotionStatus::Interrupted => {
+            return Err(
+                "proposal promotion ended interrupted/unknown; it will not be retried".into(),
+            );
+        }
+        PromotionStatus::Absent | PromotionStatus::Approved => {}
+    }
     let candidate = current.proposal;
-    let candidate_path = current.path;
+    let candidate_path = current.path.clone();
     let repository_root = repository_root()?;
     let source = proposals::resolve_source(&repository_root, &candidate.path)?;
     if fs::read(&candidate_path)? != candidate.content {
@@ -2375,6 +2527,21 @@ fn run_proposal_promotion(session: &Path, index: usize) -> Result<(), Box<dyn st
         .into());
     }
     let operation = proposal_operation(index, current.revision)?;
+    let mut session_log = session::SessionLog::open(&session)?;
+    if state.promotion_status(&current) == PromotionStatus::Absent {
+        session_log.append(session::SessionFact::ProposalApproved {
+            proposal_index: index,
+            revision: current.revision,
+            candidate_sha256: candidate.result_sha256.clone(),
+        })?;
+    }
+    session_log.append(session::SessionFact::PromotionStarted {
+        proposal_index: index,
+        revision: current.revision,
+        candidate_sha256: candidate.result_sha256.clone(),
+        operation,
+    })?;
+
     let fixtures = PathBuf::from(env!("QUARTZ_FIXTURE_DIR"));
     let persistence = || {
         ComponentSpec::new("journal", artifact(&fixtures, "journal"))
@@ -2388,7 +2555,6 @@ fn run_proposal_promotion(session: &Path, index: usize) -> Result<(), Box<dyn st
         operation,
         candidate,
     )?;
-
     let mut runtime = Runtime::open_persistent(proposal_limits(), persistence())?;
     runtime.apply_tree(desired)?;
     active_id(&runtime, "root/promoter")?;
@@ -2406,6 +2572,14 @@ fn run_proposal_promotion(session: &Path, index: usize) -> Result<(), Box<dyn st
     if !restarted.is_observationally_clean() || fs::read(&source)? != candidate.content {
         return Err(format!("proposal {index} did not retain a clean promotion").into());
     }
+    session_log.append(session::SessionFact::ProposalPromoted {
+        proposal_index: index,
+        revision: current.revision,
+        candidate_sha256: candidate.result_sha256.clone(),
+        operation,
+    })?;
+    let reconstructed = reconstruct_proposal_session(&session)?;
+    display_proposals(&session, &reconstructed)?;
     println!(
         "proposal {index} promoted: {} result_sha256={} restart=verified context=clean",
         candidate.path, candidate.result_sha256
@@ -3175,7 +3349,6 @@ mod proposal_runtime_tests {
                 admitted("beta.txt", b"beta\n"),
             ],
         };
-        let base_prompt = admission.prompt_bytes().unwrap();
         let base_response = serde_json::to_vec(&serde_json::json!({
             "proposals": [
                 {
@@ -3191,21 +3364,7 @@ mod proposal_runtime_tests {
             ]
         }))
         .unwrap();
-        let base_prompt_path = session.join("admission.prompt");
-        fs::write(&base_prompt_path, &base_prompt).unwrap();
-        let base_calls = Arc::new(AtomicU64::new(0));
-        run_exchange_turn_with_limits(
-            &base_prompt_path,
-            &session.join("turn.qj"),
-            Arc::new(FixedExchange::success(
-                "base-revision-test",
-                base_prompt,
-                base_response,
-                base_calls.clone(),
-            )),
-            proposal_limits(),
-        )
-        .unwrap();
+        initialize_proposal_session(&session, &admission, &base_response);
         let (_, proposals) = reconstruct_base_proposals(&session).unwrap();
         let revision = proposals::Revision::new(
             "test-model",
@@ -3224,32 +3383,37 @@ mod proposal_runtime_tests {
             }
         }))
         .unwrap();
-        let revision_prompt_path =
-            proposals::materialize_revision_prompt(&session, &revision_prompt).unwrap();
-        let revision_calls = Arc::new(AtomicU64::new(0));
-        let revision_adapter = Arc::new(FixedExchange::success(
-            "correction-revision-test",
-            revision_prompt,
-            revision_response,
-            revision_calls.clone(),
-        ));
-        let revision_journal = proposals::revision_journal_path(&session);
-        run_exchange_turn_with_limits(
-            &revision_prompt_path,
-            &revision_journal,
-            revision_adapter.clone(),
-            proposal_limits(),
-        )
+        let mut log = session::SessionLog::open(&session).unwrap();
+        log.append(session::SessionFact::ProposalRejected {
+            proposal_index: 0,
+            revision: 0,
+            candidate_sha256: proposals[0].result_sha256.clone(),
+            model: "test-model".into(),
+            feedback: "Use the corrected alpha label.".into(),
+        })
         .unwrap();
-        run_exchange_turn_with_limits(
-            &revision_prompt_path,
-            &revision_journal,
-            revision_adapter,
-            proposal_limits(),
-        )
+        let revision_prompt_sha256 = session::sha256(&revision_prompt);
+        log.append(session::SessionFact::ModelStarted {
+            turn: session::ModelTurn::Revision {
+                proposal_index: 0,
+                revision: 1,
+            },
+            model: "test-model".into(),
+            prompt_sha256: revision_prompt_sha256.clone(),
+            prompt: String::from_utf8(revision_prompt).unwrap(),
+        })
         .unwrap();
-        assert_eq!(base_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(revision_calls.load(Ordering::Relaxed), 1);
+        log.append(session::SessionFact::ModelCompleted {
+            turn: session::ModelTurn::Revision {
+                proposal_index: 0,
+                revision: 1,
+            },
+            prompt_sha256: revision_prompt_sha256,
+            response_sha256: session::sha256(&revision_response),
+            response: String::from_utf8(revision_response).unwrap(),
+            provenance: "test:revision".into(),
+        })
+        .unwrap();
 
         let state = reconstruct_proposal_session(&session).unwrap();
         let current = state.current(&session, 0).unwrap();
@@ -3266,6 +3430,159 @@ mod proposal_runtime_tests {
         assert!(proposals::revision_candidate_path(&session, 0).is_file());
         assert!(session.join("revision-1.json").is_file());
         fs::remove_dir_all(session).unwrap();
+    }
+
+    #[test]
+    fn started_only_initial_turn_is_terminal_on_restart() {
+        let session = temporary_directory();
+        let admission = proposals::Admission {
+            task: "initial interruption".into(),
+            files: vec![
+                admitted("alpha.txt", b"alpha\n"),
+                admitted("beta.txt", b"beta\n"),
+            ],
+        };
+        let prompt = admission.prompt_bytes().unwrap();
+        let mut log = session::SessionLog::open(&session).unwrap();
+        log.append(session::SessionFact::ModelStarted {
+            turn: session::ModelTurn::Initial,
+            model: "test-model".into(),
+            prompt_sha256: session::sha256(&prompt),
+            prompt: String::from_utf8(prompt).unwrap(),
+        })
+        .unwrap();
+        assert!(reconstruct_proposal_session(&session).is_err());
+        let before = log.facts().len();
+        assert!(
+            run_multi_proposal(
+                "test-model",
+                Path::new("unused-task"),
+                &session,
+                &[PathBuf::from("unused-a"), PathBuf::from("unused-b")],
+            )
+            .is_err()
+        );
+        assert_eq!(
+            session::SessionLog::open(&session).unwrap().facts().len(),
+            before
+        );
+        fs::remove_dir_all(session).unwrap();
+    }
+
+    #[test]
+    fn started_only_revision_and_promotion_are_terminal_on_restart() {
+        let revision_session = temporary_directory();
+        let admission = proposals::Admission {
+            task: "revision interruption".into(),
+            files: vec![
+                admitted("alpha.txt", b"alpha\n"),
+                admitted("beta.txt", b"beta\n"),
+            ],
+        };
+        let response = serde_json::to_vec(&serde_json::json!({
+            "proposals": [
+                {
+                    "path": "alpha.txt",
+                    "before_sha256": admission.files[0].before_sha256,
+                    "content": "alpha proposed\n"
+                },
+                {
+                    "path": "beta.txt",
+                    "before_sha256": admission.files[1].before_sha256,
+                    "content": "beta proposed\n"
+                }
+            ]
+        }))
+        .unwrap();
+        initialize_proposal_session(&revision_session, &admission, &response);
+        let state = reconstruct_proposal_session(&revision_session).unwrap();
+        let request = proposals::Revision::new(
+            "test-model",
+            b"correct alpha",
+            &state.admission,
+            &state.proposals,
+            0,
+        )
+        .unwrap();
+        let prompt = request.prompt_bytes().unwrap();
+        let mut log = session::SessionLog::open(&revision_session).unwrap();
+        log.append(session::SessionFact::ProposalRejected {
+            proposal_index: 0,
+            revision: 0,
+            candidate_sha256: state.proposals[0].result_sha256.clone(),
+            model: "test-model".into(),
+            feedback: "correct alpha".into(),
+        })
+        .unwrap();
+        log.append(session::SessionFact::ModelStarted {
+            turn: session::ModelTurn::Revision {
+                proposal_index: 0,
+                revision: 1,
+            },
+            model: "test-model".into(),
+            prompt_sha256: session::sha256(&prompt),
+            prompt: String::from_utf8(prompt).unwrap(),
+        })
+        .unwrap();
+        let restarted = reconstruct_proposal_session(&revision_session).unwrap();
+        assert!(matches!(
+            restarted.revision,
+            Some(ProposalRevisionState::Interrupted(_))
+        ));
+        let before = log.facts().len();
+        assert!(
+            run_proposal_revision(
+                "test-model",
+                &revision_session,
+                0,
+                &revision_session.join("unused-feedback"),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            session::SessionLog::open(&revision_session)
+                .unwrap()
+                .facts()
+                .len(),
+            before
+        );
+        fs::remove_dir_all(revision_session).unwrap();
+
+        let promotion_session = temporary_directory();
+        initialize_proposal_session(&promotion_session, &admission, &response);
+        let state = reconstruct_proposal_session(&promotion_session).unwrap();
+        let current = state.current(&promotion_session, 0).unwrap();
+        let operation = proposal_operation(0, current.revision).unwrap();
+        let mut log = session::SessionLog::open(&promotion_session).unwrap();
+        log.append(session::SessionFact::ProposalApproved {
+            proposal_index: 0,
+            revision: current.revision,
+            candidate_sha256: current.proposal.result_sha256.clone(),
+        })
+        .unwrap();
+        log.append(session::SessionFact::PromotionStarted {
+            proposal_index: 0,
+            revision: current.revision,
+            candidate_sha256: current.proposal.result_sha256.clone(),
+            operation,
+        })
+        .unwrap();
+        let restarted = reconstruct_proposal_session(&promotion_session).unwrap();
+        let current = restarted.current(&promotion_session, 0).unwrap();
+        assert_eq!(
+            restarted.promotion_status(&current),
+            PromotionStatus::Interrupted
+        );
+        let before = log.facts().len();
+        assert!(run_proposal_promotion(&promotion_session, 0).is_err());
+        assert_eq!(
+            session::SessionLog::open(&promotion_session)
+                .unwrap()
+                .facts()
+                .len(),
+            before
+        );
+        fs::remove_dir_all(promotion_session).unwrap();
     }
 
     #[test]
@@ -3288,10 +3605,6 @@ mod proposal_runtime_tests {
             run_exchange_turn_with_limits(&prompt, &journal, adapter, proposal_limits()).is_err()
         );
         assert_eq!(calls.load(Ordering::Relaxed), 1);
-        assert!(matches!(
-            read_durable_proposal_turn(&journal).unwrap(),
-            DurableProposalTurn::Interrupted { .. }
-        ));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3406,14 +3719,6 @@ mod proposal_runtime_tests {
             )),
         )
         .unwrap();
-        for (attempt, kind) in [
-            (1, commands::COMMAND_STARTED_KIND),
-            (1, commands::COMMAND_FINISHED_KIND),
-            (2, commands::COMMAND_STARTED_KIND),
-            (2, commands::COMMAND_FINISHED_KIND),
-        ] {
-            fs::remove_file(command_fact_path(&session, attempt, kind).unwrap()).unwrap();
-        }
         fs::remove_file(proposals::continuation_prompt_path(&session, 1)).unwrap();
         fs::remove_file(session.join("continuation-1.json")).unwrap();
         fs::remove_file(proposals::continuation_candidate_path(&session, 0, 2)).unwrap();
@@ -3448,6 +3753,70 @@ mod proposal_runtime_tests {
         assert!(run_proposal_promotion(&session, 0).is_err());
         assert!(run_proposal_revision("test-model", &session, 0, &root.join("unused")).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn command_sequence_and_terminal_identity_tampering_fail_closed() {
+        let (sequence_root, sequence_session, _) = promoted_session("command-sequence-tamper");
+        let sequence_state = reconstruct_proposal_session(&sequence_session).unwrap();
+        let paths = sequence_state
+            .admission
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        let out_of_sequence = commands::CommandStarted::new(
+            2,
+            vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+            &repository_root().unwrap(),
+            &paths,
+        )
+        .unwrap();
+        let payload = String::from_utf8(out_of_sequence.to_bytes().unwrap()).unwrap();
+        session::SessionLog::open(&sequence_session)
+            .unwrap()
+            .append(session::SessionFact::CommandStarted {
+                attempt: 2,
+                payload_sha256: session::sha256(payload.as_bytes()),
+                payload,
+            })
+            .unwrap();
+        assert!(reconstruct_proposal_session(&sequence_session).is_err());
+        fs::remove_dir_all(sequence_root).unwrap();
+
+        let (identity_root, identity_session, _) = promoted_session("command-identity-tamper");
+        let identity_state = reconstruct_proposal_session(&identity_session).unwrap();
+        let paths = identity_state
+            .admission
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        let started = commands::CommandStarted::new(
+            1,
+            vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+            &repository_root().unwrap(),
+            &paths,
+        )
+        .unwrap();
+        let payload = String::from_utf8(started.to_bytes().unwrap()).unwrap();
+        let mut log = session::SessionLog::open(&identity_session).unwrap();
+        log.append(session::SessionFact::CommandStarted {
+            attempt: 1,
+            payload_sha256: session::sha256(payload.as_bytes()),
+            payload,
+        })
+        .unwrap();
+        let terminal_payload = "{}";
+        log.append(session::SessionFact::CommandFinished {
+            attempt: 1,
+            start_sha256: "0".repeat(64),
+            payload_sha256: session::sha256(terminal_payload.as_bytes()),
+            payload: terminal_payload.into(),
+        })
+        .unwrap();
+        assert!(reconstruct_proposal_session(&identity_session).is_err());
+        fs::remove_dir_all(identity_root).unwrap();
     }
 
     #[test]
@@ -3510,12 +3879,35 @@ mod proposal_runtime_tests {
                 ..
             })
         ));
+        let log = session::SessionLog::open(&session).unwrap();
+        let kinds = log
+            .facts()
+            .iter()
+            .map(|record| session_fact_kind(&record.fact))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                "model-started",
+                "model-completed",
+                "proposal-approved",
+                "promotion-started",
+                "proposal-promoted",
+                "proposal-approved",
+                "promotion-started",
+                "proposal-promoted",
+                "command-started",
+                "command-finished",
+                "model-started",
+                "task-completed",
+            ]
+        );
         assert!(run_proposal_continuation("test-model", &session).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn interrupted_command_reconstruction_never_spawns_without_new_approval() {
+    fn interrupted_command_reconstruction_blocks_later_facts() {
         let (root, session, _) = promoted_session("interrupted-command");
         let marker = root.join("must-not-exist");
         let state = reconstruct_proposal_session(&session).unwrap();
@@ -3536,13 +3928,15 @@ mod proposal_runtime_tests {
             &paths,
         )
         .unwrap();
-        append_command_fact(
-            &session,
-            commands::COMMAND_STARTED_KIND,
-            1,
-            &started.to_bytes().unwrap(),
-        )
-        .unwrap();
+        let payload = String::from_utf8(started.to_bytes().unwrap()).unwrap();
+        session::SessionLog::open(&session)
+            .unwrap()
+            .append(session::SessionFact::CommandStarted {
+                attempt: 1,
+                payload_sha256: session::sha256(payload.as_bytes()),
+                payload,
+            })
+            .unwrap();
         for _ in 0..2 {
             let restarted = reconstruct_proposal_session(&session).unwrap();
             assert!(matches!(
@@ -3552,36 +3946,33 @@ mod proposal_runtime_tests {
         }
         assert!(run_proposal_continuation("test-model", &session).is_err());
         assert!(!marker.exists());
-        run_approved_command(
-            &session,
-            vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
-        )
-        .unwrap();
-        let renewed = reconstruct_proposal_session(&session).unwrap();
-        assert_eq!(renewed.command.as_ref().unwrap().attempts.len(), 2);
-        assert!(matches!(
-            renewed.command.as_ref().unwrap().attempts[0],
-            CommandAttemptState::Interrupted(_)
-        ));
-        assert!(matches!(
-            renewed.command.as_ref().unwrap().attempts[1],
-            CommandAttemptState::Finished { .. }
-        ));
-        let current = renewed
-            .generations_before_continuation(&session, 1)
-            .unwrap();
-        let continuation = proposals::Continuation::new(
-            1,
-            "test-model",
-            &renewed.admission,
-            &current,
-            renewed.command.as_ref().unwrap().latest_finished().unwrap(),
-            &repository_root().unwrap(),
-        )
-        .unwrap();
-        assert_eq!(continuation.sequence, 1);
-        assert_eq!(continuation.command.attempt, 2);
+        let fact_count = session::SessionLog::open(&session).unwrap().facts().len();
+        assert!(
+            run_approved_command(
+                &session,
+                vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!("touch {}", marker.display()),
+                ],
+            )
+            .is_err()
+        );
         assert!(!marker.exists());
+        assert_eq!(
+            session::SessionLog::open(&session).unwrap().facts().len(),
+            fact_count
+        );
+        let current = state.current(&session, 0).unwrap();
+        session::SessionLog::open(&session)
+            .unwrap()
+            .append(session::SessionFact::ProposalApproved {
+                proposal_index: 0,
+                revision: current.revision,
+                candidate_sha256: current.proposal.result_sha256.clone(),
+            })
+            .unwrap();
+        assert!(reconstruct_proposal_session(&session).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3694,7 +4085,6 @@ mod proposal_runtime_tests {
                 admitted(&paths[1], b"beta original\n"),
             ],
         };
-        let prompt = admission.prompt_bytes().unwrap();
         let response = serde_json::to_vec(&serde_json::json!({
             "proposals": [
                 {
@@ -3710,21 +4100,7 @@ mod proposal_runtime_tests {
             ]
         }))
         .unwrap();
-        let prompt_path = session.join("admission.prompt");
-        fs::write(&prompt_path, &prompt).unwrap();
-        run_exchange_turn_with_limits(
-            &prompt_path,
-            &session.join("turn.qj"),
-            Arc::new(FixedExchange::success(
-                "promoted-session-base",
-                prompt,
-                response,
-                Arc::new(AtomicU64::new(0)),
-            )),
-            proposal_limits(),
-        )
-        .unwrap();
-        reconstruct_proposal_session(&session).unwrap();
+        initialize_proposal_session(&session, &admission, &response);
         run_proposal_promotion(&session, 0).unwrap();
         run_proposal_promotion(&session, 1).unwrap();
         (root, session, sources)
@@ -3781,6 +4157,47 @@ mod proposal_runtime_tests {
                 usage: 1,
             })
         }
+    }
+
+    fn session_fact_kind(fact: &session::SessionFact) -> &'static str {
+        match fact {
+            session::SessionFact::ModelStarted { .. } => "model-started",
+            session::SessionFact::ModelCompleted { .. } => "model-completed",
+            session::SessionFact::ProposalRejected { .. } => "proposal-rejected",
+            session::SessionFact::ProposalApproved { .. } => "proposal-approved",
+            session::SessionFact::PromotionStarted { .. } => "promotion-started",
+            session::SessionFact::ProposalPromoted { .. } => "proposal-promoted",
+            session::SessionFact::CommandStarted { .. } => "command-started",
+            session::SessionFact::CommandFinished { .. } => "command-finished",
+            session::SessionFact::TaskCompleted { .. } => "task-completed",
+        }
+    }
+
+    fn initialize_proposal_session(
+        session: &Path,
+        admission: &proposals::Admission,
+        response: &[u8],
+    ) {
+        let prompt = admission.prompt_bytes().unwrap();
+        fs::write(session.join("admission.prompt"), &prompt).unwrap();
+        let prompt_sha256 = session::sha256(&prompt);
+        let mut log = session::SessionLog::open(session).unwrap();
+        log.append(session::SessionFact::ModelStarted {
+            turn: session::ModelTurn::Initial,
+            model: "test-model".into(),
+            prompt_sha256: prompt_sha256.clone(),
+            prompt: String::from_utf8(prompt).unwrap(),
+        })
+        .unwrap();
+        log.append(session::SessionFact::ModelCompleted {
+            turn: session::ModelTurn::Initial,
+            prompt_sha256,
+            response_sha256: session::sha256(response),
+            response: String::from_utf8(response.to_vec()).unwrap(),
+            provenance: "test:initial".into(),
+        })
+        .unwrap();
+        reconstruct_proposal_session(session).unwrap();
     }
 
     fn admitted(path: &str, content: &[u8]) -> proposals::AdmittedFile {

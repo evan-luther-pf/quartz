@@ -115,20 +115,20 @@ candidate, exchange, and mutation-ledger records remain honestly external.
 
 The production CLI composes the credentialed exchange, durable event,
 workspace, mutation, promotion, and approved-command capabilities into one
-bounded repository task. It admits a small exact source set, reconstructs
-proposal generations without credentials, renders diffs for separate approval,
-promotes only current generations, synchronizes each user-approved command
-before one spawn, and commits bounded terminal evidence. One sequence-numbered
-continuation consumes each finished command and returns either one corrected
-candidate or explicit completion. Restart reconstructs repeated correction and
-validation cycles without rerunning a command or model exchange.
+bounded repository task. One `session.qe` event stream is its authoritative
+history. A strict reducer derives proposal generations, decisions, promotions,
+command attempts, continuations, and completion only from ordered checksummed
+facts. Every external operation commits a bound start before emission; a
+started-only operation remains interrupted/unknown and blocks later facts.
+Credential-free restart rebuilds disposable render caches and reconstructs
+repeated correction and validation cycles without rerunning a command or model
+exchange.
 
 The current implementation uses complete-file candidates, a two-or-three-source
-ceiling, host-only path selection, parallel ledgers, and filename-derived
-session state. These are implementation constraints, not permanent product
-invariants. Planned clean cutovers replace them with one append-only session
-log, digest-anchored ranged edits, and a host-admitted canonical path/digest
-manifest selected only by numeric index.
+ceiling, and host-only path selection. These are implementation constraints, not
+permanent product invariants. Planned clean cutovers replace them with
+digest-anchored ranged edits and a host-admitted canonical path/digest manifest
+selected only by numeric index.
 
 The repository-task state machine, response grammar, candidate reconstruction,
 dispatch policy, and review sequencing are currently native executable code.
@@ -138,23 +138,25 @@ filesystem/process operations, and terminal I/O are the only justified native
 parts of that path. The orchestrator must move behind the public component
 contract before the product surface expands.
 
-Focused repository-loop contracts pass 28 tests, and the workspace passes 87
+Focused repository-loop contracts pass 34 tests, and the workspace passes 93
 tests across 12 suites. The latest credentialed dogfood scenario exercised a
 failed command, one reviewed and promoted correction, a successful command,
-explicit completion, and credential-free causal reconstruction. Kernel source,
-WIT, ABI, module manifests, and package dependencies remained unchanged.
+explicit completion, credential-free causal reconstruction after render-cache
+deletion, and post-completion action rejection. WIT, component ABI 10, and
+module manifests remain unchanged; the kernel adds one schema-agnostic
+`DurableEventLog` wrapper, and `quartz` directly imports workspace `serde` for
+strict session facts.
 
 ## Next boundary
 
-The next boundary is one authoritative append-only session log. Proposal turns,
-revisions, command starts and terminals, continuations, approvals, rejections,
-promotions, and completion become facts in that log; task state is derived from
-facts rather than parallel ledgers or filenames. Started external work without
-a terminal fact remains interrupted/unknown. Crash injection must exercise every
-fsync boundary before this slice closes.
+The next boundary is digest-anchored ranged edits. Every candidate carries the
+admitted source digest, exact byte range, replacement bytes, and expected result
+digest. Promotion applies the range only when the live source still matches the
+admitted digest, and review renders the range without reconstructing task state
+from filenames.
 
-Ranged edits, component-owned orchestration, an admitted path/digest manifest,
-and terminal diff review follow in that order. Tool invocation remains closed:
+Component-owned orchestration, an admitted path/digest manifest, and terminal
+diff review follow. Tool invocation remains closed:
 no model-selected tool, executable, argument vector, ambient shell authority,
 automatic retry, or general conversation loop is committed.
 

@@ -9,11 +9,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(crate) const COMMAND_EVENT_NAMESPACE: &str = "quartz.command";
-pub(crate) const COMMAND_EVENT_NAME: &str = "approved";
-pub(crate) const COMMAND_EVENT_REVISION: u32 = 1;
-pub(crate) const COMMAND_STARTED_KIND: u64 = 9;
-pub(crate) const COMMAND_FINISHED_KIND: u64 = 10;
 pub(crate) const COMMAND_TIMEOUT_MS: u64 = 120_000;
 pub(crate) const MAX_OUTPUT_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_ARG_BYTES: usize = 4 * 1024;
@@ -526,23 +521,6 @@ impl BoundedOutput {
         }
         Ok(())
     }
-}
-
-pub(crate) fn materialize_fact(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    if bytes.is_empty() || bytes.len() > MAX_FACT_BYTES {
-        return Err(format!(
-            "command fact cache must contain 1..={MAX_FACT_BYTES} bytes"
-        ));
-    }
-    if path.exists()
-        && fs::read(path).map_err(|error| format!("read `{}`: {error}", path.display()))? == bytes
-    {
-        return Ok(());
-    }
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    fs::write(&temporary, bytes)
-        .map_err(|error| format!("write `{}`: {error}", temporary.display()))?;
-    fs::rename(&temporary, path).map_err(|error| format!("publish `{}`: {error}", path.display()))
 }
 
 pub(crate) fn execute(started: &CommandStarted) -> ExecutionResult {

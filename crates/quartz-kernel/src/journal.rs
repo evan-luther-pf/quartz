@@ -8,7 +8,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{ComponentTree, CompositionPatch, Error, Result};
+use crate::{ComponentTree, CompositionPatch, Error, Limits, Result};
 
 const COMPOSITION_MAGIC: &[u8; 8] = b"QUARTZJ2";
 const EVENT_MAGIC: &[u8; 8] = b"QUARTZE2";
@@ -485,6 +485,47 @@ impl EventStream {
             });
         }
         Ok(())
+    }
+}
+
+pub struct DurableEventLog {
+    stream: EventStream,
+}
+
+impl DurableEventLog {
+    pub fn open(path: impl AsRef<Path>, limits: Limits) -> Result<Self> {
+        Ok(Self {
+            stream: EventStream::open(
+                path.as_ref(),
+                limits.max_event_record_bytes,
+                limits.max_event_records,
+                limits.max_payload_records,
+                limits.max_payload_bytes,
+                limits.max_payload_total_bytes,
+            )?,
+        })
+    }
+
+    pub fn records(&self) -> &[EventRecord] {
+        self.stream.records()
+    }
+
+    pub fn append(
+        &mut self,
+        actor_path: impl Into<String>,
+        event: EventGrant,
+        value: u64,
+        payload: Option<DurablePayload>,
+    ) -> Result<u64> {
+        let id = self.stream.next_id();
+        self.stream.append(&EventFact {
+            id,
+            actor_path: actor_path.into(),
+            event,
+            value,
+            payload,
+        })?;
+        Ok(id)
     }
 }
 

@@ -212,6 +212,14 @@ the stream is a reversible capability registration; recovery closes it but does
 not claim to erase committed facts. A projection component reads the bounded
 stream through its committed provider view and publishes ordinary coeffects.
 
+The same `EventStream` framing is available to justified native storage
+boundaries through `DurableEventLog`. This wrapper opens one explicitly supplied
+path under caller-supplied limits, exposes committed records, and synchronizes
+one validated event at a time with an automatically assigned monotonic ID. It
+does not know repository-task schemas, infer state, dispatch work, or grant
+ambient filesystem authority. The component event imports and ABI are
+unchanged.
+
 ## Immutable snapshot and payload boundary
 
 Slice 5 admits immutable repository evidence without granting guest filesystem

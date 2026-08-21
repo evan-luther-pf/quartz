@@ -101,6 +101,13 @@ OPENAI_API_KEY="$OPENAI_API_KEY" cargo run --release -p quartz -- \
   --continue-task gpt-5.4 /path/to/session
 ```
 
+The session directory contains one authoritative task history, `session.qe`.
+Resume derives proposal generations, decisions, promotions, command attempts,
+continuations, and completion only from its ordered checksummed facts.
+Neighboring prompt, response, exchange, promotion, and mutation files are
+operation evidence or disposable render caches; they cannot supply missing
+session history or authorize an action.
+
 The proposal command admits two or three exact UTF-8 files, commits one bounded
 production turn, validates multiple path-bound complete-file candidates, and
 leaves every source unchanged. Resume reconstructs all generations and renders
@@ -115,8 +122,9 @@ The approved-command invocation is the user's exact argv approval; `--` is
 mandatory. Quartz synchronizes a durable start fact, executes that argv once in
 the repository root with a 120-second timeout and 32 KiB stdout/stderr bounds,
 then commits the terminal status and output. A start without a finish
-reconstructs as interrupted/unknown and never runs during resume. A later
-invocation is a separate renewed approval.
+reconstructs as interrupted/unknown, is never run during resume, and blocks
+later session facts. After a completed nonterminal continuation, another command
+requires a separate renewed approval.
 
 Each finished command is consumed by one sequence-numbered continuation that
 binds the exact command facts, current proposal generations, and post-command
