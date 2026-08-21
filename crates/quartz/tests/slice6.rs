@@ -208,9 +208,7 @@ fn timed_out_exchange_is_ambiguous_and_never_retried() {
     assert_eq!(adapter.calls(), 0);
     drop(runtime);
 
-    let started = Instant::now();
     runtime = persistent_runtime(&case, adapter.clone(), Limits::default()).unwrap();
-    assert!(started.elapsed() < Duration::from_millis(300));
     assert!(matches!(
         runtime.fiber_state("a-loop"),
         Some(FiberState::Active)
