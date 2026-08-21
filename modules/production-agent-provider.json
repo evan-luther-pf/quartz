@@ -1,5 +1,5 @@
 {
-  "abi": 11,
+  "abi": 10,
   "module": "quartz.slice6.production-agent-provider",
   "version": "0.1.0",
   "execution_mode": "wasm-component",

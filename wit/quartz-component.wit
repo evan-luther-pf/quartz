@@ -1,4 +1,4 @@
-package quartz:component@0.10.0;
+package quartz:component@0.9.0;
 
 world module {
   /// Set a fiber-owned context cell. Returns zero or a Quartz status code.
@@ -34,14 +34,6 @@ world module {
 
   /// Queue one host-admitted typed value after replay-aware event projection.
   import resume-event: func(index: u64, value: u64) -> s32;
-  /// Resize one fiber-private event output within its admitted bound.
-  import event-output-set-len: func(index: u64, length: u64) -> s32;
-
-  /// Replace one existing byte in a fiber-private event output.
-  import event-output-write-byte: func(index: u64, offset: u64, value: u32) -> s32;
-
-  /// Queue one guest-authored event output as a replay-aware durable payload.
-  import resume-event-output: func(event-index: u64, output-index: u64, value: u64) -> s32;
 
   /// Return one admitted immutable snapshot length, or a negative Quartz status.
   import snapshot-len: func(index: u64) -> s64;

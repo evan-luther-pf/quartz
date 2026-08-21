@@ -401,7 +401,6 @@ fn run_acceptance() -> Result<(), Box<dyn std::error::Error>> {
     run_event_acceptance(&fixtures)?;
     run_agent_acceptance(&fixtures)?;
     run_exchange_acceptance(&fixtures)?;
-    run_repository_task_component_acceptance()?;
     let repository =
         std::env::temp_dir().join(format!("quartz-slice7-smoke-{}", std::process::id()));
     run_repository_edit_acceptance(&fixtures, &repository)?;
@@ -414,70 +413,6 @@ fn run_acceptance() -> Result<(), Box<dyn std::error::Error>> {
     println!("subtree_removal_ns={subtree_removal_ns}");
     println!("scenario_total_ns={scenario_total_ns}");
     println!("cross_component_resolve_ns_per={cross_component_resolve_ns:.3}");
-    Ok(())
-}
-
-fn run_repository_task_component_acceptance() -> Result<(), Box<dyn std::error::Error>> {
-    let directory = std::env::temp_dir().join(format!(
-        "quartz-repository-task-component-smoke-{}",
-        std::process::id()
-    ));
-    if directory.exists() {
-        return Err(format!(
-            "repository-task smoke path already exists: {}",
-            directory.display()
-        )
-        .into());
-    }
-    fs::create_dir_all(&directory)?;
-    let task = directory.join("task.txt");
-    let alpha_path = directory.join("alpha.txt");
-    let beta_path = directory.join("beta.txt");
-    fs::write(&task, "replace both values")?;
-    fs::write(&alpha_path, "alpha\n")?;
-    fs::write(&beta_path, "beta\n")?;
-    let admission = proposals::Admission::from_files(&directory, &task, &[alpha_path, beta_path])?;
-    let prompt = admission.prompt_bytes()?;
-    let alpha = &admission.files[0];
-    let beta = &admission.files[1];
-    let response = serde_json::to_string(&serde_json::json!({
-        "proposals": [
-            {
-                "path": alpha.path,
-                "source_sha256": alpha.before_sha256,
-                "byte_start": 0,
-                "byte_end": alpha.content.len(),
-                "replacement": "ready\n",
-                "result_sha256": session::sha256(b"ready\n")
-            },
-            {
-                "path": beta.path,
-                "source_sha256": beta.before_sha256,
-                "byte_start": 0,
-                "byte_end": beta.content.len(),
-                "replacement": "done\n",
-                "result_sha256": session::sha256(b"done\n")
-            }
-        ]
-    }))?;
-    let prompt_sha256 = session::sha256(&prompt);
-    let mut log = session::SessionLog::open(&directory)?;
-    log.append(session::SessionFact::ModelStarted {
-        turn: session::ModelTurn::Initial,
-        model: "smoke".into(),
-        prompt_sha256: prompt_sha256.clone(),
-        prompt: String::from_utf8(prompt)?,
-    })?;
-    log.append(session::SessionFact::ModelCompleted {
-        turn: session::ModelTurn::Initial,
-        prompt_sha256,
-        response_sha256: session::sha256(response.as_bytes()),
-        response,
-        provenance: "smoke".into(),
-    })?;
-    assert_eq!(session::SessionLog::open(&directory)?.facts().len(), 2);
-    fs::remove_dir_all(directory)?;
-    println!("repository-task component: two validated facts reconstructed");
     Ok(())
 }
 
@@ -3822,17 +3757,15 @@ mod proposal_runtime_tests {
         )
         .unwrap();
         let payload = String::from_utf8(out_of_sequence.to_bytes().unwrap()).unwrap();
-        assert!(
-            session::SessionLog::open(&sequence_session)
-                .unwrap()
-                .append(session::SessionFact::CommandStarted {
-                    attempt: 2,
-                    payload_sha256: session::sha256(payload.as_bytes()),
-                    payload,
-                })
-                .is_err()
-        );
-        assert!(reconstruct_proposal_session(&sequence_session).is_ok());
+        session::SessionLog::open(&sequence_session)
+            .unwrap()
+            .append(session::SessionFact::CommandStarted {
+                attempt: 2,
+                payload_sha256: session::sha256(payload.as_bytes()),
+                payload,
+            })
+            .unwrap();
+        assert!(reconstruct_proposal_session(&sequence_session).is_err());
         fs::remove_dir_all(sequence_root).unwrap();
 
         let (identity_root, identity_session, _) = promoted_session("command-identity-tamper");
@@ -3859,16 +3792,14 @@ mod proposal_runtime_tests {
         })
         .unwrap();
         let terminal_payload = "{}";
-        assert!(
-            log.append(session::SessionFact::CommandFinished {
-                attempt: 1,
-                start_sha256: "0".repeat(64),
-                payload_sha256: session::sha256(terminal_payload.as_bytes()),
-                payload: terminal_payload.into(),
-            })
-            .is_err()
-        );
-        assert!(reconstruct_proposal_session(&identity_session).is_ok());
+        log.append(session::SessionFact::CommandFinished {
+            attempt: 1,
+            start_sha256: "0".repeat(64),
+            payload_sha256: session::sha256(terminal_payload.as_bytes()),
+            payload: terminal_payload.into(),
+        })
+        .unwrap();
+        assert!(reconstruct_proposal_session(&identity_session).is_err());
         fs::remove_dir_all(identity_root).unwrap();
     }
 
@@ -4017,17 +3948,15 @@ mod proposal_runtime_tests {
             fact_count
         );
         let current = state.current(&session, 0).unwrap();
-        assert!(
-            session::SessionLog::open(&session)
-                .unwrap()
-                .append(session::SessionFact::ProposalApproved {
-                    proposal_index: 0,
-                    revision: current.revision,
-                    candidate_sha256: current.proposal.result_sha256.clone(),
-                })
-                .is_err()
-        );
-        assert!(reconstruct_proposal_session(&session).is_ok());
+        session::SessionLog::open(&session)
+            .unwrap()
+            .append(session::SessionFact::ProposalApproved {
+                proposal_index: 0,
+                revision: current.revision,
+                candidate_sha256: current.proposal.result_sha256.clone(),
+            })
+            .unwrap();
+        assert!(reconstruct_proposal_session(&session).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use crate::{
     composition::CompositionPatch,
     exchange::ExchangeGrant,
-    journal::{EventGrant, EventOutputGrant, SnapshotGrant},
+    journal::{EventGrant, SnapshotGrant},
     repository::WorkspaceGrant,
 };
 
@@ -23,7 +23,6 @@ pub struct ComponentSpec {
     pub journal_paths: Vec<PathBuf>,
     pub event_stream_paths: Vec<PathBuf>,
     pub event_grants: Vec<EventGrant>,
-    pub event_output_grants: Vec<EventOutputGrant>,
     pub snapshot_grants: Vec<SnapshotGrant>,
     pub exchange_grants: Vec<ExchangeGrant>,
     pub workspace_grants: Vec<WorkspaceGrant>,
@@ -41,7 +40,6 @@ impl ComponentSpec {
             journal_paths: Vec::new(),
             event_stream_paths: Vec::new(),
             event_grants: Vec::new(),
-            event_output_grants: Vec::new(),
             snapshot_grants: Vec::new(),
             exchange_grants: Vec::new(),
             workspace_grants: Vec::new(),
@@ -80,11 +78,6 @@ impl ComponentSpec {
 
     pub fn with_event_grants(mut self, grants: Vec<EventGrant>) -> Self {
         self.event_grants = grants;
-        self
-    }
-
-    pub fn with_event_output_grants(mut self, grants: Vec<EventOutputGrant>) -> Self {
-        self.event_output_grants = grants;
         self
     }
 

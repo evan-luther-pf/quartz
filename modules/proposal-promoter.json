@@ -1,5 +1,5 @@
 {
-  "abi": 11,
+  "abi": 10,
   "module": "quartz.orchestration.proposal-promoter",
   "version": "0.1.0",
   "execution_mode": "wasm-component",

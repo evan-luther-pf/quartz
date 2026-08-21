@@ -1,5 +1,5 @@
 {
-  "abi": 11,
+  "abi": 10,
   "module": "quartz.slice8.event-payload-undeclared",
   "version": "0.1.0",
   "execution_mode": "wasm-component",

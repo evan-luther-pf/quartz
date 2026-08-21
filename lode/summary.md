@@ -132,35 +132,32 @@ source-count ceiling. Host-only path selection remains an implementation
 constraint; Slice E replaces it with a host-admitted canonical path/digest
 manifest selected only by numeric index.
 
-The repository-task orchestrator is now a loadable, no-`std` Rust WASM component
-under `components/repository-task-orchestrator`. ABI 11 gives it one bounded
-fiber-private output: each task fact is staged as an immutable snapshot, checked
-against the complete committed history, copied into the component output, and
-withheld by the event outbox until activation commits. The component rejects
-illegal lifecycle transitions, malformed initial/revision/continuation
-responses, mismatched candidate generations, command sequence or identity
-changes, and promotion identity changes before they enter `session.qe`.
+The repository-task state machine, response grammar, candidate reconstruction,
+dispatch policy, and review sequencing are currently native executable code.
+They violate the host-residency rule in
+`architecture/component-contract.md`; credential custody, privileged
+filesystem/process operations, and terminal I/O are the only justified native
+parts of that path. The orchestrator must move behind the public component
+contract before the product surface expands.
 
-The native reducer remains a fact projection for credential custody, privileged
-filesystem/process work, and terminal presentation. It cannot append a fact the
-component rejects, and production code no longer calls `DurableEventLog::append`
-directly. The component artifact imports no WASI filesystem, environment,
-network, clock, random, or polling interfaces.
-
-Focused repository-loop contracts pass 35 tests. A component contract also
-proves exact guest-authored payload bytes and provenance. A live credentialed
-dogfood call was not emitted in this slice because `OPENAI_API_KEY` was absent;
-the existing bounded adapter path remains unchanged.
+Focused repository-loop contracts pass 34 tests, and the workspace passes 93
+tests across 12 suites. The latest credentialed dogfood scenario admitted four
+files, rejected one wrong result digest, then materialized four 6-or-7-byte
+ranges into exact candidates while leaving every source unchanged.
+Credential-free restart reconstructed all four ranges and diffs. WIT, component
+ABI 10, kernel source, and module manifests remain unchanged.
 
 ## Next boundary
 
-The next boundary is Slice E: replace host-admitted path strings with one
-canonical path/digest manifest selected by numeric index. Native code remains
-only at privileged OS, credential, and terminal boundaries.
+The next boundary is Slice D: move the repository-task state machine, response
+validation, generation resolution, dispatch policy, and promotion gating behind
+the public component contract. The native host retains only justified credential
+custody, privileged OS operations, and terminal I/O.
 
-The admitted manifest and terminal diff review follow. Tool invocation remains
-closed: no model-selected tool, executable, argument vector, ambient shell
-authority, automatic retry, or general conversation loop is committed.
+Component-owned orchestration, an admitted path/digest manifest, and terminal
+diff review follow. Tool invocation remains closed:
+no model-selected tool, executable, argument vector, ambient shell authority,
+automatic retry, or general conversation loop is committed.
 
 ## Non-goals
 

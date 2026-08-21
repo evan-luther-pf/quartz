@@ -10,7 +10,7 @@ use crate::{
     component::{ComponentSpec, ComponentTree, FiberId, FiberState, TraceEvent},
     exchange::ExchangeGrant,
     fiber::{Core, FiberBackup, InternalState, Inverse},
-    journal::{EventGrant, EventOutputGrant, Journal, JournalEffect, JournalSnapshot},
+    journal::{EventGrant, Journal, JournalEffect, JournalSnapshot},
     module::Artifact,
     repository::{PreparedSnapshot, PreparedWorkspace},
     runtime::Runtime,
@@ -74,7 +74,6 @@ pub(crate) struct PreparedSpec {
     pub(crate) journal_paths: Vec<PathBuf>,
     pub(crate) event_stream_paths: Vec<PathBuf>,
     pub(crate) event_grants: Vec<EventGrant>,
-    pub(crate) event_output_grants: Vec<EventOutputGrant>,
     pub(crate) snapshots: Vec<PreparedSnapshot>,
     pub(crate) exchange_grants: Vec<ExchangeGrant>,
     pub(crate) workspaces: Vec<PreparedWorkspace>,
@@ -679,15 +678,10 @@ impl Runtime {
         }
         let requests_append = artifact.manifest.requests(HostCapability::AppendEvent);
         let requests_resume = artifact.manifest.requests(HostCapability::ResumeEvent);
-        let requests_resume_output = artifact
-            .manifest
-            .requests(HostCapability::ResumeEventOutput);
         let requests_resume_snapshot = artifact.manifest.requests(HostCapability::ResumeSnapshot);
         let requests_resume_exchange = artifact.manifest.requests(HostCapability::ResumeExchange);
-        let requests_replay_append = requests_resume
-            || requests_resume_output
-            || requests_resume_snapshot
-            || requests_resume_exchange;
+        let requests_replay_append =
+            requests_resume || requests_resume_snapshot || requests_resume_exchange;
         if requests_append && requests_replay_append {
             return Err(Error::Manifest(format!(
                 "component `{path}` cannot mix ordinary and replay-aware event append authority"
@@ -710,45 +704,6 @@ impl Runtime {
                     "component `{path}` has a duplicate event grant"
                 )));
             }
-        }
-        let requests_event_output_write =
-            artifact.manifest.requests(HostCapability::EventOutputWrite);
-        if requests_event_output_write != requests_resume_output
-            || requests_event_output_write != !spec.event_output_grants.is_empty()
-        {
-            return Err(Error::Manifest(format!(
-                "component `{path}` must pair event-output write and resume authority with admitted output grants"
-            )));
-        }
-        let mut output_total = 0_usize;
-        for grant in &spec.event_output_grants {
-            output_total =
-                output_total
-                    .checked_add(grant.max_bytes)
-                    .ok_or(Error::PayloadTotalBytesLimit {
-                        actual: usize::MAX,
-                        limit: self.limits.max_payload_total_bytes,
-                    })?;
-            if grant.provenance.is_empty()
-                || grant.max_bytes == 0
-                || grant.max_bytes > self.limits.max_payload_bytes
-            {
-                return Err(Error::Manifest(format!(
-                    "component `{path}` has an invalid event output grant"
-                )));
-            }
-        }
-        if spec.event_output_grants.len() > self.limits.max_payload_records {
-            return Err(Error::PayloadCountLimit {
-                actual: spec.event_output_grants.len(),
-                limit: self.limits.max_payload_records,
-            });
-        }
-        if output_total > self.limits.max_payload_total_bytes {
-            return Err(Error::PayloadTotalBytesLimit {
-                actual: output_total,
-                limit: self.limits.max_payload_total_bytes,
-            });
         }
         let requests_snapshot_read = artifact.manifest.requests(HostCapability::ReadSnapshot);
         if (requests_snapshot_read || requests_resume_snapshot) != !spec.snapshot_grants.is_empty()
@@ -823,7 +778,6 @@ impl Runtime {
             journal_paths: spec.journal_paths,
             event_stream_paths: spec.event_stream_paths,
             event_grants: spec.event_grants,
-            event_output_grants: spec.event_output_grants,
             snapshots,
             exchange_grants: spec.exchange_grants,
             workspaces,
@@ -1499,7 +1453,6 @@ fn same_spec(left: &PreparedSpec, right: &PreparedSpec) -> bool {
         && left.journal_paths == right.journal_paths
         && left.event_stream_paths == right.event_stream_paths
         && left.event_grants == right.event_grants
-        && left.event_output_grants == right.event_output_grants
         && left
             .snapshots
             .iter()
@@ -1642,7 +1595,6 @@ impl PreparedSpec {
             journal_paths: self.journal_paths.clone(),
             event_stream_paths: self.event_stream_paths.clone(),
             event_grants: self.event_grants.clone(),
-            event_output_grants: self.event_output_grants.clone(),
             snapshot_grants: self
                 .snapshots
                 .iter()

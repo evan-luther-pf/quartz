@@ -2,7 +2,7 @@ use crate::{
     Error, HostCapability, Result,
     component::{FiberId, TraceEvent},
     fiber::{Core, InternalState, Inverse},
-    journal::{DurablePayload, EventFact, EventRecord, EventStream, JournalSnapshot, sha256_hex},
+    journal::{DurablePayload, EventFact, EventRecord, EventStream, JournalSnapshot},
     runtime::Runtime,
     wasm_host::{
         STATUS_BUSY, STATUS_COLLISION, STATUS_INVALID, STATUS_LIMIT, STATUS_OK, STATUS_UNDECLARED,
@@ -22,7 +22,6 @@ pub(crate) enum EventPayloadSource {
     None,
     Snapshot(u64),
     Exchange,
-    Output(u64),
 }
 
 pub(crate) struct EventStreamRegistration {
@@ -275,7 +274,6 @@ impl Core {
                 EventPayloadSource::None => HostCapability::AppendEvent,
                 EventPayloadSource::Snapshot(_) => HostCapability::ResumeSnapshot,
                 EventPayloadSource::Exchange => HostCapability::ResumeExchange,
-                EventPayloadSource::Output(_) => HostCapability::ResumeEventOutput,
             };
             if record.state != InternalState::Activating
                 || !record.spec.artifact.manifest.requests(capability)
@@ -308,22 +306,6 @@ impl Core {
                         provenance: snapshot.grant.provenance.clone(),
                         sha256: snapshot.grant.sha256.clone(),
                         bytes: snapshot.bytes.to_vec(),
-                    })
-                }
-                EventPayloadSource::Output(output_index) => {
-                    let Ok(output_index) = usize::try_from(output_index) else {
-                        return STATUS_INVALID;
-                    };
-                    let Some(grant) = record.spec.event_output_grants.get(output_index) else {
-                        return STATUS_UNDECLARED;
-                    };
-                    let Some(bytes) = record.event_output_buffers.get(output_index) else {
-                        return STATUS_UNDECLARED;
-                    };
-                    Some(DurablePayload {
-                        provenance: grant.provenance.clone(),
-                        sha256: sha256_hex(bytes),
-                        bytes: bytes.clone(),
                     })
                 }
                 EventPayloadSource::Exchange => {
@@ -384,89 +366,11 @@ impl Core {
             value,
             payload,
         });
-        match payload_source {
-            EventPayloadSource::Exchange => {
-                if let Some(record) = self.fibers.get_mut(&fiber) {
-                    record.inbound_response = None;
-                }
-            }
-            EventPayloadSource::Output(index) => {
-                if let Ok(index) = usize::try_from(index)
-                    && let Some(record) = self.fibers.get_mut(&fiber)
-                    && let Some(buffer) = record.event_output_buffers.get_mut(index)
-                {
-                    buffer.clear();
-                }
-            }
-            EventPayloadSource::None | EventPayloadSource::Snapshot(_) => {}
-        }
-        STATUS_OK
-    }
-
-    pub(crate) fn host_event_output_set_len(
-        &mut self,
-        fiber: FiberId,
-        index: u64,
-        length: u64,
-    ) -> i32 {
-        let (Ok(index), Ok(length)) = (usize::try_from(index), usize::try_from(length)) else {
-            return STATUS_INVALID;
-        };
-        let Some(record) = self.fibers.get_mut(&fiber) else {
-            return STATUS_INVALID;
-        };
-        if record.state != InternalState::Activating
-            || !record
-                .spec
-                .artifact
-                .manifest
-                .requests(HostCapability::EventOutputWrite)
+        if matches!(payload_source, EventPayloadSource::Exchange)
+            && let Some(record) = self.fibers.get_mut(&fiber)
         {
-            return STATUS_UNDECLARED;
+            record.inbound_response = None;
         }
-        let Some(grant) = record.spec.event_output_grants.get(index) else {
-            return STATUS_UNDECLARED;
-        };
-        if length > grant.max_bytes {
-            return STATUS_LIMIT;
-        }
-        record.event_output_buffers[index].resize(length, 0);
-        STATUS_OK
-    }
-
-    pub(crate) fn host_event_output_write_byte(
-        &mut self,
-        fiber: FiberId,
-        index: u64,
-        offset: u64,
-        value: u32,
-    ) -> i32 {
-        let (Ok(index), Ok(offset), Ok(value)) = (
-            usize::try_from(index),
-            usize::try_from(offset),
-            u8::try_from(value),
-        ) else {
-            return STATUS_INVALID;
-        };
-        let Some(record) = self.fibers.get_mut(&fiber) else {
-            return STATUS_INVALID;
-        };
-        if record.state != InternalState::Activating
-            || !record
-                .spec
-                .artifact
-                .manifest
-                .requests(HostCapability::EventOutputWrite)
-        {
-            return STATUS_UNDECLARED;
-        }
-        let Some(buffer) = record.event_output_buffers.get_mut(index) else {
-            return STATUS_UNDECLARED;
-        };
-        let Some(byte) = buffer.get_mut(offset) else {
-            return STATUS_INVALID;
-        };
-        *byte = value;
         STATUS_OK
     }
 

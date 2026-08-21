@@ -60,7 +60,6 @@ impl Runtime {
         if journal_component.journal_paths.len() != 1
             || journal_component.event_stream_paths.len() > 1
             || !journal_component.event_grants.is_empty()
-            || !journal_component.event_output_grants.is_empty()
             || !journal_component.snapshot_grants.is_empty()
             || !journal_component.exchange_grants.is_empty()
             || !journal_component.children.is_empty()

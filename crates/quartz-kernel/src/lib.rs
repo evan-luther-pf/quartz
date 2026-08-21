@@ -15,9 +15,7 @@ pub use component::{
 };
 pub use composition::CompositionPatch;
 pub use exchange::{ExchangeAdapter, ExchangeFailure, ExchangeGrant, ExchangeResponse};
-pub use journal::{
-    DurableEventLog, DurablePayload, EventGrant, EventOutputGrant, EventRecord, SnapshotGrant,
-};
+pub use journal::{DurableEventLog, DurablePayload, EventGrant, EventRecord, SnapshotGrant};
 pub use manifest::{
     ABI_VERSION, BindingKind, ComponentDeclaration, HostCapability, InterfaceId, Manifest,
     ProvidedBinding, RequiredBinding, Requirement,
