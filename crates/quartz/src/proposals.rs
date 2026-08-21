@@ -50,10 +50,9 @@ pub(crate) struct Proposal {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Revision {
     pub(crate) model: String,
-    pub(crate) proposal_index: usize,
     pub(crate) feedback: String,
     pub(crate) admission: Admission,
-    pub(crate) rejected: Proposal,
+    pub(crate) rejected: ProposalGeneration,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -280,28 +279,36 @@ impl Revision {
         model: &str,
         feedback: &[u8],
         admission: &Admission,
-        proposals: &[Proposal],
-        proposal_index: usize,
+        rejected: &ProposalGeneration,
     ) -> Result<Self, String> {
         validate_model(model)?;
         let feedback = validate_feedback(feedback)?;
-        let rejected = proposals
-            .get(proposal_index)
-            .ok_or_else(|| format!("proposal index {proposal_index} is absent"))?
-            .clone();
+        validate_current_generations(admission, std::slice::from_ref(rejected))?;
+        rejected
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| "proposal revision overflow".to_owned())?;
         let revision = Self {
             model: model.to_owned(),
-            proposal_index,
             feedback,
             admission: admission.clone(),
-            rejected,
+            rejected: rejected.clone(),
         };
         revision.prompt_bytes()?;
         Ok(revision)
     }
 
+    pub(crate) fn next_revision(&self) -> Result<u32, String> {
+        self.rejected
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| "proposal revision overflow".to_owned())
+    }
+
     pub(crate) fn prompt_bytes(&self) -> Result<Vec<u8>, String> {
         let admission_prompt = self.admission.prompt_bytes()?;
+        let rejected = &self.rejected;
+        let proposal = &rejected.proposal;
         let prompt = serde_json::to_vec_pretty(&json!({
             "schema": 2,
             "instructions": REVISION_INSTRUCTIONS,
@@ -312,20 +319,24 @@ impl Revision {
                 "files": admitted_files_json(&self.admission.files),
             },
             "rejection": {
-                "proposal_index": self.proposal_index,
-                "path": self.rejected.path,
-                "source_sha256": self.rejected.source_sha256,
-                "byte_start": self.rejected.byte_start,
-                "byte_end": self.rejected.byte_end,
-                "prior_replacement": std::str::from_utf8(&self.rejected.replacement)
+                "proposal_index": rejected.proposal_index,
+                "admitted_path_index": rejected.admitted_path_index,
+                "revision": rejected.revision,
+                "path": proposal.path,
+                "source_sha256": proposal.source_sha256,
+                "source": std::str::from_utf8(&proposal.source)
+                    .expect("validated rejected source must remain UTF-8"),
+                "byte_start": proposal.byte_start,
+                "byte_end": proposal.byte_end,
+                "prior_replacement": std::str::from_utf8(&proposal.replacement)
                     .expect("validated rejected replacement must remain UTF-8"),
-                "prior_result_sha256": self.rejected.result_sha256,
+                "prior_result_sha256": proposal.result_sha256,
                 "feedback": self.feedback,
             },
             "required_response": {
                 "proposal": {
                     "path": "the rejected admitted path",
-                    "source_sha256": "that file's original admitted SHA-256",
+                    "source_sha256": "the rejected generation's source SHA-256",
                     "byte_start": "inclusive UTF-8 byte offset",
                     "byte_end": "exclusive UTF-8 byte offset",
                     "replacement": "exact corrected UTF-8 replacement text"
@@ -342,137 +353,16 @@ impl Revision {
         Ok(prompt)
     }
 
-    pub(crate) fn from_prompt(
-        prompt: &[u8],
-        admission: &Admission,
-        proposals: &[Proposal],
-    ) -> Result<Self, String> {
+    pub(crate) fn from_prompt(prompt: &[u8], expected: &Self) -> Result<Self, String> {
         if prompt.is_empty() || prompt.len() > MAX_REVISION_PROMPT_BYTES {
             return Err(format!(
                 "durable revision prompt must contain 1..={MAX_REVISION_PROMPT_BYTES} bytes"
             ));
         }
-        let value: Value = serde_json::from_slice(prompt)
-            .map_err(|error| format!("invalid durable revision prompt JSON: {error}"))?;
-        let object = exact_object(
-            &value,
-            &[
-                "schema",
-                "instructions",
-                "model",
-                "admission",
-                "rejection",
-                "required_response",
-            ],
-            "revision prompt",
-        )?;
-        if object.get("schema").and_then(Value::as_u64) != Some(2) {
-            return Err("unsupported revision prompt schema".into());
+        if prompt != expected.prompt_bytes()? {
+            return Err("durable revision prompt changed".into());
         }
-        if string_field(object, "instructions", "revision prompt")? != REVISION_INSTRUCTIONS {
-            return Err("revision prompt instructions changed".into());
-        }
-        let model = string_field(object, "model", "revision prompt")?.to_owned();
-        validate_model(&model)?;
-
-        let admitted = exact_object(
-            object.get("admission").expect("required key checked"),
-            &["prompt_sha256", "task", "files"],
-            "revision admission",
-        )?;
-        let prompt_sha256 = string_field(admitted, "prompt_sha256", "revision admission")?;
-        validate_sha256(prompt_sha256, "revision admission prompt digest")?;
-        if prompt_sha256 != sha256(&admission.prompt_bytes()?) {
-            return Err("revision admission prompt digest changed".into());
-        }
-        if string_field(admitted, "task", "revision admission")? != admission.task {
-            return Err("revision admission task changed".into());
-        }
-        let files = admitted
-            .get("files")
-            .and_then(Value::as_array)
-            .ok_or_else(|| "revision admission files must be an array".to_owned())?;
-        if files.len() != admission.files.len() {
-            return Err("revision admission file count changed".into());
-        }
-        for (value, expected) in files.iter().zip(&admission.files) {
-            let file = exact_object(
-                value,
-                &["path", "before_sha256", "content"],
-                "revision admitted file",
-            )?;
-            if string_field(file, "path", "revision admitted file")? != expected.path
-                || string_field(file, "before_sha256", "revision admitted file")?
-                    != expected.before_sha256
-                || string_field(file, "content", "revision admitted file")?.as_bytes()
-                    != expected.content
-            {
-                return Err("revision admitted file changed".into());
-            }
-        }
-
-        let rejection = exact_object(
-            object.get("rejection").expect("required key checked"),
-            &[
-                "proposal_index",
-                "path",
-                "source_sha256",
-                "byte_start",
-                "byte_end",
-                "prior_replacement",
-                "prior_result_sha256",
-                "feedback",
-            ],
-            "revision rejection",
-        )?;
-        let proposal_index = rejection
-            .get("proposal_index")
-            .and_then(Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-            .ok_or_else(|| "revision proposal index must be a non-negative integer".to_owned())?;
-        let rejected = proposals
-            .get(proposal_index)
-            .ok_or_else(|| format!("revision proposal index {proposal_index} is absent"))?;
-        if string_field(rejection, "path", "revision rejection")? != rejected.path
-            || string_field(rejection, "source_sha256", "revision rejection")?
-                != rejected.source_sha256
-            || usize_field(rejection, "byte_start", "revision rejection")? != rejected.byte_start
-            || usize_field(rejection, "byte_end", "revision rejection")? != rejected.byte_end
-            || string_field(rejection, "prior_replacement", "revision rejection")?.as_bytes()
-                != rejected.replacement
-            || string_field(rejection, "prior_result_sha256", "revision rejection")?
-                != rejected.result_sha256
-        {
-            return Err("revision rejected proposal changed".into());
-        }
-        let feedback = validate_feedback(
-            string_field(rejection, "feedback", "revision rejection")?.as_bytes(),
-        )?;
-        let required = exact_object(
-            object
-                .get("required_response")
-                .expect("required key checked"),
-            &["proposal"],
-            "revision required response",
-        )?;
-        exact_object(
-            required.get("proposal").expect("required key checked"),
-            &[
-                "path",
-                "source_sha256",
-                "byte_start",
-                "byte_end",
-                "replacement",
-            ],
-            "revision response template",
-        )?;
-        Ok(Self {
-            model,
-            proposal_index,
-            feedback,
-            admission: admission.clone(),
-            rejected: rejected.clone(),
-        })
+        Ok(expected.clone())
     }
 }
 
@@ -487,7 +377,7 @@ impl Continuation {
     ) -> Result<Self, String> {
         validate_continuation_sequence(sequence)?;
         validate_model(model)?;
-        validate_current_generations(admission, current, sequence)?;
+        validate_current_generations(admission, current)?;
         let paths = admission
             .files
             .iter()
@@ -526,7 +416,7 @@ impl Continuation {
     pub(crate) fn prompt_bytes(&self) -> Result<Vec<u8>, String> {
         validate_continuation_sequence(self.sequence)?;
         validate_model(&self.model)?;
-        validate_current_generations(&self.admission, &self.current, self.sequence)?;
+        validate_current_generations(&self.admission, &self.current)?;
         let admitted_sources = self
             .sources
             .iter()
@@ -608,7 +498,7 @@ impl Continuation {
         }
         let model = string_field(object, "model", "continuation prompt")?.to_owned();
         validate_model(&model)?;
-        validate_current_generations(admission, current, sequence)?;
+        validate_current_generations(admission, current)?;
         let expected_generations = Value::Array(continuation_generations(current));
         if object.get("current_proposals") != Some(&expected_generations) {
             return Err("durable continuation current proposals changed".into());
@@ -721,29 +611,42 @@ pub(crate) fn parse_continuation_response(
         "continued proposal",
     )?;
     let proposal = parse_ranged_edit(edit, &source.path, source, "continued proposal")?;
-    let proposal_index = continuation
-        .current
-        .iter()
-        .find(|generation| generation.admitted_path_index == admitted_path_index)
-        .map(|generation| generation.proposal_index)
-        .unwrap_or_else(|| {
-            continuation
-                .current
-                .iter()
-                .map(|generation| generation.proposal_index)
-                .max()
-                .map_or(0, |index| index + 1)
-        });
-    let revision = continuation
-        .sequence
-        .checked_add(1)
-        .ok_or_else(|| "continuation revision overflow".to_owned())?;
+    let (proposal_index, revision) =
+        continuation_generation_identity(continuation, admitted_path_index)?;
     Ok(ContinuationResponse::Proposal {
         admitted_path_index,
         proposal_index,
         revision,
         proposal,
     })
+}
+
+fn continuation_generation_identity(
+    continuation: &Continuation,
+    admitted_path_index: usize,
+) -> Result<(usize, u32), String> {
+    if let Some(current) = continuation
+        .current
+        .iter()
+        .find(|generation| generation.admitted_path_index == admitted_path_index)
+    {
+        return Ok((
+            current.proposal_index,
+            current
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| "continuation proposal revision overflow".to_owned())?,
+        ));
+    }
+    Ok((
+        continuation
+            .current
+            .iter()
+            .map(|generation| generation.proposal_index)
+            .max()
+            .map_or(0, |index| index + 1),
+        0,
+    ))
 }
 
 fn continuation_generations(current: &[ProposalGeneration]) -> Vec<Value> {
@@ -776,7 +679,6 @@ fn validate_continuation_sequence(sequence: u32) -> Result<(), String> {
 fn validate_current_generations(
     admission: &Admission,
     current: &[ProposalGeneration],
-    max_revision: u32,
 ) -> Result<(), String> {
     if current.is_empty() {
         return Err("continuation requires at least one current proposal".into());
@@ -796,7 +698,7 @@ fn validate_current_generations(
         if !proposal_indices.insert(generation.proposal_index)
             || !admitted_indices.insert(generation.admitted_path_index)
             || admitted.path != generation.proposal.path
-            || generation.revision > max_revision
+            || generation.revision == u32::MAX
             || generation.proposal.result_sha256 != sha256(&generation.proposal.result)
             || generation.proposal.source_sha256 != sha256(&generation.proposal.source)
             || generation.proposal.byte_start > generation.proposal.byte_end
@@ -994,16 +896,18 @@ pub(crate) fn parse_revision_response(
         ],
         "revised proposal",
     )?;
+    let rejected = &revision.rejected.proposal;
     let path = string_field(proposal, "path", "revised proposal")?.to_owned();
-    if path != revision.rejected.path {
+    if path != rejected.path {
         return Err("revision response changed the rejected proposal path".into());
     }
-    let admitted = revision
-        .admission
-        .file(&path)
-        .ok_or_else(|| "revision source is no longer admitted".to_owned())?;
-    let revised = parse_ranged_edit(proposal, &path, admitted, "revised proposal")?;
-    if revised.result == revision.rejected.result {
+    let source = AdmittedFile {
+        path: rejected.path.clone(),
+        before_sha256: rejected.source_sha256.clone(),
+        content: rejected.source.clone(),
+    };
+    let revised = parse_ranged_edit(proposal, &path, &source, "revised proposal")?;
+    if revised.result == rejected.result {
         return Err(format!(
             "revised proposal for `{path}` does not change the rejected result"
         ));
@@ -1101,16 +1005,42 @@ pub(crate) fn candidate_path(session: &Path, index: usize) -> PathBuf {
     session.join(format!("proposal-{index}.candidate"))
 }
 
-pub(crate) fn revision_prompt_path(session: &Path) -> PathBuf {
-    session.join("revision-1.prompt")
+pub(crate) fn generation_candidate_path(
+    session: &Path,
+    proposal_index: usize,
+    revision: u32,
+) -> PathBuf {
+    if revision == 0 {
+        candidate_path(session, proposal_index)
+    } else {
+        session.join(format!(
+            "proposal-{proposal_index}.revision-{revision}.candidate"
+        ))
+    }
 }
 
-pub(crate) fn revision_journal_path(session: &Path) -> PathBuf {
-    session.join("revision-1.qj")
+pub(crate) fn revision_prompt_path(session: &Path, revision: &Revision) -> Result<PathBuf, String> {
+    Ok(session.join(format!(
+        "proposal-{}.revision-{}.prompt",
+        revision.rejected.proposal_index,
+        revision.next_revision()?
+    )))
+}
+
+pub(crate) fn revision_journal_path(
+    session: &Path,
+    revision: &Revision,
+) -> Result<PathBuf, String> {
+    Ok(session.join(format!(
+        "proposal-{}.revision-{}.qj",
+        revision.rejected.proposal_index,
+        revision.next_revision()?
+    )))
 }
 
 pub(crate) fn materialize_revision_prompt(
     session: &Path,
+    revision: &Revision,
     prompt: &[u8],
 ) -> Result<PathBuf, String> {
     if prompt.is_empty() || prompt.len() > MAX_REVISION_PROMPT_BYTES {
@@ -1118,13 +1048,9 @@ pub(crate) fn materialize_revision_prompt(
             "revision prompt must contain 1..={MAX_REVISION_PROMPT_BYTES} bytes"
         ));
     }
-    let path = revision_prompt_path(session);
+    let path = revision_prompt_path(session, revision)?;
     atomic_write(&path, prompt)?;
     Ok(path)
-}
-
-pub(crate) fn revision_candidate_path(session: &Path, proposal_index: usize) -> PathBuf {
-    session.join(format!("proposal-{proposal_index}.revision-1.candidate"))
 }
 
 pub(crate) fn materialize_revision(
@@ -1132,12 +1058,14 @@ pub(crate) fn materialize_revision(
     revision: &Revision,
     proposal: &Proposal,
 ) -> Result<PathBuf, String> {
-    let candidate = revision_candidate_path(session, revision.proposal_index);
+    let revision_number = revision.next_revision()?;
+    let candidate =
+        generation_candidate_path(session, revision.rejected.proposal_index, revision_number);
     atomic_write(&candidate, &proposal.result)?;
     let metadata = serde_json::to_vec_pretty(&json!({
         "schema": 1,
-        "revision": 1,
-        "proposal_index": revision.proposal_index,
+        "revision": revision_number,
+        "proposal_index": revision.rejected.proposal_index,
         "model": revision.model,
         "feedback_sha256": sha256(revision.feedback.as_bytes()),
         "path": proposal.path,
@@ -1145,12 +1073,18 @@ pub(crate) fn materialize_revision(
         "byte_start": proposal.byte_start,
         "byte_end": proposal.byte_end,
         "replacement_sha256": sha256(&proposal.replacement),
-        "rejected_result_sha256": revision.rejected.result_sha256,
+        "rejected_result_sha256": revision.rejected.proposal.result_sha256,
         "result_sha256": proposal.result_sha256,
         "candidate": candidate.file_name().expect("candidate file name").to_string_lossy(),
     }))
     .map_err(|error| format!("serialize proposal revision metadata: {error}"))?;
-    atomic_write(&session.join("revision-1.json"), &metadata)?;
+    atomic_write(
+        &session.join(format!(
+            "proposal-{}.revision-{revision_number}.json",
+            revision.rejected.proposal_index
+        )),
+        &metadata,
+    )?;
     Ok(candidate)
 }
 
@@ -1160,16 +1094,6 @@ pub(crate) fn continuation_prompt_path(session: &Path, sequence: u32) -> PathBuf
 
 pub(crate) fn continuation_journal_path(session: &Path, sequence: u32) -> PathBuf {
     session.join(format!("continuation-{sequence}.qj"))
-}
-
-pub(crate) fn continuation_candidate_path(
-    session: &Path,
-    proposal_index: usize,
-    revision: u32,
-) -> PathBuf {
-    session.join(format!(
-        "proposal-{proposal_index}.revision-{revision}.candidate"
-    ))
 }
 
 pub(crate) fn completion_summary_path(session: &Path, sequence: u32) -> PathBuf {
@@ -1205,10 +1129,11 @@ pub(crate) fn materialize_continuation_response(
             revision,
             proposal,
         } => {
-            if *revision != continuation.sequence + 1 {
-                return Err("continued proposal revision does not match its sequence".into());
+            let expected = continuation_generation_identity(continuation, *admitted_path_index)?;
+            if expected != (*proposal_index, *revision) {
+                return Err("continued proposal generation identity changed".into());
             }
-            let candidate = continuation_candidate_path(session, *proposal_index, *revision);
+            let candidate = generation_candidate_path(session, *proposal_index, *revision);
             atomic_write(&candidate, &proposal.result)?;
             (
                 json!({
@@ -1418,51 +1343,37 @@ mod tests {
     }
 
     #[test]
-    fn revision_round_trip_binds_rejection_feedback_and_original_admission() {
+    fn revision_round_trip_binds_rejection_feedback_and_current_generation() {
         let admission = fixture_admission();
-        let proposals = fixture_proposals(&admission);
+        let generations = fixture_generations(&admission);
         let revision = Revision::new(
             "gpt-test",
             b"Use a more precise label.\n",
             &admission,
-            &proposals,
-            1,
+            &generations[1],
         )
         .unwrap();
         let prompt = revision.prompt_bytes().unwrap();
-        assert_eq!(
-            Revision::from_prompt(&prompt, &admission, &proposals).unwrap(),
-            revision
-        );
+        assert_eq!(Revision::from_prompt(&prompt, &revision).unwrap(), revision);
 
         let mut value: Value = serde_json::from_slice(&prompt).unwrap();
         value["admission"]["prompt_sha256"] = Value::String("0".repeat(64));
-        assert!(
-            Revision::from_prompt(&serde_json::to_vec(&value).unwrap(), &admission, &proposals)
-                .is_err()
-        );
-        let mut legacy: Value = serde_json::from_slice(&prompt).unwrap();
-        legacy["schema"] = Value::from(1);
-        assert!(
-            Revision::from_prompt(
-                &serde_json::to_vec(&legacy).unwrap(),
-                &admission,
-                &proposals,
-            )
-            .is_err()
-        );
+        assert!(Revision::from_prompt(&serde_json::to_vec(&value).unwrap(), &revision).is_err());
+        let mut stale: Value = serde_json::from_slice(&prompt).unwrap();
+        stale["rejection"]["revision"] = Value::from(9);
+        assert!(Revision::from_prompt(&serde_json::to_vec(&stale).unwrap(), &revision).is_err());
     }
 
     #[test]
     fn revision_accepts_only_a_changed_range_for_the_rejected_path() {
         let root = temporary_directory("revision");
         let admission = fixture_admission();
-        let proposals = fixture_proposals(&admission);
+        let generations = fixture_generations(&admission);
         let revision =
-            Revision::new("gpt-test", b"Correct beta.", &admission, &proposals, 1).unwrap();
+            Revision::new("gpt-test", b"Correct beta.", &admission, &generations[1]).unwrap();
         let response = json!({
             "proposal": proposal(
-                &revision.rejected.path,
+                &revision.rejected.proposal.path,
                 &admission.files[1],
                 "beta corrected\n"
             )
@@ -1483,11 +1394,15 @@ mod tests {
 
         let wrong_path = proposal("README.md", &admission.files[1], "beta corrected\n");
         let unchanged = proposal(
-            &revision.rejected.path,
+            &revision.rejected.proposal.path,
             &admission.files[1],
-            std::str::from_utf8(&revision.rejected.result).unwrap(),
+            std::str::from_utf8(&revision.rejected.proposal.result).unwrap(),
         );
-        let original = proposal(&revision.rejected.path, &admission.files[1], "beta\n");
+        let original = proposal(
+            &revision.rejected.proposal.path,
+            &admission.files[1],
+            "beta\n",
+        );
         for response in [wrong_path, unchanged, original] {
             let response = json!({ "proposal": response });
             assert!(
@@ -1686,7 +1601,7 @@ mod tests {
         };
         assert_eq!(admitted_path_index, 1);
         assert_eq!(proposal_index, 1);
-        assert_eq!(revision, 2);
+        assert_eq!(revision, 1);
         assert_eq!(proposal.source, b"beta revised\n");
         assert_eq!(proposal.result, b"beta corrected\n");
         fs::remove_dir_all(root).unwrap();
@@ -1744,17 +1659,7 @@ mod tests {
         fs::write(root.join("README.md"), b"alpha revised\n").unwrap();
         fs::write(root.join("lode/summary.md"), b"beta revised\n").unwrap();
         let admission = fixture_admission();
-        let proposals = fixture_proposals(&admission);
-        let current = proposals
-            .into_iter()
-            .enumerate()
-            .map(|(index, proposal)| ProposalGeneration {
-                proposal_index: index,
-                admitted_path_index: index,
-                revision: 0,
-                proposal,
-            })
-            .collect::<Vec<_>>();
+        let current = fixture_generations(&admission);
         let paths = admission
             .files
             .iter()
@@ -1799,6 +1704,19 @@ mod tests {
             )
         ]});
         parse_response(&serde_json::to_vec(&response).unwrap(), admission).unwrap()
+    }
+
+    fn fixture_generations(admission: &Admission) -> Vec<ProposalGeneration> {
+        fixture_proposals(admission)
+            .into_iter()
+            .enumerate()
+            .map(|(index, proposal)| ProposalGeneration {
+                proposal_index: index,
+                admitted_path_index: index,
+                revision: 0,
+                proposal,
+            })
+            .collect()
     }
 
     fn admitted(path: &str, content: &[u8]) -> AdmittedFile {

@@ -26,11 +26,14 @@ exchange. It renders every candidate as an exact diff and identifies current,
 superseded, rejected, interrupted, and completed state.
 
 `quartz --revise-proposal <model> <session-dir> <index> <feedback-path>` records
-one explicit bounded rejection and may emit one correction exchange for the
-selected current generation. The correction is bound to the original admission,
-model, source digest, rejected byte range, replacement and result identities,
-and feedback. Interrupted exchange state remains interrupted/unknown and is
-never implicitly retried.
+one explicit bounded rejection of the selected current unpromoted generation
+and may emit one correction exchange. The correction revision is exactly the
+rejected revision plus one and is bound to that generation's index, admitted
+path, model, source bytes and digest, ranged edit, replacement and result
+identities, and feedback. Initial, corrected, and continuation-produced
+generations use the same path. Only one revision turn may be pending; an
+interrupted exchange remains interrupted/unknown, is never retried, and blocks
+later actions.
 
 `quartz --promote-proposal <session-dir> <index>` is the user's exact approval of
 the displayed current candidate. It publishes and retains that candidate through
@@ -64,10 +67,12 @@ COMPLETE
 <bounded final summary>
 ```
 
-`PROPOSE` creates the next generation for one admitted source. After separate
-review and promotion, the user may approve another command. `COMPLETE` is legal
-only after a successful command and closes the session. Pending or interrupted
-continuation state, explicit completion, a finished command awaiting
+`PROPOSE` creates the next generation for one admitted source. The reducer keeps
+one ordered generation history and projects the newest completed generation for
+review, rejection, approval, promotion, and continuation. After separate review
+and promotion, the user may approve another command. `COMPLETE` is legal only
+after a successful command and closes the session. Pending or interrupted
+revision or continuation state, explicit completion, a finished command awaiting
 continuation, or an unpromoted current proposal blocks actions that would skip
 that state.
 
@@ -148,9 +153,13 @@ The later manifest change is likewise a clean cutover.
 - `CommandStarted` is synchronized before spawn. `CommandFinished` binds that
   start and records exit code or signal, timeout or spawn failure, bounded
   output, truncation, duration, and post-command admitted-file identities.
-- Continuation sequence `n` consumes the `n`th finished command. It can create
-  proposal revision `n + 1`. Sequence gaps, swapped command evidence, orphaned
-  artifacts, stale generations, and repository drift fail closed.
+- Every completed proposal or correction generation has a monotonic per-proposal
+  revision identity. A correction is exactly the rejected current revision plus
+  one. A continuation proposal advances the selected proposal's current revision
+  by one; a newly selected admitted path begins revision zero.
+- Rejection and promotion bind the exact current proposal index, revision, and
+  candidate digest. Superseded, promoted, pending, interrupted, mismatched, and
+  post-completion generations fail closed.
 - A completed or interrupted external operation is never emitted again.
   Credential-free reconstruction performs no command or model call.
 - Command facts, model facts, promotion commits, and source mutations are honest
@@ -168,7 +177,8 @@ binds the identities and bytes needed to validate its predecessor.
 The closed fact set is:
 
 - initial proposal turn started and completed;
-- proposal rejection and revision turn started and completed;
+- proposal rejection and revision turn started and completed, repeated in
+  generation order as needed;
 - exact candidate approval, promotion started, and promotion completed;
 - approved command started and finished;
 - continuation started and either completed with one proposal or completed the
@@ -261,8 +271,8 @@ Prompt schema 1 sessions remain retained evidence but are not resumable after
 the clean schema 2 cutover. Quartz does not reinterpret their model-authored
 result digests.
 
-`cargo test -p quartz --bin quartz` passes 34 focused contracts.
-`cargo test --workspace --all-targets` passes 93 tests across 12 suites. Twenty
+`cargo test -p quartz --bin quartz` passes 38 focused contracts.
+`cargo test --workspace --all-targets` passes 97 tests across 12 suites. Twenty
 release runs measure 3.220 ms p50 cold readiness, 3.000 MiB p50 idle RSS, and a
 14.173 MiB executable: respectively +3.4%, +3.2%, and -6.2% against the Slice 0
 budget. The release profile strips symbols and uses thin LTO. WIT, component ABI

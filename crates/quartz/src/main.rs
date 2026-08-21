@@ -1218,60 +1218,51 @@ fn run_proposal_revision(
     if state.is_complete() {
         return Err("proposal session is explicitly complete".into());
     }
-    if state.command.is_some() || !state.continuations.is_empty() {
-        return Err("proposal rejection is available only before command cycles begin".into());
+    if let Some(ProposalRevisionState::Interrupted(request)) = state.revisions.last() {
+        validate_revision_selector(request, model, index)?;
+        return Err("revision turn ended interrupted/unknown; it will not be retried".into());
     }
-    match &state.revision {
-        Some(ProposalRevisionState::Completed { request, .. }) => {
-            validate_revision_selector(request, model, index)?;
-            display_proposals(&session, &state)?;
-            println!("revision turn reconstructed; no exchange emitted");
-            return Ok(());
-        }
-        Some(ProposalRevisionState::Interrupted(request)) => {
-            validate_revision_selector(request, model, index)?;
-            return Err("revision turn ended interrupted/unknown; it will not be retried".into());
-        }
-        _ => {}
-    }
-
     let feedback_bytes = fs::read(feedback)?;
-    let expected = match &state.revision {
+    let (expected, append_rejection) = match state.revisions.last() {
         Some(ProposalRevisionState::Pending(request)) => {
             validate_revision_selector(request, model, index)?;
             if request.feedback.as_bytes() != feedback_bytes {
                 return Err("durable rejection feedback changed".into());
             }
-            request.clone()
+            (request.clone(), false)
         }
-        None => proposals::Revision::new(
-            model,
-            &feedback_bytes,
-            &state.admission,
-            &state.proposals,
-            index,
-        )?,
-        Some(ProposalRevisionState::Interrupted(_))
-        | Some(ProposalRevisionState::Completed { .. }) => unreachable!("handled above"),
+        Some(ProposalRevisionState::Interrupted(_)) => unreachable!("handled above"),
+        Some(ProposalRevisionState::Completed { .. }) | None => {
+            let current = state.current(&session, index)?;
+            if state.promotion_status(&current) != PromotionStatus::Absent {
+                return Err("only an unpromoted current generation may be rejected".into());
+            }
+            (
+                proposals::Revision::new(
+                    model,
+                    &feedback_bytes,
+                    &state.admission,
+                    current.generation,
+                )?,
+                true,
+            )
+        }
     };
+    let revision = expected.next_revision()?;
     let prompt_bytes = expected.prompt_bytes()?;
     let prompt_text = String::from_utf8(prompt_bytes.clone())?;
-    let prompt_path = proposals::materialize_revision_prompt(&session, &prompt_bytes)?;
-    let journal = proposals::revision_journal_path(&session);
+    let prompt_path = proposals::materialize_revision_prompt(&session, &expected, &prompt_bytes)?;
+    let journal = proposals::revision_journal_path(&session, &expected)?;
 
     let api_key = std::env::var("OPENAI_API_KEY")
         .map_err(|_| "OPENAI_API_KEY is required to start or resume --revise-proposal")?;
     let adapter = Arc::new(openai::OpenAiResponses::new(api_key, model.to_owned())?);
     let mut session_log = session::SessionLog::open(&session)?;
-    if state.revision.is_none() {
+    if append_rejection {
         session_log.append(session::SessionFact::ProposalRejected {
-            proposal_index: index,
-            revision: 0,
-            candidate_sha256: state
-                .current(&session, index)?
-                .proposal
-                .result_sha256
-                .clone(),
+            proposal_index: expected.rejected.proposal_index,
+            revision: expected.rejected.revision,
+            candidate_sha256: expected.rejected.proposal.result_sha256.clone(),
             model: model.to_owned(),
             feedback: expected.feedback.clone(),
         })?;
@@ -1280,7 +1271,7 @@ fn run_proposal_revision(
     session_log.append(session::SessionFact::ModelStarted {
         turn: session::ModelTurn::Revision {
             proposal_index: index,
-            revision: 1,
+            revision,
         },
         model: model.to_owned(),
         prompt_sha256: prompt_sha256.clone(),
@@ -1292,7 +1283,7 @@ fn run_proposal_revision(
     session_log.append(session::SessionFact::ModelCompleted {
         turn: session::ModelTurn::Revision {
             proposal_index: index,
-            revision: 1,
+            revision,
         },
         prompt_sha256,
         response_sha256: session::sha256(response.as_bytes()),
@@ -1311,7 +1302,7 @@ fn validate_revision_selector(
     model: &str,
     index: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if revision.model != model || revision.proposal_index != index {
+    if revision.model != model || revision.rejected.proposal_index != index {
         return Err("durable revision belongs to another model or proposal index".into());
     }
     Ok(())
@@ -1319,8 +1310,8 @@ fn validate_revision_selector(
 
 struct ProposalSession {
     admission: proposals::Admission,
-    proposals: Vec<proposals::Proposal>,
-    revision: Option<ProposalRevisionState>,
+    generations: Vec<proposals::ProposalGeneration>,
+    revisions: Vec<ProposalRevisionState>,
     promotions: Vec<ProposalPromotionState>,
     command: Option<CommandHistory>,
     continuations: Vec<ProposalContinuationState>,
@@ -1329,10 +1320,7 @@ struct ProposalSession {
 enum ProposalRevisionState {
     Pending(proposals::Revision),
     Interrupted(proposals::Revision),
-    Completed {
-        request: proposals::Revision,
-        proposal: proposals::Proposal,
-    },
+    Completed { request: proposals::Revision },
 }
 
 enum ProposalContinuationState {
@@ -1378,10 +1366,8 @@ enum CommandAttemptState {
 }
 
 struct CurrentProposal<'a> {
-    proposal_index: usize,
-    proposal: &'a proposals::Proposal,
+    generation: &'a proposals::ProposalGeneration,
     path: PathBuf,
-    revision: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1466,131 +1452,54 @@ impl ProposalSession {
         session: &Path,
         index: usize,
     ) -> Result<CurrentProposal<'_>, Box<dyn std::error::Error>> {
-        for continuation in self.continuations.iter().rev() {
-            if let ProposalContinuationState::Completed {
-                response:
-                    proposals::ContinuationResponse::Proposal {
-                        proposal_index,
-                        revision,
-                        proposal,
-                        ..
-                    },
-                ..
-            } = continuation
-                && *proposal_index == index
-            {
-                return Ok(CurrentProposal {
-                    proposal_index: index,
-                    proposal,
-                    path: proposals::continuation_candidate_path(session, index, *revision),
-                    revision: *revision,
-                });
-            }
+        if let Some(ProposalRevisionState::Pending(request))
+        | Some(ProposalRevisionState::Interrupted(request)) = self.revisions.last()
+            && request.rejected.proposal_index == index
+        {
+            return Err(
+                format!("proposal {index} was rejected and has no completed correction").into(),
+            );
         }
-        self.current_without_continuation(session, index)
+        let generation = self
+            .generations
+            .iter()
+            .rev()
+            .find(|generation| generation.proposal_index == index)
+            .ok_or_else(|| format!("proposal index {index} is absent"))?;
+        Ok(CurrentProposal {
+            generation,
+            path: proposals::generation_candidate_path(
+                session,
+                generation.proposal_index,
+                generation.revision,
+            ),
+        })
+    }
+
+    fn current_generations(&self) -> Vec<proposals::ProposalGeneration> {
+        let mut current = self
+            .generations
+            .iter()
+            .enumerate()
+            .filter(|(position, generation)| {
+                !self.generations[position + 1..]
+                    .iter()
+                    .any(|later| later.proposal_index == generation.proposal_index)
+            })
+            .map(|(_, generation)| generation.clone())
+            .collect::<Vec<_>>();
+        current.sort_by_key(|generation| generation.proposal_index);
+        current
     }
 
     fn generations_before_continuation(
         &self,
-        session: &Path,
         sequence: u32,
     ) -> Result<Vec<proposals::ProposalGeneration>, Box<dyn std::error::Error>> {
         if usize::try_from(sequence)? != self.continuations.len() + 1 {
             return Err("continuation sequence does not follow reconstructed history".into());
         }
-        let mut generations = Vec::with_capacity(self.proposals.len());
-        for index in 0..self.proposals.len() {
-            let current = self.current_without_continuation(session, index)?;
-            let admitted_path_index = self
-                .admission
-                .files
-                .iter()
-                .position(|file| file.path == current.proposal.path)
-                .ok_or("current proposal path left the admission")?;
-            generations.push(proposals::ProposalGeneration {
-                proposal_index: index,
-                admitted_path_index,
-                revision: current.revision,
-                proposal: current.proposal.clone(),
-            });
-        }
-        for continuation in &self.continuations {
-            match continuation {
-                ProposalContinuationState::Completed {
-                    response:
-                        proposals::ContinuationResponse::Proposal {
-                            admitted_path_index,
-                            proposal_index,
-                            revision,
-                            proposal,
-                        },
-                    ..
-                } => {
-                    let generation = proposals::ProposalGeneration {
-                        proposal_index: *proposal_index,
-                        admitted_path_index: *admitted_path_index,
-                        revision: *revision,
-                        proposal: proposal.clone(),
-                    };
-                    if let Some(existing) = generations
-                        .iter_mut()
-                        .find(|existing| existing.proposal_index == *proposal_index)
-                    {
-                        *existing = generation;
-                    } else {
-                        generations.push(generation);
-                    }
-                }
-                ProposalContinuationState::Completed {
-                    response: proposals::ContinuationResponse::Complete(_),
-                    ..
-                } => {
-                    return Err("explicit completion cannot precede another continuation".into());
-                }
-                ProposalContinuationState::Interrupted(_) => {
-                    return Err(
-                        "nonterminal continuation cannot precede another continuation".into(),
-                    );
-                }
-            }
-        }
-        generations.sort_by_key(|generation| generation.proposal_index);
-        Ok(generations)
-    }
-
-    fn current_without_continuation(
-        &self,
-        session: &Path,
-        index: usize,
-    ) -> Result<CurrentProposal<'_>, Box<dyn std::error::Error>> {
-        let original = self
-            .proposals
-            .get(index)
-            .ok_or_else(|| format!("proposal index {index} is absent"))?;
-        match &self.revision {
-            Some(ProposalRevisionState::Completed { request, proposal })
-                if request.proposal_index == index =>
-            {
-                Ok(CurrentProposal {
-                    proposal_index: index,
-                    proposal,
-                    path: proposals::revision_candidate_path(session, index),
-                    revision: 1,
-                })
-            }
-            Some(ProposalRevisionState::Pending(request))
-            | Some(ProposalRevisionState::Interrupted(request))
-                if request.proposal_index == index =>
-            {
-                Err(format!("proposal {index} was rejected and has no completed correction").into())
-            }
-            _ => Ok(CurrentProposal {
-                proposal_index: index,
-                proposal: original,
-                path: proposals::candidate_path(session, index),
-                revision: 0,
-            }),
-        }
+        Ok(self.current_generations())
     }
 
     fn promotion_status(&self, current: &CurrentProposal<'_>) -> PromotionStatus {
@@ -1602,9 +1511,9 @@ impl ProposalSession {
                     proposal_index,
                     revision,
                     candidate_sha256,
-                } if *proposal_index == current.proposal_index
-                    && *revision == current.revision
-                    && *candidate_sha256 == current.proposal.result_sha256 =>
+                } if *proposal_index == current.generation.proposal_index
+                    && *revision == current.generation.revision
+                    && *candidate_sha256 == current.generation.proposal.result_sha256 =>
                 {
                     Some(PromotionStatus::Approved)
                 }
@@ -1613,9 +1522,9 @@ impl ProposalSession {
                     revision,
                     candidate_sha256,
                     ..
-                } if *proposal_index == current.proposal_index
-                    && *revision == current.revision
-                    && *candidate_sha256 == current.proposal.result_sha256 =>
+                } if *proposal_index == current.generation.proposal_index
+                    && *revision == current.generation.revision
+                    && *candidate_sha256 == current.generation.proposal.result_sha256 =>
                 {
                     Some(PromotionStatus::Interrupted)
                 }
@@ -1624,9 +1533,9 @@ impl ProposalSession {
                     revision,
                     candidate_sha256,
                     ..
-                } if *proposal_index == current.proposal_index
-                    && *revision == current.revision
-                    && *candidate_sha256 == current.proposal.result_sha256 =>
+                } if *proposal_index == current.generation.proposal_index
+                    && *revision == current.generation.revision
+                    && *candidate_sha256 == current.generation.proposal.result_sha256 =>
                 {
                     Some(PromotionStatus::Promoted)
                 }
@@ -1697,18 +1606,36 @@ fn reconstruct_proposal_session(
     let session = fs::canonicalize(session)?;
     let log = session::SessionLog::open(&session)?;
     let (admission, candidates) = reconstruct_base_proposals_from_facts(&session, log.facts())?;
+    let generations = candidates
+        .into_iter()
+        .enumerate()
+        .map(|(proposal_index, proposal)| {
+            let admitted_path_index = admission
+                .files
+                .iter()
+                .position(|file| file.path == proposal.path)
+                .ok_or("initial proposal path left the admission")?;
+            Ok(proposals::ProposalGeneration {
+                proposal_index,
+                admitted_path_index,
+                revision: 0,
+                proposal,
+            })
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
     let mut state = ProposalSession {
         admission,
-        proposals: candidates,
-        revision: None,
+        generations,
+        revisions: Vec::new(),
         promotions: Vec::new(),
         command: None,
         continuations: Vec::new(),
     };
     let mut cursor = 2;
     while let Some(record) = log.facts().get(cursor) {
-        if let Some(ProposalRevisionState::Pending(expected)) = &state.revision {
+        if let Some(ProposalRevisionState::Pending(expected)) = state.revisions.last() {
             let expected = expected.clone();
+            let next_revision = expected.next_revision()?;
             let request = match &record.fact {
                 session::SessionFact::ModelStarted {
                     turn:
@@ -1719,28 +1646,28 @@ fn reconstruct_proposal_session(
                     model,
                     prompt_sha256,
                     prompt,
-                } if *proposal_index == expected.proposal_index && *revision == 1 => {
+                } if *proposal_index == expected.rejected.proposal_index
+                    && *revision == next_revision =>
+                {
                     validate_session_text(prompt, prompt_sha256, "revision prompt")?;
-                    let request = proposals::Revision::from_prompt(
-                        prompt.as_bytes(),
-                        &state.admission,
-                        &state.proposals,
-                    )?;
+                    let request = proposals::Revision::from_prompt(prompt.as_bytes(), &expected)?;
                     validate_revision_selector(&request, model, *proposal_index)?;
-                    if request != expected {
-                        return Err("revision start changed the durable rejection".into());
-                    }
-                    proposals::materialize_revision_prompt(&session, prompt.as_bytes())?;
+                    proposals::materialize_revision_prompt(&session, &request, prompt.as_bytes())?;
                     request
                 }
                 _ => return Err("proposal rejection is not followed by its revision start".into()),
             };
-            state.revision = Some(ProposalRevisionState::Interrupted(request));
+            *state
+                .revisions
+                .last_mut()
+                .expect("pending revision checked above") =
+                ProposalRevisionState::Interrupted(request);
             cursor += 1;
             continue;
         }
-        if let Some(ProposalRevisionState::Interrupted(expected)) = &state.revision {
+        if let Some(ProposalRevisionState::Interrupted(expected)) = state.revisions.last() {
             let expected = expected.clone();
+            let next_revision = expected.next_revision()?;
             let prompt = expected.prompt_bytes()?;
             let prompt_sha256 = session::sha256(&prompt);
             match &record.fact {
@@ -1754,7 +1681,9 @@ fn reconstruct_proposal_session(
                     response_sha256,
                     response,
                     provenance,
-                } if *proposal_index == expected.proposal_index && *revision == 1 => {
+                } if *proposal_index == expected.rejected.proposal_index
+                    && *revision == next_revision =>
+                {
                     if *completed_prompt != prompt_sha256 || provenance.is_empty() {
                         return Err("revision completion does not bind its start".into());
                     }
@@ -1762,10 +1691,17 @@ fn reconstruct_proposal_session(
                     let proposal =
                         proposals::parse_revision_response(response.as_bytes(), &expected)?;
                     proposals::materialize_revision(&session, &expected, &proposal)?;
-                    state.revision = Some(ProposalRevisionState::Completed {
-                        request: expected,
-                        proposal,
+                    state.generations.push(proposals::ProposalGeneration {
+                        proposal_index: expected.rejected.proposal_index,
+                        admitted_path_index: expected.rejected.admitted_path_index,
+                        revision: next_revision,
+                        proposal: proposal.clone(),
                     });
+                    *state
+                        .revisions
+                        .last_mut()
+                        .expect("interrupted revision checked above") =
+                        ProposalRevisionState::Completed { request: expected };
                     cursor += 1;
                     continue;
                 }
@@ -1882,6 +1818,20 @@ fn reconstruct_proposal_session(
                         return Err("explicit completion requires a task-completed fact".into());
                     }
                     proposals::materialize_continuation_response(&session, &expected, &response)?;
+                    if let proposals::ContinuationResponse::Proposal {
+                        admitted_path_index,
+                        proposal_index,
+                        revision,
+                        proposal,
+                    } = &response
+                    {
+                        state.generations.push(proposals::ProposalGeneration {
+                            proposal_index: *proposal_index,
+                            admitted_path_index: *admitted_path_index,
+                            revision: *revision,
+                            proposal: proposal.clone(),
+                        });
+                    }
                     *state
                         .continuations
                         .last_mut()
@@ -1940,27 +1890,32 @@ fn reconstruct_proposal_session(
                 feedback,
             } => {
                 if state.is_complete()
-                    || state.command.is_some()
-                    || !state.continuations.is_empty()
-                    || state.revision.is_some()
-                    || *revision != 0
+                    || matches!(
+                        state.revisions.last(),
+                        Some(ProposalRevisionState::Pending(_))
+                            | Some(ProposalRevisionState::Interrupted(_))
+                    )
                 {
                     return Err("proposal rejection is not legal in the derived state".into());
                 }
                 let current = state.current(&session, *proposal_index)?;
-                if current.revision != *revision
-                    || current.proposal.result_sha256 != *candidate_sha256
+                if current.generation.revision != *revision
+                    || current.generation.proposal.result_sha256 != *candidate_sha256
                 {
                     return Err("proposal rejection names a stale generation".into());
+                }
+                if state.promotion_status(&current) != PromotionStatus::Absent {
+                    return Err("proposal rejection names a promoted or consumed generation".into());
                 }
                 let request = proposals::Revision::new(
                     model,
                     feedback.as_bytes(),
                     &state.admission,
-                    &state.proposals,
-                    *proposal_index,
+                    current.generation,
                 )?;
-                state.revision = Some(ProposalRevisionState::Pending(request));
+                state
+                    .revisions
+                    .push(ProposalRevisionState::Pending(request));
             }
             session::SessionFact::ProposalApproved {
                 proposal_index,
@@ -1971,8 +1926,8 @@ fn reconstruct_proposal_session(
                     return Err("proposal approval follows explicit completion".into());
                 }
                 let current = state.current(&session, *proposal_index)?;
-                if current.revision != *revision
-                    || current.proposal.result_sha256 != *candidate_sha256
+                if current.generation.revision != *revision
+                    || current.generation.proposal.result_sha256 != *candidate_sha256
                     || state.promotion_status(&current) != PromotionStatus::Absent
                 {
                     return Err("proposal approval names a stale or consumed generation".into());
@@ -2019,7 +1974,7 @@ fn reconstruct_proposal_session(
                     .as_ref()
                     .ok_or("continuation exists without command history")?
                     .finished(*sequence)?;
-                let current = state.generations_before_continuation(&session, *sequence)?;
+                let current = state.generations_before_continuation(*sequence)?;
                 let request = proposals::Continuation::from_prompt(
                     *sequence,
                     prompt.as_bytes(),
@@ -2078,12 +2033,12 @@ fn validate_new_command_fact(
     if finished > state.continuations.len() {
         return Err("latest finished command has no continuation".into());
     }
-    for index in 0..state.proposals.len() {
-        let current = state.current(session, index)?;
+    for generation in state.current_generations() {
+        let current = state.current(session, generation.proposal_index)?;
         if state.promotion_status(&current) != PromotionStatus::Promoted {
             return Err(format!(
-                "proposal {index} revision {} is not durably promoted",
-                current.revision
+                "proposal {} revision {} is not durably promoted",
+                generation.proposal_index, generation.revision
             )
             .into());
         }
@@ -2117,12 +2072,12 @@ fn validate_new_command_fact_for_continuation(
     state: &ProposalSession,
     session: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for index in 0..state.proposals.len() {
-        let current = state.current(session, index)?;
+    for generation in state.current_generations() {
+        let current = state.current(session, generation.proposal_index)?;
         if state.promotion_status(&current) != PromotionStatus::Promoted {
             return Err(format!(
-                "proposal {index} revision {} is not durably promoted",
-                current.revision
+                "proposal {} revision {} is not durably promoted",
+                generation.proposal_index, generation.revision
             )
             .into());
         }
@@ -2134,58 +2089,57 @@ fn display_proposals(
     session: &Path,
     state: &ProposalSession,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for (index, candidate) in state.proposals.iter().enumerate() {
-        let base_path = proposals::candidate_path(session, index);
-        if fs::read(&base_path)? != candidate.result {
-            return Err(format!("materialized candidate {index} changed").into());
-        }
-        let current_revision = state
-            .current(session, index)
-            .ok()
-            .map(|current| current.revision);
-        let revision = state.revision.as_ref().filter(|revision| match revision {
-            ProposalRevisionState::Pending(request)
-            | ProposalRevisionState::Interrupted(request)
-            | ProposalRevisionState::Completed { request, .. } => request.proposal_index == index,
-        });
-        println!(
-            "proposal {index} revision 0: {}",
-            if current_revision == Some(0) {
-                "current"
-            } else {
-                "superseded"
-            }
+    for generation in &state.generations {
+        let path = proposals::generation_candidate_path(
+            session,
+            generation.proposal_index,
+            generation.revision,
         );
-        display_proposal(candidate, &base_path);
-        match revision {
-            Some(ProposalRevisionState::Pending(request)) => {
-                println!("proposal {index} revision 1: pending");
-                println!("  rejection_feedback={:?}", request.feedback);
-            }
-            Some(ProposalRevisionState::Interrupted(request)) => {
-                println!("proposal {index} revision 1: interrupted/unknown");
-                println!("  rejection_feedback={:?}", request.feedback);
-            }
-            Some(ProposalRevisionState::Completed { request, proposal }) => {
-                let path = proposals::revision_candidate_path(session, index);
-                if fs::read(&path)? != proposal.result {
-                    return Err(
-                        format!("materialized revision for proposal {index} changed").into(),
-                    );
-                }
-                println!(
-                    "proposal {index} revision 1: {}",
-                    if current_revision == Some(1) {
-                        "current"
-                    } else {
-                        "superseded"
-                    }
-                );
-                println!("  rejection_feedback={:?}", request.feedback);
-                display_proposal(proposal, &path);
-            }
-            None => {}
+        if fs::read(&path)? != generation.proposal.result {
+            return Err(format!(
+                "materialized proposal {} revision {} changed",
+                generation.proposal_index, generation.revision
+            )
+            .into());
         }
+        let current = state
+            .current(session, generation.proposal_index)
+            .ok()
+            .is_some_and(|current| current.generation.revision == generation.revision);
+        println!(
+            "proposal {} revision {}: {}",
+            generation.proposal_index,
+            generation.revision,
+            if current { "current" } else { "superseded" }
+        );
+        if let Some(request) = state.revisions.iter().find_map(|revision| match revision {
+            ProposalRevisionState::Completed { request, .. }
+                if request.rejected.proposal_index == generation.proposal_index
+                    && request.next_revision().ok() == Some(generation.revision) =>
+            {
+                Some(request)
+            }
+            _ => None,
+        }) {
+            println!("  rejection_feedback={:?}", request.feedback);
+        }
+        display_proposal(&generation.proposal, &path);
+    }
+    if let Some(
+        revision @ (ProposalRevisionState::Pending(_) | ProposalRevisionState::Interrupted(_)),
+    ) = state.revisions.last()
+    {
+        let (request, status) = match revision {
+            ProposalRevisionState::Pending(request) => (request, "pending"),
+            ProposalRevisionState::Interrupted(request) => (request, "interrupted/unknown"),
+            ProposalRevisionState::Completed { .. } => unreachable!(),
+        };
+        println!(
+            "proposal {} revision {}: {status}",
+            request.rejected.proposal_index,
+            request.next_revision()?
+        );
+        println!("  rejection_feedback={:?}", request.feedback);
     }
     if let Some(command) = &state.command {
         let mut continuation_index = 0;
@@ -2248,7 +2202,7 @@ fn display_continuation(
                     proposal,
                 },
         } => {
-            let path = proposals::continuation_candidate_path(session, *proposal_index, *revision);
+            let path = proposals::generation_candidate_path(session, *proposal_index, *revision);
             if fs::read(&path)? != proposal.result {
                 return Err(format!(
                     "materialized continuation {} proposal changed",
@@ -2256,11 +2210,12 @@ fn display_continuation(
                 )
                 .into());
             }
-            let status = if state.current(session, *proposal_index)?.revision == *revision {
-                "current"
-            } else {
-                "superseded"
-            };
+            let status =
+                if state.current(session, *proposal_index)?.generation.revision == *revision {
+                    "current"
+                } else {
+                    "superseded"
+                };
             println!(
                 "proposal {proposal_index} revision {revision}: {status} admitted_path_index={admitted_path_index}"
             );
@@ -2402,7 +2357,7 @@ fn run_proposal_continuation_with_adapter(
     let state = reconstruct_proposal_session(&session)?;
     validate_continuation_start(model, &state)?;
     let sequence = state.next_continuation_sequence()?;
-    let current = state.generations_before_continuation(&session, sequence)?;
+    let current = state.generations_before_continuation(sequence)?;
     let finished = state
         .command
         .as_ref()
@@ -2462,7 +2417,7 @@ fn run_proposal_continuation_with_adapter(
 }
 
 fn proposal_promotion_paths(session: &Path, index: usize, revision: u32) -> (PathBuf, PathBuf) {
-    if revision < 2 {
+    if revision == 0 {
         (
             session.join(format!("promotion-{index}.qj")),
             session.join(format!("promotion-{index}.qm")),
@@ -2479,7 +2434,7 @@ fn proposal_operation(index: usize, revision: u32) -> Result<u64, Box<dyn std::e
     let index = u64::try_from(index)?
         .checked_add(1)
         .ok_or("proposal operation overflow")?;
-    if revision < 2 {
+    if revision == 0 {
         Ok(index)
     } else {
         Ok((u64::from(revision)
@@ -2510,14 +2465,15 @@ fn run_proposal_promotion(session: &Path, index: usize) -> Result<(), Box<dyn st
         }
         PromotionStatus::Absent | PromotionStatus::Approved => {}
     }
-    let candidate = current.proposal;
+    let candidate = &current.generation.proposal;
     let candidate_path = current.path.clone();
     let repository_root = repository_root()?;
     let source = proposals::resolve_source(&repository_root, &candidate.path)?;
     if fs::read(&candidate_path)? != candidate.result {
         return Err(format!("proposal candidate {index} changed before approval").into());
     }
-    let (journal, mutation) = proposal_promotion_paths(&session, index, current.revision);
+    let (journal, mutation) =
+        proposal_promotion_paths(&session, index, current.generation.revision);
     let live = fs::read(&source)?;
     let live_digest = digest(&live);
     if live_digest != candidate.source_sha256
@@ -2529,18 +2485,18 @@ fn run_proposal_promotion(session: &Path, index: usize) -> Result<(), Box<dyn st
         )
         .into());
     }
-    let operation = proposal_operation(index, current.revision)?;
+    let operation = proposal_operation(index, current.generation.revision)?;
     let mut session_log = session::SessionLog::open(&session)?;
     if state.promotion_status(&current) == PromotionStatus::Absent {
         session_log.append(session::SessionFact::ProposalApproved {
             proposal_index: index,
-            revision: current.revision,
+            revision: current.generation.revision,
             candidate_sha256: candidate.result_sha256.clone(),
         })?;
     }
     session_log.append(session::SessionFact::PromotionStarted {
         proposal_index: index,
-        revision: current.revision,
+        revision: current.generation.revision,
         candidate_sha256: candidate.result_sha256.clone(),
         operation,
     })?;
@@ -2577,7 +2533,7 @@ fn run_proposal_promotion(session: &Path, index: usize) -> Result<(), Box<dyn st
     }
     session_log.append(session::SessionFact::ProposalPromoted {
         proposal_index: index,
-        revision: current.revision,
+        revision: current.generation.revision,
         candidate_sha256: candidate.result_sha256.clone(),
         operation,
     })?;
@@ -3358,12 +3314,17 @@ mod proposal_runtime_tests {
         .unwrap();
         initialize_proposal_session(&session, &admission, &base_response);
         let (_, proposals) = reconstruct_base_proposals(&session).unwrap();
+        let rejected = proposals::ProposalGeneration {
+            proposal_index: 0,
+            admitted_path_index: 0,
+            revision: 0,
+            proposal: proposals[0].clone(),
+        };
         let revision = proposals::Revision::new(
             "test-model",
             b"Use the corrected alpha label.",
             &admission,
-            &proposals,
-            0,
+            &rejected,
         )
         .unwrap();
         let revision_prompt = revision.prompt_bytes().unwrap();
@@ -3409,18 +3370,177 @@ mod proposal_runtime_tests {
 
         let state = reconstruct_proposal_session(&session).unwrap();
         let current = state.current(&session, 0).unwrap();
-        assert_eq!(current.proposal.result, b"alpha corrected\n");
-        assert_eq!(fs::read(current.path).unwrap(), current.proposal.result);
+        assert_eq!(current.generation.proposal.result, b"alpha corrected\n");
+        assert_eq!(
+            fs::read(current.path).unwrap(),
+            current.generation.proposal.result
+        );
         let sibling = state.current(&session, 1).unwrap();
-        assert_eq!(sibling.proposal.result, b"beta accepted\n");
-        fs::remove_file(proposals::revision_prompt_path(&session)).unwrap();
-        fs::remove_file(proposals::revision_candidate_path(&session, 0)).unwrap();
-        fs::remove_file(session.join("revision-1.json")).unwrap();
-        run_proposal_revision("test-model", &session, 0, &session.join("missing-feedback"))
-            .unwrap();
-        assert!(proposals::revision_prompt_path(&session).is_file());
-        assert!(proposals::revision_candidate_path(&session, 0).is_file());
-        assert!(session.join("revision-1.json").is_file());
+        assert_eq!(sibling.generation.proposal.result, b"beta accepted\n");
+        fs::remove_file(proposals::revision_prompt_path(&session, &revision).unwrap()).unwrap();
+        fs::remove_file(proposals::generation_candidate_path(&session, 0, 1)).unwrap();
+        fs::remove_file(session.join("proposal-0.revision-1.json")).unwrap();
+        reconstruct_proposal_session(&session).unwrap();
+        assert!(
+            proposals::revision_prompt_path(&session, &revision)
+                .unwrap()
+                .is_file()
+        );
+        assert!(proposals::generation_candidate_path(&session, 0, 1).is_file());
+        assert!(session.join("proposal-0.revision-1.json").is_file());
+        fs::remove_dir_all(session).unwrap();
+    }
+
+    #[test]
+    fn repeated_revisions_advance_and_stale_generation_rejection_fails_closed() {
+        let admission = proposals::Admission {
+            task: "revise one proposal repeatedly".into(),
+            files: vec![
+                admitted("alpha.txt", b"alpha\n"),
+                admitted("beta.txt", b"beta\n"),
+            ],
+        };
+        let response = serde_json::to_vec(&serde_json::json!({
+            "proposals": [
+                ranged_proposal("alpha.txt", &admission.files[0], "alpha proposed\n"),
+                ranged_proposal("beta.txt", &admission.files[1], "beta proposed\n")
+            ]
+        }))
+        .unwrap();
+
+        let session = temporary_directory();
+        initialize_proposal_session(&session, &admission, &response);
+        append_completed_revision(&session, 0, "First correction.", "alpha revision one\n");
+        let second =
+            append_completed_revision(&session, 0, "Second correction.", "alpha revision two\n");
+        assert_eq!(second.rejected.revision, 1);
+        let restarted = reconstruct_proposal_session(&session).unwrap();
+        let current = restarted.current(&session, 0).unwrap();
+        assert_eq!(current.generation.revision, 2);
+        assert_eq!(current.generation.proposal.result, b"alpha revision two\n");
+        let mut log = session::SessionLog::open(&session).unwrap();
+        log.append(session::SessionFact::ProposalApproved {
+            proposal_index: 0,
+            revision: current.generation.revision,
+            candidate_sha256: current.generation.proposal.result_sha256.clone(),
+        })
+        .unwrap();
+        let restarted = reconstruct_proposal_session(&session).unwrap();
+        let current = restarted.current(&session, 0).unwrap();
+        assert_eq!(
+            restarted.promotion_status(&current),
+            PromotionStatus::Approved
+        );
+        fs::remove_dir_all(session).unwrap();
+
+        let stale_session = temporary_directory();
+        initialize_proposal_session(&stale_session, &admission, &response);
+        append_completed_revision(
+            &stale_session,
+            0,
+            "First correction.",
+            "alpha revision one\n",
+        );
+        let stale = append_completed_revision(
+            &stale_session,
+            0,
+            "Second correction.",
+            "alpha revision two\n",
+        )
+        .rejected;
+        let mut log = session::SessionLog::open(&stale_session).unwrap();
+        log.append(session::SessionFact::ProposalRejected {
+            proposal_index: 0,
+            revision: stale.revision,
+            candidate_sha256: "stale-digest".into(),
+            model: "test-model".into(),
+            feedback: "Stale correction.".into(),
+        })
+        .unwrap();
+        assert!(reconstruct_proposal_session(&stale_session).is_err());
+        fs::remove_dir_all(stale_session).unwrap();
+    }
+
+    #[test]
+    fn pending_and_interrupted_revision_restart_boundaries_fail_closed() {
+        let session = temporary_directory();
+        let admission = proposals::Admission {
+            task: "interrupt a correction".into(),
+            files: vec![
+                admitted("alpha.txt", b"alpha\n"),
+                admitted("beta.txt", b"beta\n"),
+            ],
+        };
+        let response = serde_json::to_vec(&serde_json::json!({
+            "proposals": [
+                ranged_proposal("alpha.txt", &admission.files[0], "alpha proposed\n"),
+                ranged_proposal("beta.txt", &admission.files[1], "beta proposed\n")
+            ]
+        }))
+        .unwrap();
+        initialize_proposal_session(&session, &admission, &response);
+        let state = reconstruct_proposal_session(&session).unwrap();
+        let current = state.current(&session, 0).unwrap();
+        let request = proposals::Revision::new(
+            "test-model",
+            b"Durable feedback.",
+            &state.admission,
+            current.generation,
+        )
+        .unwrap();
+        let mut log = session::SessionLog::open(&session).unwrap();
+        log.append(session::SessionFact::ProposalRejected {
+            proposal_index: 0,
+            revision: 0,
+            candidate_sha256: current.generation.proposal.result_sha256.clone(),
+            model: request.model.clone(),
+            feedback: request.feedback.clone(),
+        })
+        .unwrap();
+        let restarted = reconstruct_proposal_session(&session).unwrap();
+        assert!(matches!(
+            restarted.revisions.last(),
+            Some(ProposalRevisionState::Pending(pending)) if pending == &request
+        ));
+        assert!(run_proposal_promotion(&session, 0).is_err());
+
+        let prompt = request.prompt_bytes().unwrap();
+        log.append(session::SessionFact::ModelStarted {
+            turn: session::ModelTurn::Revision {
+                proposal_index: 0,
+                revision: 1,
+            },
+            model: request.model.clone(),
+            prompt_sha256: session::sha256(&prompt),
+            prompt: String::from_utf8(prompt).unwrap(),
+        })
+        .unwrap();
+        let restarted = reconstruct_proposal_session(&session).unwrap();
+        assert!(matches!(
+            restarted.revisions.last(),
+            Some(ProposalRevisionState::Interrupted(interrupted)) if interrupted == &request
+        ));
+        let before = log.facts().len();
+        let error = run_proposal_revision(
+            "test-model",
+            &session,
+            0,
+            Path::new("feedback-file-is-not-read"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("interrupted/unknown"));
+        assert_eq!(
+            session::SessionLog::open(&session).unwrap().facts().len(),
+            before
+        );
+        log.append(session::SessionFact::ProposalApproved {
+            proposal_index: 0,
+            revision: 0,
+            candidate_sha256: current.generation.proposal.result_sha256.clone(),
+        })
+        .unwrap();
+        assert!(reconstruct_proposal_session(&session).is_err());
         fs::remove_dir_all(session).unwrap();
     }
 
@@ -3480,12 +3600,12 @@ mod proposal_runtime_tests {
         .unwrap();
         initialize_proposal_session(&revision_session, &admission, &response);
         let state = reconstruct_proposal_session(&revision_session).unwrap();
+        let current = state.current(&revision_session, 0).unwrap();
         let request = proposals::Revision::new(
             "test-model",
             b"correct alpha",
             &state.admission,
-            &state.proposals,
-            0,
+            current.generation,
         )
         .unwrap();
         let prompt = request.prompt_bytes().unwrap();
@@ -3493,7 +3613,7 @@ mod proposal_runtime_tests {
         log.append(session::SessionFact::ProposalRejected {
             proposal_index: 0,
             revision: 0,
-            candidate_sha256: state.proposals[0].result_sha256.clone(),
+            candidate_sha256: current.generation.proposal.result_sha256.clone(),
             model: "test-model".into(),
             feedback: "correct alpha".into(),
         })
@@ -3510,7 +3630,7 @@ mod proposal_runtime_tests {
         .unwrap();
         let restarted = reconstruct_proposal_session(&revision_session).unwrap();
         assert!(matches!(
-            restarted.revision,
+            restarted.revisions.last(),
             Some(ProposalRevisionState::Interrupted(_))
         ));
         let before = log.facts().len();
@@ -3536,18 +3656,18 @@ mod proposal_runtime_tests {
         initialize_proposal_session(&promotion_session, &admission, &response);
         let state = reconstruct_proposal_session(&promotion_session).unwrap();
         let current = state.current(&promotion_session, 0).unwrap();
-        let operation = proposal_operation(0, current.revision).unwrap();
+        let operation = proposal_operation(0, current.generation.revision).unwrap();
         let mut log = session::SessionLog::open(&promotion_session).unwrap();
         log.append(session::SessionFact::ProposalApproved {
             proposal_index: 0,
-            revision: current.revision,
-            candidate_sha256: current.proposal.result_sha256.clone(),
+            revision: current.generation.revision,
+            candidate_sha256: current.generation.proposal.result_sha256.clone(),
         })
         .unwrap();
         log.append(session::SessionFact::PromotionStarted {
             proposal_index: 0,
-            revision: current.revision,
-            candidate_sha256: current.proposal.result_sha256.clone(),
+            revision: current.generation.revision,
+            candidate_sha256: current.generation.proposal.result_sha256.clone(),
             operation,
         })
         .unwrap();
@@ -3609,7 +3729,7 @@ mod proposal_runtime_tests {
         let finished = history.latest_finished().unwrap();
         assert_eq!(finished.exit_code, Some(7));
         assert_eq!(finished.stderr.bytes().unwrap(), b"validation-failed");
-        let current = state.generations_before_continuation(&session, 1).unwrap();
+        let current = state.generations_before_continuation(1).unwrap();
         let request = proposals::Continuation::new(
             1,
             "test-model",
@@ -3634,14 +3754,29 @@ mod proposal_runtime_tests {
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         let reconstructed = reconstruct_proposal_session(&session).unwrap();
         let corrected = reconstructed.current(&session, 0).unwrap();
-        assert_eq!(corrected.revision, 2);
+        assert_eq!(corrected.generation.revision, 1);
         assert_eq!(
-            corrected.proposal.result,
+            corrected.generation.proposal.result,
             b"alpha corrected after failure\n"
         );
+        let continuation_generation = corrected.generation.clone();
+        let correction = append_completed_revision(
+            &session,
+            0,
+            "Tighten the continuation correction.",
+            "alpha corrected after review\n",
+        );
+        assert_eq!(correction.rejected, continuation_generation);
+        let reconstructed = reconstruct_proposal_session(&session).unwrap();
+        let corrected = reconstructed.current(&session, 0).unwrap();
+        assert_eq!(corrected.generation.revision, 2);
+        assert_eq!(
+            corrected.generation.proposal.result,
+            b"alpha corrected after review\n"
+        );
         assert_eq!(fs::read(&sources[0]).unwrap(), b"alpha proposed\n");
-        assert!(session.join("promotion-0.qj").is_file());
         assert!(!session.join("promotion-0-revision-2.qj").exists());
+        assert!(!session.join("promotion-0-revision-1.qj").exists());
         assert!(
             run_approved_command(
                 &session,
@@ -3652,7 +3787,7 @@ mod proposal_runtime_tests {
         run_proposal_promotion(&session, 0).unwrap();
         assert_eq!(
             fs::read(&sources[0]).unwrap(),
-            b"alpha corrected after failure\n"
+            b"alpha corrected after review\n"
         );
         assert!(session.join("promotion-0-revision-2.qj").is_file());
         assert!(session.join("promotion-0-revision-2.qm").is_file());
@@ -3671,7 +3806,7 @@ mod proposal_runtime_tests {
         let second_finished = history.latest_finished().unwrap();
         assert!(second_finished.succeeded());
         let current = after_second_command
-            .generations_before_continuation(&session, 2)
+            .generations_before_continuation(2)
             .unwrap();
         assert!(
             proposals::Continuation::from_prompt(
@@ -3705,7 +3840,7 @@ mod proposal_runtime_tests {
         .unwrap();
         fs::remove_file(proposals::continuation_prompt_path(&session, 1)).unwrap();
         fs::remove_file(session.join("continuation-1.json")).unwrap();
-        fs::remove_file(proposals::continuation_candidate_path(&session, 0, 2)).unwrap();
+        fs::remove_file(proposals::generation_candidate_path(&session, 0, 1)).unwrap();
         fs::remove_file(proposals::continuation_prompt_path(&session, 2)).unwrap();
         fs::remove_file(session.join("continuation-2.json")).unwrap();
         fs::remove_file(proposals::completion_summary_path(&session, 2)).unwrap();
@@ -3715,7 +3850,7 @@ mod proposal_runtime_tests {
         assert!(matches!(
             complete.continuations[0],
             ProposalContinuationState::Completed {
-                response: proposals::ContinuationResponse::Proposal { revision: 2, .. },
+                response: proposals::ContinuationResponse::Proposal { revision: 1, .. },
                 ..
             }
         ));
@@ -3825,9 +3960,7 @@ mod proposal_runtime_tests {
         assert!(finished.succeeded());
         assert_eq!(finished.stdout.bytes().unwrap(), b"validation-passed");
         assert!(restarted.continuations.is_empty());
-        let current = restarted
-            .generations_before_continuation(&session, 1)
-            .unwrap();
+        let current = restarted.generations_before_continuation(1).unwrap();
         let request = proposals::Continuation::new(
             1,
             "test-model",
@@ -3952,8 +4085,8 @@ mod proposal_runtime_tests {
             .unwrap()
             .append(session::SessionFact::ProposalApproved {
                 proposal_index: 0,
-                revision: current.revision,
-                candidate_sha256: current.proposal.result_sha256.clone(),
+                revision: current.generation.revision,
+                candidate_sha256: current.generation.proposal.result_sha256.clone(),
             })
             .unwrap();
         assert!(reconstruct_proposal_session(&session).is_err());
@@ -3970,7 +4103,7 @@ mod proposal_runtime_tests {
         .unwrap();
         let failed = reconstruct_proposal_session(&session).unwrap();
         let failed_result = failed.command.as_ref().unwrap().latest_finished().unwrap();
-        let current = failed.generations_before_continuation(&session, 1).unwrap();
+        let current = failed.generations_before_continuation(1).unwrap();
         let correction = proposals::Continuation::new(
             1,
             "test-model",
@@ -4003,7 +4136,7 @@ mod proposal_runtime_tests {
         .unwrap();
         let second = reconstruct_proposal_session(&session).unwrap();
         let second_result = second.command.as_ref().unwrap().latest_finished().unwrap();
-        let current = second.generations_before_continuation(&session, 2).unwrap();
+        let current = second.generations_before_continuation(2).unwrap();
         let continuation = proposals::Continuation::new(
             2,
             "test-model",
@@ -4186,6 +4319,66 @@ mod proposal_runtime_tests {
             before_sha256: digest(content),
             content: content.to_vec(),
         }
+    }
+
+    fn append_completed_revision(
+        session: &Path,
+        index: usize,
+        feedback: &str,
+        result: &str,
+    ) -> proposals::Revision {
+        let state = reconstruct_proposal_session(session).unwrap();
+        let current = state.current(session, index).unwrap();
+        let request = proposals::Revision::new(
+            "test-model",
+            feedback.as_bytes(),
+            &state.admission,
+            current.generation,
+        )
+        .unwrap();
+        let revision = request.next_revision().unwrap();
+        let prompt = request.prompt_bytes().unwrap();
+        let source = admitted(
+            &current.generation.proposal.path,
+            &current.generation.proposal.source,
+        );
+        let response = serde_json::to_vec(&serde_json::json!({
+            "proposal": ranged_proposal(&source.path, &source, result)
+        }))
+        .unwrap();
+        let mut log = session::SessionLog::open(session).unwrap();
+        log.append(session::SessionFact::ProposalRejected {
+            proposal_index: index,
+            revision: request.rejected.revision,
+            candidate_sha256: request.rejected.proposal.result_sha256.clone(),
+            model: request.model.clone(),
+            feedback: request.feedback.clone(),
+        })
+        .unwrap();
+        let prompt_sha256 = session::sha256(&prompt);
+        log.append(session::SessionFact::ModelStarted {
+            turn: session::ModelTurn::Revision {
+                proposal_index: index,
+                revision,
+            },
+            model: request.model.clone(),
+            prompt_sha256: prompt_sha256.clone(),
+            prompt: String::from_utf8(prompt).unwrap(),
+        })
+        .unwrap();
+        log.append(session::SessionFact::ModelCompleted {
+            turn: session::ModelTurn::Revision {
+                proposal_index: index,
+                revision,
+            },
+            prompt_sha256,
+            response_sha256: session::sha256(&response),
+            response: String::from_utf8(response).unwrap(),
+            provenance: format!("test:revision-{revision}"),
+        })
+        .unwrap();
+        reconstruct_proposal_session(session).unwrap();
+        request
     }
 
     fn ranged_proposal(
