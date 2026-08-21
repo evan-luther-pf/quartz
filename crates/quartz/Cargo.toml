@@ -1,6 +1,7 @@
 [package]
 name = "quartz"
 version = "0.1.0"
+description = "CLI crate for the Quartz WebAssembly runtime"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

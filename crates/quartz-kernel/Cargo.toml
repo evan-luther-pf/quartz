@@ -1,6 +1,7 @@
 [package]
 name = "quartz-kernel"
 version = "0.1.0"
+description = "Kernel crate for the Quartz WebAssembly runtime"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

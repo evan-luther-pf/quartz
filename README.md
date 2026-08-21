@@ -7,8 +7,8 @@ component-authored patches, crash-safe desired-composition recovery, a
 transactional durable event stream, restart-safe deterministic agent turns,
 host-admitted immutable repository inspection, credential-safe production
 model exchange, authority-approved isolated repository editing, durable
-reviewed application, and separately approved retention of model-authored
-candidates in Rust. All acceptance
+reviewed application, separately approved retention of model-authored
+candidates, and resumable multi-proposal repository turns in Rust. All acceptance
 components run as sandboxed Wasmtime components through
 `wit/quartz-component.wit`. Product knowledge and measured tradeoffs live in
 `lode/`; the primary architecture paper is vendored at
@@ -74,3 +74,23 @@ state under the host deadline, reconstructs the exact assistant payload from
 fresh runtime state, recovers live authority, and leaves the `.qj`, `.qe`, and
 `.qx` durable records for inspection. OpenAI temporarily stores background
 response data for asynchronous execution and polling.
+
+Multi-proposal production turn:
+
+```sh
+OPENAI_API_KEY="$OPENAI_API_KEY" cargo run --release -p quartz -- \
+  --propose gpt-5.4 /path/to/task.txt /path/to/session \
+  path/to/source-a path/to/source-b
+cargo run --release -p quartz -- \
+  --resume-proposals /path/to/session
+cargo run --release -p quartz -- \
+  --promote-proposal /path/to/session 0
+```
+
+The proposal command admits two or three exact UTF-8 files, commits one bounded
+production turn, validates multiple path-bound complete-file candidates, and
+leaves every source unchanged. Resume reconstructs the candidates and renders
+exact diffs without credentials or another exchange. Promotion is an explicit
+per-candidate action through the existing workspace, mutation, and retention
+authorities; it verifies the committed bytes after restart before recovering
+all live authority.

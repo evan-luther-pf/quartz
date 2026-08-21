@@ -134,12 +134,28 @@ each. The approved workspace test command passed 67 tests across 12 suites; its
 bounded result entered a durable production turn and the model returned
 `VALIDATION PASSED.` No kernel, dependency, or tracked-file addition was needed.
 
+The production CLI now admits two or three exact UTF-8 repository files and one
+task into a bounded immutable prompt, completes one credentialed model turn,
+and accepts only a strict JSON response containing at least two unique
+path-bound complete-file proposals. The durable prompt and assistant-message
+events reconstruct byte-identical candidate caches without credentials or a
+second exchange. The CLI renders exact bounded diffs, and each separately
+approved proposal publishes through the existing ABI 10 workspace, mutation,
+and promotion authorities with restart verification and clean withdrawal.
+
+The live dogfood session inspected both package manifests in one `gpt-5.4`
+turn. It reconstructed both pending candidates offline, rendered their exact
+description-only diffs, and durably promoted each user-approved digest. The
+workspace test command then passed 74 tests across 12 suites. No kernel, WIT,
+package dependency, retry path, or atomic multi-file transaction was added.
+
 ## Next boundary
 
-The dogfood run exposed orchestration, not validation transactions, as the next
-product gap: a production agent component still cannot choose among admitted
-repository reads or return multiple path-bound proposals in one resumable turn.
-That path should be exercised before introducing another kernel capability.
+The orchestration path remains one bounded proposal turn rather than an agent
+loop. It cannot yet carry a rejection or command result into a subsequent turn
+while preserving the admitted repository snapshot set and prior durable
+evidence. That resumable correction boundary should be exercised before adding
+model-selected tools or another kernel capability.
 
 ## Non-goals
 

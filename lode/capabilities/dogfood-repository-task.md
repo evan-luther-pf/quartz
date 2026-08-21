@@ -154,3 +154,106 @@ explicit acceptance command.
 - ABI 10, the kernel, package dependencies, and the tracked file set are
   unchanged. Promotion, exchange, event, and mutation records remain under
   `.quartz/dogfood-cli-safety/` for inspection.
+
+## Resumable multi-proposal orchestration
+
+### Problem
+
+The production path accepts one prebuilt prompt and returns one opaque response.
+It cannot yet admit a small set of repository files, let the model choose among
+only those files, validate multiple path-bound candidates, or reconstruct those
+pending proposals without another model call.
+
+### Observable behavior
+
+`quartz --propose <model> <task-path> <session-dir> <source> <source>
+[source]` admits two or three UTF-8 repository files and one task. The host
+builds one bounded immutable prompt snapshot containing exact relative paths,
+before digests, and bytes. The existing sandboxed production client submits
+that snapshot through the existing durable turn and exchange path. A successful
+response contains two or three complete-file proposals selected only from the
+admitted paths.
+
+Quartz validates the strict response shape, path membership, uniqueness, exact
+before digests, candidate bounds, and changed bytes before materializing
+derived candidate files under the session directory.
+`quartz --resume-proposals <session-dir>` reconstructs the same candidates from
+the durable response event without credentials or another exchange.
+`quartz --promote-proposal <session-dir> <index>` is the explicit approval for
+one displayed candidate and promotes only that candidate through the existing
+workspace, mutation-authority, and promotion-authority contracts.
+
+### Non-goals
+
+- A new kernel capability, ABI revision, prompt framework, tool registry, or
+  provider protocol.
+- Model-selected filesystem access, ambient directory traversal, automatic
+  diff approval, or automatic promotion.
+- Atomic multi-file publication, rollback of an already promoted sibling, merge
+  resolution, retries, or validation-command orchestration.
+- More than three admitted files or binary repository content.
+
+### Invariants
+
+- ABI 10 and all kernel contracts remain unchanged.
+- The host canonicalizes each source under the repository root, rejects
+  duplicates, and records its exact relative path, SHA-256, and bytes before the
+  model request.
+- The generated prompt, each source, the response, and each candidate are
+  independently bounded. Guest code receives one numeric snapshot grant and no
+  path or ambient filesystem authority.
+- The response is one strict JSON object with a `proposals` array. Each proposal
+  has exactly `path`, `before_sha256`, and `content`; at least two unique
+  admitted paths must be present.
+- The durable assistant-message payload is the source of truth. Candidate files
+  are reconstructible caches and may be replaced only from that payload.
+- Invalid or ambiguous responses remain durable evidence and never trigger an
+  automatic model retry.
+- Promotion is per proposal. The approval command binds the admitted canonical
+  source, exact before and result digests, positive operation identity, byte
+  bound, and separate durable mutation ledger.
+- Model exchange, event facts, promotion commits, and approved source bytes are
+  external emissions. Component recovery withdraws live authority without
+  claiming to erase them.
+
+### Public contract
+
+No WIT or kernel API changes. One new sandboxed promoter component composes
+existing snapshot reads, workspace buffering, callable mutation approval,
+publication, and promotion. The executable owns bounded admission, strict JSON
+validation, candidate reconstruction, explicit command dispatch, and review
+presentation.
+
+### Acceptance scenario
+
+1. Admit one task plus two exact real repository files into a fresh bounded
+   session.
+2. Complete one credentialed production turn returning two valid path-bound
+   complete-file proposals.
+3. Terminate, reopen without credentials, and reconstruct byte-identical
+   candidates from the durable response event without another exchange.
+4. Render both exact diffs and obtain separate explicit user approval.
+5. Promote each approved candidate independently through ABI 10 authorities.
+6. Reopen each promotion runtime, verify the exact candidate remains published,
+   then withdraw all live authority cleanly.
+7. Retain the production turn, proposal materialization metadata, and promotion
+   ledgers under `.quartz/`; add no kernel code or package dependency.
+
+### Verification
+
+- One credentialed `gpt-5.4` turn admitted `crates/quartz/Cargo.toml` and
+  `crates/quartz-kernel/Cargo.toml`, returned two valid complete-file
+  candidates, and left both sources unchanged.
+- A credential-free process reconstructed proposal digests
+  `c3c1fdf1131958957b50bb308de289ff921acfce98e8014e6a7b71c071371c68`
+  and
+  `93f7f6676a52375f12a4c43dcf0ebf0a50682beae14944863ea9f67e2ba28532`
+  from the durable turn and rendered exact description-only diffs.
+- The user approved each diff separately. Independent promotion commands
+  published each exact digest, reconstructed it after restart, and withdrew to
+  a clean context while retaining the approved bytes.
+- `cargo test -p quartz --bin quartz` passed 15 focused contracts.
+  `cargo test --workspace --all-targets` passed 74 tests across 12 suites.
+  The production turn, derived proposal metadata and candidates, and separate
+  promotion journals and mutation ledgers remain under
+  `.quartz/dogfood-multi-proposal/`.

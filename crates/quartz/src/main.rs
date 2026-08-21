@@ -1,4 +1,5 @@
 mod openai;
+mod proposals;
 
 use quartz_kernel::{
     ComponentSpec, ComponentTree, CompositionPatch, Error, EventGrant, ExchangeAdapter,
@@ -36,6 +37,9 @@ Commands:
   --reviewed-edit <directory>
   --promote-edit <directory>
   --production-model <model> <prompt> <journal>
+  --propose <model> <task> <session> <source> <source> [source]
+  --resume-proposals <session>
+  --promote-proposal <session> <index>
 ";
 
 #[derive(Debug, Eq, PartialEq)]
@@ -61,6 +65,17 @@ enum CliCommand {
         model: String,
         prompt: PathBuf,
         journal: PathBuf,
+    },
+    Propose {
+        model: String,
+        task: PathBuf,
+        session: PathBuf,
+        sources: Vec<PathBuf>,
+    },
+    ResumeProposals(PathBuf),
+    PromoteProposal {
+        session: PathBuf,
+        index: usize,
     },
 }
 
@@ -109,6 +124,17 @@ fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), Box<dyn std::er
             prompt,
             journal,
         } => run_production_model(&model, &prompt, &journal)?,
+        CliCommand::Propose {
+            model,
+            task,
+            session,
+            sources,
+        } => run_multi_proposal(&model, &task, &session, &sources)?,
+        CliCommand::ResumeProposals(session) => {
+            let proposals = reconstruct_proposals(&session)?;
+            display_proposals(&session, &proposals)?;
+        }
+        CliCommand::PromoteProposal { session, index } => run_proposal_promotion(&session, index)?,
     }
     Ok(())
 }
@@ -164,6 +190,49 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CliCommand, Stri
             prompt: path_arg(&mut args, command, "<model> <prompt> <journal>")?,
             journal: path_arg(&mut args, command, "<model> <prompt> <journal>")?,
         },
+        "--propose" => {
+            let model = required_arg(
+                &mut args,
+                command,
+                "<model> <task> <session> <source> <source> [source]",
+            )?;
+            let task = path_arg(
+                &mut args,
+                command,
+                "<model> <task> <session> <source> <source> [source]",
+            )?;
+            let session = path_arg(
+                &mut args,
+                command,
+                "<model> <task> <session> <source> <source> [source]",
+            )?;
+            let sources: Vec<PathBuf> = args.by_ref().map(PathBuf::from).collect();
+            if !(2..=3).contains(&sources.len())
+                || sources.iter().any(|path| path.as_os_str().is_empty())
+            {
+                return Err(
+                    "`--propose` requires two or three non-empty <source> paths; try `quartz --help`"
+                        .into(),
+                );
+            }
+            CliCommand::Propose {
+                model,
+                task,
+                session,
+                sources,
+            }
+        }
+        "--resume-proposals" => {
+            CliCommand::ResumeProposals(path_arg(&mut args, command, "<session>")?)
+        }
+        "--promote-proposal" => {
+            let session = path_arg(&mut args, command, "<session> <index>")?;
+            let value = required_arg(&mut args, command, "<session> <index>")?;
+            let index = value
+                .parse()
+                .map_err(|_| format!("invalid proposal index: `{value}`"))?;
+            CliCommand::PromoteProposal { session, index }
+        }
         unknown => {
             return Err(format!("unknown command `{unknown}`; try `quartz --help`"));
         }
@@ -1014,6 +1083,243 @@ fn run_agent_phase(journal: &Path, phase: AgentPhase) -> Result<(), Box<dyn std:
     Ok(())
 }
 
+fn run_multi_proposal(
+    model: &str,
+    task: &Path,
+    session: &Path,
+    sources: &[PathBuf],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if session.exists() {
+        if !session.is_dir() || session.read_dir()?.next().is_some() {
+            return Err(format!(
+                "proposal session `{}` must be absent or empty",
+                session.display()
+            )
+            .into());
+        }
+    } else {
+        fs::create_dir_all(session)?;
+    }
+    let session = fs::canonicalize(session)?;
+    let admission = proposals::Admission::from_files(&repository_root()?, task, sources)?;
+    let prompt = session.join("admission.prompt");
+    let journal = session.join("turn.qj");
+    fs::write(&prompt, admission.prompt_bytes()?)?;
+
+    let api_key =
+        std::env::var("OPENAI_API_KEY").map_err(|_| "OPENAI_API_KEY is required for --propose")?;
+    let adapter = Arc::new(openai::OpenAiResponses::new(api_key, model.to_owned())?);
+    let (response, provenance) =
+        run_exchange_turn_with_limits(&prompt, &journal, adapter, proposal_limits())?;
+    let candidates = proposals::parse_response(&response, &admission)?;
+    proposals::materialize(&session, &candidates)?;
+    display_proposals(&session, &candidates)?;
+    println!("response provenance: {provenance}");
+    println!("proposal turn reconstructed; no source changed");
+    Ok(())
+}
+
+fn reconstruct_proposals(
+    session: &Path,
+) -> Result<Vec<proposals::Proposal>, Box<dyn std::error::Error>> {
+    let session = fs::canonicalize(session)?;
+    let journal = session.join("turn.qj");
+    let (prompt, response) = read_durable_proposal_turn(&journal)?;
+    let admission = proposals::Admission::from_prompt(&prompt)?;
+    let candidates = proposals::parse_response(&response, &admission)?;
+    proposals::materialize(&session, &candidates)?;
+    Ok(candidates)
+}
+
+fn display_proposals(
+    session: &Path,
+    candidates: &[proposals::Proposal],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (index, candidate) in candidates.iter().enumerate() {
+        let path = proposals::candidate_path(session, index);
+        if fs::read(&path)? != candidate.content {
+            return Err(format!("materialized candidate {index} changed").into());
+        }
+        println!("proposal {index}: {}", candidate.path);
+        println!("  before_sha256={}", candidate.before_sha256);
+        println!("  result_sha256={}", candidate.result_sha256);
+        println!("  candidate={}", path.display());
+        print!("{}", proposals::render_diff(candidate));
+    }
+    Ok(())
+}
+
+fn read_durable_proposal_turn(
+    journal: &Path,
+) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
+    let fixtures = PathBuf::from(env!("QUARTZ_FIXTURE_DIR"));
+    let events = journal.with_extension("qe");
+    let mut runtime = Runtime::open_persistent(
+        proposal_limits(),
+        ComponentSpec::new("event-store", artifact(&fixtures, "event-store"))
+            .with_journal_paths(vec![journal.to_path_buf()])
+            .with_event_stream_paths(vec![events]),
+    )?;
+    let records = runtime.events();
+    let payload = |kind| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let matches: Vec<_> = records
+            .iter()
+            .filter(|event| event.value >> 56 == kind && ((event.value >> 48) & 0xff) == 1)
+            .collect();
+        if matches.len() != 1 {
+            return Err(format!(
+                "durable proposal turn has {} facts of kind {kind}; expected one",
+                matches.len()
+            )
+            .into());
+        }
+        matches[0]
+            .payload
+            .as_ref()
+            .map(|payload| payload.bytes.clone())
+            .ok_or_else(|| format!("durable proposal fact kind {kind} has no payload").into())
+    };
+    if records
+        .iter()
+        .filter(|event| event.value >> 56 == 7 && ((event.value >> 48) & 0xff) == 1)
+        .count()
+        != 1
+    {
+        return Err("durable proposal turn is not terminal".into());
+    }
+    let prompt = payload(1)?;
+    let response = payload(5)?;
+    runtime.shutdown_persistent()?;
+    if !runtime.is_observationally_clean() {
+        return Err("proposal reconstruction authority did not recover".into());
+    }
+    Ok((prompt, response))
+}
+
+fn run_proposal_promotion(session: &Path, index: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let session = fs::canonicalize(session)?;
+    let candidates = reconstruct_proposals(&session)?;
+    let candidate = candidates
+        .get(index)
+        .ok_or_else(|| format!("proposal index {index} is absent"))?;
+    let repository_root = repository_root()?;
+    let source = proposals::resolve_source(&repository_root, &candidate.path)?;
+    let candidate_path = proposals::candidate_path(&session, index);
+    if fs::read(&candidate_path)? != candidate.content {
+        return Err(format!("proposal candidate {index} changed before approval").into());
+    }
+    let journal = session.join(format!("promotion-{index}.qj"));
+    let mutation = session.join(format!("promotion-{index}.qm"));
+    let live = fs::read(&source)?;
+    let live_digest = digest(&live);
+    if live_digest != candidate.before_sha256
+        && !(live_digest == candidate.result_sha256 && journal.exists() && mutation.exists())
+    {
+        return Err(format!(
+            "source `{}` drifted before proposal {index} promotion",
+            candidate.path
+        )
+        .into());
+    }
+    let operation = u64::try_from(index)?
+        .checked_add(1)
+        .ok_or("proposal operation overflow")?;
+    let fixtures = PathBuf::from(env!("QUARTZ_FIXTURE_DIR"));
+    let persistence = || {
+        ComponentSpec::new("journal", artifact(&fixtures, "journal"))
+            .with_journal_paths(vec![journal.clone()])
+    };
+    let desired = proposal_promotion_tree(
+        &fixtures,
+        &source,
+        &candidate_path,
+        &mutation,
+        operation,
+        candidate,
+    )?;
+
+    let mut runtime = Runtime::open_persistent(proposal_limits(), persistence())?;
+    runtime.apply_tree(desired)?;
+    active_id(&runtime, "root/promoter")?;
+    if fs::read(&source)? != candidate.content {
+        return Err(format!("proposal {index} promotion produced different bytes").into());
+    }
+    drop(runtime);
+
+    let mut restarted = Runtime::open_persistent(proposal_limits(), persistence())?;
+    active_id(&restarted, "root/promoter")?;
+    if fs::read(&source)? != candidate.content {
+        return Err(format!("proposal {index} changed after restart").into());
+    }
+    restarted.shutdown_persistent()?;
+    if !restarted.is_observationally_clean() || fs::read(&source)? != candidate.content {
+        return Err(format!("proposal {index} did not retain a clean promotion").into());
+    }
+    println!(
+        "proposal {index} promoted: {} result_sha256={} restart=verified context=clean",
+        candidate.path, candidate.result_sha256
+    );
+    Ok(())
+}
+
+fn proposal_promotion_tree(
+    fixtures: &Path,
+    source: &Path,
+    candidate_path: &Path,
+    mutation: &Path,
+    operation: u64,
+    candidate: &proposals::Proposal,
+) -> Result<ComponentTree, Error> {
+    Ok(ComponentTree {
+        roots: vec![
+            ComponentSpec::new("root", artifact(fixtures, "root"))
+                .with_config(3)
+                .with_children(vec![
+                    ComponentSpec::new(
+                        "mutation-authority",
+                        artifact(fixtures, "mutation-authority"),
+                    )
+                    .with_config(operation),
+                    ComponentSpec::new(
+                        "promotion-authority",
+                        artifact(fixtures, "promotion-authority-a"),
+                    )
+                    .with_config(operation),
+                    ComponentSpec::new("promoter", artifact(fixtures, "proposal-promoter"))
+                        .with_config(operation)
+                        .with_snapshot_grants(vec![SnapshotGrant::from_file(
+                            candidate_path,
+                            format!("approved proposal {} result", candidate.path),
+                        )?])
+                        .with_workspace_grants(vec![WorkspaceGrant::new(
+                            source,
+                            mutation,
+                            operation,
+                            format!("approved proposal {}", candidate.path),
+                            candidate.before_sha256.clone(),
+                            candidate.result_sha256.clone(),
+                            proposals::MAX_SOURCE_BYTES,
+                        )?]),
+                ]),
+        ],
+    })
+}
+
+fn proposal_limits() -> Limits {
+    Limits {
+        max_event_record_bytes: 512 * 1024,
+        max_exchange_record_bytes: 512 * 1024,
+        max_mutation_record_bytes: 512 * 1024,
+        ..Limits::default()
+    }
+}
+
+fn repository_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    Ok(fs::canonicalize(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."),
+    )?)
+}
+
 fn run_production_model(
     model: &str,
     prompt: &Path,
@@ -1049,6 +1355,15 @@ fn run_exchange_turn(
     journal: &Path,
     adapter: Arc<dyn ExchangeAdapter>,
 ) -> Result<(Vec<u8>, String), Box<dyn std::error::Error>> {
+    run_exchange_turn_with_limits(prompt, journal, adapter, Limits::default())
+}
+
+fn run_exchange_turn_with_limits(
+    prompt: &Path,
+    journal: &Path,
+    adapter: Arc<dyn ExchangeAdapter>,
+    limits: Limits,
+) -> Result<(Vec<u8>, String), Box<dyn std::error::Error>> {
     let fixtures = PathBuf::from(env!("QUARTZ_FIXTURE_DIR"));
     let prompt = fs::canonicalize(prompt)?;
     let prompt_bytes = fs::read(&prompt)?;
@@ -1060,7 +1375,7 @@ fn run_exchange_turn(
 
     for _ in 0..8 {
         let mut runtime = Runtime::open_persistent_with_exchange(
-            Limits::default(),
+            limits,
             ComponentSpec::new("event-store", artifact(&fixtures, "event-store"))
                 .with_journal_paths(vec![journal.to_path_buf()])
                 .with_event_stream_paths(vec![events.clone()]),
@@ -1085,7 +1400,7 @@ fn run_exchange_turn(
     let (response, provenance) = completed.ok_or("production turn did not reach a stop fact")?;
 
     let mut runtime = Runtime::open_persistent_with_exchange(
-        Limits::default(),
+        limits,
         ComponentSpec::new("event-store", artifact(&fixtures, "event-store"))
             .with_journal_paths(vec![journal.to_path_buf()])
             .with_event_stream_paths(vec![events]),
@@ -1412,6 +1727,9 @@ mod cli_tests {
             "--reviewed-edit",
             "--promote-edit",
             "--production-model",
+            "--propose",
+            "--resume-proposals",
+            "--promote-proposal",
         ] {
             assert!(USAGE.contains(command), "usage omitted {command}");
         }
@@ -1460,6 +1778,33 @@ mod cli_tests {
                 journal: PathBuf::from("turn.qj"),
             })
         );
+        assert_eq!(
+            parse(&[
+                "--propose",
+                "model",
+                "task",
+                "session",
+                "README.md",
+                "lode/summary.md",
+            ]),
+            Ok(CliCommand::Propose {
+                model: "model".into(),
+                task: PathBuf::from("task"),
+                session: PathBuf::from("session"),
+                sources: vec![PathBuf::from("README.md"), PathBuf::from("lode/summary.md"),],
+            })
+        );
+        assert_eq!(
+            parse(&["--resume-proposals", "session"]),
+            Ok(CliCommand::ResumeProposals(PathBuf::from("session")))
+        );
+        assert_eq!(
+            parse(&["--promote-proposal", "session", "1"]),
+            Ok(CliCommand::PromoteProposal {
+                session: PathBuf::from("session"),
+                index: 1,
+            })
+        );
     }
 
     #[test]
@@ -1478,6 +1823,31 @@ mod cli_tests {
                 &["--production-model", "model", "prompt"][..],
                 "requires <model> <prompt> <journal>",
             ),
+            (
+                &["--propose", "model", "task", "session", "one"][..],
+                "requires two or three",
+            ),
+            (
+                &[
+                    "--propose",
+                    "model",
+                    "task",
+                    "session",
+                    "one",
+                    "two",
+                    "three",
+                    "four",
+                ][..],
+                "requires two or three",
+            ),
+            (
+                &["--promote-proposal", "session", "bad"][..],
+                "invalid proposal index",
+            ),
+            (
+                &["--resume-proposals", "session", "extra"][..],
+                "unexpected trailing argument",
+            ),
             (&["--idle", "bad"][..], "invalid milliseconds"),
             (&["--help", "extra"][..], "unexpected trailing argument"),
             (&["--unknown"][..], "unknown command"),
@@ -1488,5 +1858,101 @@ mod cli_tests {
                 "`{error}` did not contain `{message}`"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod proposal_runtime_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_CASE: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn promoter_requires_authority_and_reconstructs_exact_publication() {
+        let root = temporary_directory();
+        let source = root.join("source.txt");
+        let candidate_path = root.join("candidate.txt");
+        let denied_ledger = root.join("denied.qm");
+        let journal = root.join("promotion.qj");
+        let mutation = root.join("promotion.qm");
+        let before = b"before\n";
+        let result = b"after\n";
+        fs::write(&source, before).unwrap();
+        fs::write(&candidate_path, result).unwrap();
+        let candidate = proposals::Proposal {
+            path: "source.txt".into(),
+            before_sha256: digest(before),
+            result_sha256: digest(result),
+            before: before.to_vec(),
+            content: result.to_vec(),
+        };
+        let fixtures = PathBuf::from(env!("QUARTZ_FIXTURE_DIR"));
+
+        let mut denied = proposal_promotion_tree(
+            &fixtures,
+            &source,
+            &candidate_path,
+            &denied_ledger,
+            1,
+            &candidate,
+        )
+        .unwrap();
+        denied.roots[0].children[0].config = 0;
+        let mut runtime = Runtime::new(proposal_limits()).unwrap();
+        runtime.apply_tree(denied).unwrap();
+        assert!(matches!(
+            runtime.fiber_state("root/promoter"),
+            Some(FiberState::Failed(_))
+        ));
+        assert_eq!(fs::read(&source).unwrap(), before);
+        runtime.apply_tree(ComponentTree::default()).unwrap();
+        assert!(runtime.is_observationally_clean());
+
+        let persistence = || {
+            ComponentSpec::new("journal", artifact(&fixtures, "journal"))
+                .with_journal_paths(vec![journal.clone()])
+        };
+        let desired = proposal_promotion_tree(
+            &fixtures,
+            &source,
+            &candidate_path,
+            &mutation,
+            1,
+            &candidate,
+        )
+        .unwrap();
+        let mut runtime = Runtime::open_persistent(proposal_limits(), persistence()).unwrap();
+        runtime.apply_tree(desired).unwrap();
+        assert_eq!(
+            runtime.fiber_state("root/promoter"),
+            Some(FiberState::Active)
+        );
+        assert_eq!(fs::read(&source).unwrap(), result);
+        drop(runtime);
+
+        let mut restarted = Runtime::open_persistent(proposal_limits(), persistence()).unwrap();
+        assert_eq!(
+            restarted.fiber_state("root/promoter"),
+            Some(FiberState::Active)
+        );
+        assert_eq!(fs::read(&source).unwrap(), result);
+        restarted.shutdown_persistent().unwrap();
+        assert!(restarted.is_observationally_clean());
+        assert_eq!(fs::read(&source).unwrap(), result);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn temporary_directory() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "quartz-proposal-runtime-{}-{}",
+            std::process::id(),
+            NEXT_CASE.fetch_add(1, Ordering::Relaxed)
+        ));
+        if path.exists() {
+            fs::remove_dir_all(&path).unwrap();
+        }
+        fs::create_dir_all(&path).unwrap();
+        path
     }
 }
