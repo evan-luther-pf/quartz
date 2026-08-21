@@ -4199,7 +4199,6 @@ mod proposal_runtime_tests {
             "byte_start": 0,
             "byte_end": source.content.len(),
             "replacement": result,
-            "result_sha256": digest(result.as_bytes()),
         })
     }
 

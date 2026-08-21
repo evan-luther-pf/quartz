@@ -14,11 +14,11 @@ resident in the native executable rather than a component.
 [source ...]` admits at least two exact UTF-8 repository files and one bounded
 task. The host canonicalizes the sources beneath the repository root, records
 their relative paths, SHA-256 identities, and bytes, and submits one bounded
-immutable prompt through the existing production exchange. The response is one
-strict JSON object containing at least two unique, path-bound ranged edits. Each
-edit names the admitted source SHA-256, a half-open UTF-8 byte range, exact
-replacement bytes, and the expected materialized result SHA-256. Proposal
-production never mutates the repository.
+immutable prompt through the existing production exchange. Prompt schema 2
+requires one strict JSON object containing at least two unique, path-bound
+ranged edits. Each edit names only the admitted source SHA-256, a half-open
+UTF-8 byte range, and exact replacement bytes. The host materializes each result
+and computes its SHA-256; proposal production never mutates the repository.
 
 `quartz --resume-proposals <session-dir>` reconstructs proposal state from the
 ordered facts in `<session-dir>/session.qe` without credentials or another
@@ -54,7 +54,7 @@ The exact response grammar is:
 
 ```text
 PROPOSE <admitted-path-index>
-{"source_sha256":"<post-command source SHA-256>","byte_start":<inclusive UTF-8 byte offset>,"byte_end":<exclusive UTF-8 byte offset>,"replacement":"<exact UTF-8 replacement>","result_sha256":"<materialized result SHA-256>"}
+{"source_sha256":"<post-command source SHA-256>","byte_start":<inclusive UTF-8 byte offset>,"byte_end":<exclusive UTF-8 byte offset>,"replacement":"<exact UTF-8 replacement>"}
 ```
 
 or:
@@ -121,13 +121,17 @@ The later manifest change is likewise a clean cutover.
 - Every admitted source is a canonical regular file beneath one canonical
   repository root. Before bytes, byte length, and SHA-256 identity are exact and
   bounded.
-- A ranged edit uses a half-open byte range whose endpoints are UTF-8 boundaries
-  in the exact admitted source. Replacement bytes are UTF-8, may be empty, and
-  must produce a changed, non-empty result within the source byte bound.
-- The host materializes `source[..start] + replacement + source[end..]` and
-  verifies the declared result SHA-256 before the edit enters proposal state.
-  Review and promotion use only that verified materialization.
-- Initial responses, revisions, and continuations are strict bounded grammars.
+- A model-authored ranged edit contains exactly `source_sha256`, `byte_start`,
+  `byte_end`, and `replacement`, plus `path` for initial and revision responses.
+  Supplying `result_sha256` is an unknown-field error.
+- The range endpoints are UTF-8 boundaries in the exact admitted source.
+  Replacement bytes are UTF-8, may be empty, and must produce a changed,
+  non-empty result within the source byte bound.
+- The host materializes `source[..start] + replacement + source[end..]`, validates
+  the result, and computes its SHA-256 before the edit enters proposal state.
+  Review, durable identity, and promotion continue to bind that host-computed
+  digest.
+- Initial responses, revisions, and continuations use strict prompt schema 2.
   Invalid or ambiguous durable responses remain evidence and never trigger an
   automatic exchange retry.
 - Candidate review precedes mutation approval. Promotion first requires the live
@@ -246,20 +250,16 @@ records remain independently bounded.
 
 ## Verification
 
-Focused contracts cover strict range grammar, source and result digest binding,
-UTF-8 boundaries, empty replacement, materialization from validated bytes,
-four-file admission, revision and continuation ranges, exact chronological
-reconstruction, repeated correction cycles, every started-only external-operation
-class, sequence and identity tampering, stale promotion, and post-completion
-closure.
+Focused contracts cover the shared initial, revision, and continuation ranged
+grammar; host-computed result digest binding; rejection of model-authored result
+digests, incorrect source digests, invalid ranges, UTF-8 splits, unchanged
+results, and oversized results; exact chronological reconstruction, repeated
+correction cycles, every started-only external-operation class, sequence and
+identity tampering, stale promotion, and post-completion closure.
 
-The credentialed Slice C dogfood run admitted four files. An unassisted response
-with a wrong result digest failed closed before candidate admission. A bounded
-retry whose task supplied the four expected result digests produced four exact
-ranges (`14..21`, `13..20`, `14..21`, and `14..21`) replacing only `pending`
-with `ready`. The host materialized and verified all four candidates, the
-sources retained their admitted digests, and the final release executable
-reconstructed all four diffs without credentials.
+Prompt schema 1 sessions remain retained evidence but are not resumable after
+the clean schema 2 cutover. Quartz does not reinterpret their model-authored
+result digests.
 
 `cargo test -p quartz --bin quartz` passes 34 focused contracts.
 `cargo test --workspace --all-targets` passes 93 tests across 12 suites. Twenty

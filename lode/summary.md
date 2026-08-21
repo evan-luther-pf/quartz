@@ -125,10 +125,11 @@ repeated correction and validation cycles without rerunning a command or model
 exchange.
 
 The current implementation uses digest-anchored ranged edits. Each model edit
-binds an admitted source digest, half-open UTF-8 byte range, exact replacement,
-and expected result digest. The host verifies and materializes the candidate
-before it enters proposal state. Prompt-size bounds replace the former fixed
-source-count ceiling. Host-only path selection remains an implementation
+binds an admitted source digest, half-open UTF-8 byte range, and exact
+replacement. Prompt schema 2 rejects a model-authored result digest; the host
+materializes the candidate, validates its bounds and UTF-8, and computes the
+result digest used by durable state and promotion. Prompt-size bounds continue
+to bound the admitted file count. Host-only path selection remains an
 constraint; Slice E replaces it with a host-admitted canonical path/digest
 manifest selected only by numeric index.
 

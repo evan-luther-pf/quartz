@@ -16,11 +16,11 @@ pub(crate) const MAX_REVISION_PROMPT_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_CONTINUATION_PROMPT_BYTES: usize = 384 * 1024;
 pub(crate) const MAX_COMPLETION_SUMMARY_BYTES: usize = 4 * 1024;
 
-const REVISION_INSTRUCTIONS: &str = "Revise only the rejected proposal identified below. Return only the required JSON object. The proposal must use the rejected admitted path and matching source_sha256. Return one half-open UTF-8 byte range, exact replacement text, and the SHA-256 of the materialized result. Address the exact feedback and change the rejected result. Do not use Markdown fences or commentary.";
+const REVISION_INSTRUCTIONS: &str = "Revise only the rejected proposal identified below. Return only the required JSON object. The proposal must use the rejected admitted path and matching source_sha256. Return one half-open UTF-8 byte range and exact replacement text. Address the exact feedback and change the rejected result. Do not use Markdown fences or commentary.";
 
-const INSTRUCTIONS: &str = "Edit only the admitted files needed for the task. Return only the required JSON object. Every proposal must use one admitted path and matching source_sha256. Return one half-open UTF-8 byte range, exact replacement text, and the SHA-256 of the materialized result. Return at least two proposals. Do not use Markdown fences or commentary.";
+const INSTRUCTIONS: &str = "Edit only the admitted files needed for the task. Return only the required JSON object. Every proposal must use one admitted path and matching source_sha256. Return one half-open UTF-8 byte range and exact replacement text. Return at least two proposals. Do not use Markdown fences or commentary.";
 
-const CONTINUATION_INSTRUCTIONS: &str = "Continue the same repository task from the exact approved-command evidence. Return exactly `PROPOSE <admitted-path-index>\\n<strict ranged-edit JSON>` or `COMPLETE\\n<bounded final summary>`. The ranged-edit object must contain only source_sha256, byte_start, byte_end, replacement, and result_sha256. PROPOSE may select only an admitted path index and must change the exact post-command source. COMPLETE is valid only when the command succeeded. Do not use Markdown fences or commentary outside the selected grammar.";
+const CONTINUATION_INSTRUCTIONS: &str = "Continue the same repository task from the exact approved-command evidence. Return exactly `PROPOSE <admitted-path-index>\\n<strict ranged-edit JSON>` or `COMPLETE\\n<bounded final summary>`. The ranged-edit object must contain only source_sha256, byte_start, byte_end, and replacement. PROPOSE may select only an admitted path index and must change the exact post-command source. COMPLETE is valid only when the command succeeded. Do not use Markdown fences or commentary outside the selected grammar.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Admission {
@@ -167,7 +167,7 @@ impl Admission {
             })
             .collect();
         let prompt = serde_json::to_vec_pretty(&json!({
-            "schema": 1,
+            "schema": 2,
             "instructions": INSTRUCTIONS,
             "task": self.task,
             "files": files,
@@ -177,8 +177,7 @@ impl Admission {
                     "source_sha256": "that file's admitted SHA-256",
                     "byte_start": "inclusive UTF-8 byte offset",
                     "byte_end": "exclusive UTF-8 byte offset",
-                    "replacement": "exact UTF-8 replacement text, which may be empty",
-                    "result_sha256": "SHA-256 after applying the range"
+                    "replacement": "exact UTF-8 replacement text, which may be empty"
                 }]
             }
         }))
@@ -211,7 +210,7 @@ impl Admission {
             ],
             "proposal prompt",
         )?;
-        if object.get("schema").and_then(Value::as_u64) != Some(1) {
+        if object.get("schema").and_then(Value::as_u64) != Some(2) {
             return Err("unsupported proposal prompt schema".into());
         }
         let instructions = string_field(object, "instructions", "proposal prompt")?;
@@ -304,7 +303,7 @@ impl Revision {
     pub(crate) fn prompt_bytes(&self) -> Result<Vec<u8>, String> {
         let admission_prompt = self.admission.prompt_bytes()?;
         let prompt = serde_json::to_vec_pretty(&json!({
-            "schema": 1,
+            "schema": 2,
             "instructions": REVISION_INSTRUCTIONS,
             "model": self.model,
             "admission": {
@@ -329,8 +328,7 @@ impl Revision {
                     "source_sha256": "that file's original admitted SHA-256",
                     "byte_start": "inclusive UTF-8 byte offset",
                     "byte_end": "exclusive UTF-8 byte offset",
-                    "replacement": "exact corrected UTF-8 replacement text",
-                    "result_sha256": "SHA-256 after applying the corrected range"
+                    "replacement": "exact corrected UTF-8 replacement text"
                 }
             }
         }))
@@ -368,7 +366,7 @@ impl Revision {
             ],
             "revision prompt",
         )?;
-        if object.get("schema").and_then(Value::as_u64) != Some(1) {
+        if object.get("schema").and_then(Value::as_u64) != Some(2) {
             return Err("unsupported revision prompt schema".into());
         }
         if string_field(object, "instructions", "revision prompt")? != REVISION_INSTRUCTIONS {
@@ -465,7 +463,6 @@ impl Revision {
                 "byte_start",
                 "byte_end",
                 "replacement",
-                "result_sha256",
             ],
             "revision response template",
         )?;
@@ -545,7 +542,7 @@ impl Continuation {
             })
             .collect::<Vec<_>>();
         let prompt = json!({
-            "schema": 1,
+            "schema": 2,
             "instructions": CONTINUATION_INSTRUCTIONS,
             "model": self.model,
             "task": self.admission.task,
@@ -553,7 +550,7 @@ impl Continuation {
             "current_proposals": continuation_generations(&self.current),
             "command_finished": self.command.to_value(),
             "required_response": [
-                "PROPOSE <admitted-path-index>\\n{\"source_sha256\":\"<post-command source SHA-256>\",\"byte_start\":<inclusive UTF-8 byte offset>,\"byte_end\":<exclusive UTF-8 byte offset>,\"replacement\":\"<exact UTF-8 replacement>\",\"result_sha256\":\"<materialized result SHA-256>\"}",
+                "PROPOSE <admitted-path-index>\\n{\"source_sha256\":\"<post-command source SHA-256>\",\"byte_start\":<inclusive UTF-8 byte offset>,\"byte_end\":<exclusive UTF-8 byte offset>,\"replacement\":\"<exact UTF-8 replacement>\"}",
                 "COMPLETE\\n<bounded final summary>",
             ],
         });
@@ -597,10 +594,10 @@ impl Continuation {
             "continuation prompt",
         )?;
         let required_response = json!([
-            "PROPOSE <admitted-path-index>\\n{\"source_sha256\":\"<post-command source SHA-256>\",\"byte_start\":<inclusive UTF-8 byte offset>,\"byte_end\":<exclusive UTF-8 byte offset>,\"replacement\":\"<exact UTF-8 replacement>\",\"result_sha256\":\"<materialized result SHA-256>\"}",
+            "PROPOSE <admitted-path-index>\\n{\"source_sha256\":\"<post-command source SHA-256>\",\"byte_start\":<inclusive UTF-8 byte offset>,\"byte_end\":<exclusive UTF-8 byte offset>,\"replacement\":\"<exact UTF-8 replacement>\"}",
             "COMPLETE\\n<bounded final summary>",
         ]);
-        if object.get("schema").and_then(Value::as_u64) != Some(1)
+        if object.get("schema").and_then(Value::as_u64) != Some(2)
             || string_field(object, "instructions", "continuation prompt")?
                 != CONTINUATION_INSTRUCTIONS
             || string_field(object, "task", "continuation prompt")? != admission.task
@@ -720,13 +717,7 @@ pub(crate) fn parse_continuation_response(
         .map_err(|error| format!("invalid continued ranged-edit JSON: {error}"))?;
     let edit = exact_object(
         &wire,
-        &[
-            "source_sha256",
-            "byte_start",
-            "byte_end",
-            "replacement",
-            "result_sha256",
-        ],
+        &["source_sha256", "byte_start", "byte_end", "replacement"],
         "continued proposal",
     )?;
     let proposal = parse_ranged_edit(edit, &source.path, source, "continued proposal")?;
@@ -919,11 +910,7 @@ fn parse_ranged_edit(
     if result == admitted.content {
         return Err(format!("proposal for `{path}` does not change the file"));
     }
-    let result_sha256 = string_field(edit, "result_sha256", label)?.to_owned();
-    validate_sha256(&result_sha256, "proposal result digest")?;
-    if sha256(&result) != result_sha256 {
-        return Err(format!("proposal result digest mismatch for `{path}`"));
-    }
+    let result_sha256 = sha256(&result);
     Ok(Proposal {
         path: path.to_owned(),
         source_sha256,
@@ -969,7 +956,6 @@ pub(crate) fn parse_response(
                 "byte_start",
                 "byte_end",
                 "replacement",
-                "result_sha256",
             ],
             "proposal",
         )?;
@@ -1005,7 +991,6 @@ pub(crate) fn parse_revision_response(
             "byte_start",
             "byte_end",
             "replacement",
-            "result_sha256",
         ],
         "revised proposal",
     )?;
@@ -1408,6 +1393,9 @@ mod tests {
         let admission = fixture_admission();
         let prompt = admission.prompt_bytes().unwrap();
         assert_eq!(Admission::from_prompt(&prompt).unwrap(), admission);
+        let mut legacy: Value = serde_json::from_slice(&prompt).unwrap();
+        legacy["schema"] = Value::from(1);
+        assert!(Admission::from_prompt(&serde_json::to_vec(&legacy).unwrap()).is_err());
     }
 
     #[test]
@@ -1426,6 +1414,7 @@ mod tests {
         assert_eq!(proposals[1].result, b"beta revised\n");
         assert_eq!(proposals[1].byte_start, 0);
         assert_eq!(proposals[1].byte_end, admission.files[1].content.len());
+        assert_eq!(proposals[0].result_sha256, sha256(&proposals[0].result));
     }
 
     #[test]
@@ -1452,6 +1441,16 @@ mod tests {
             Revision::from_prompt(&serde_json::to_vec(&value).unwrap(), &admission, &proposals)
                 .is_err()
         );
+        let mut legacy: Value = serde_json::from_slice(&prompt).unwrap();
+        legacy["schema"] = Value::from(1);
+        assert!(
+            Revision::from_prompt(
+                &serde_json::to_vec(&legacy).unwrap(),
+                &admission,
+                &proposals,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1470,6 +1469,12 @@ mod tests {
         });
         let corrected =
             parse_revision_response(&serde_json::to_vec(&response).unwrap(), &revision).unwrap();
+        let mut supplied_digest = response.clone();
+        supplied_digest["proposal"]["result_sha256"] = Value::String("0".repeat(64));
+        assert!(
+            parse_revision_response(&serde_json::to_vec(&supplied_digest).unwrap(), &revision,)
+                .is_err()
+        );
         assert_eq!(corrected.result, b"beta corrected\n");
         let path = materialize_revision(&root, &revision, &corrected).unwrap();
         fs::write(&path, b"corrupt").unwrap();
@@ -1530,10 +1535,12 @@ mod tests {
         let outside = admitted("outside.md", b"outside\n");
         let mut stale = proposal("README.md", &admission.files[0], "changed\n");
         stale["source_sha256"] = Value::String("0".repeat(64));
-        let mut bad_digest = proposal("README.md", &admission.files[0], "changed\n");
-        bad_digest["result_sha256"] = Value::String("0".repeat(64));
+        let mut supplied_digest = proposal("README.md", &admission.files[0], "changed\n");
+        supplied_digest["result_sha256"] = Value::String("0".repeat(64));
         let mut invalid_range = proposal("README.md", &admission.files[0], "changed\n");
         invalid_range["byte_end"] = Value::from(admission.files[0].content.len() + 1);
+        let mut oversized = proposal("README.md", &admission.files[0], "changed\n");
+        oversized["replacement"] = Value::String("x".repeat(MAX_SOURCE_BYTES + 1));
         let cases = [
             json!({"proposals": [
                 proposal("outside.md", &outside, "changed\n"),
@@ -1552,17 +1559,37 @@ mod tests {
                 proposal("lode/summary.md", &admission.files[1], "changed\n")
             ]}),
             json!({"proposals": [
-                bad_digest,
+                supplied_digest,
                 proposal("lode/summary.md", &admission.files[1], "changed\n")
             ]}),
             json!({"proposals": [
                 invalid_range,
                 proposal("lode/summary.md", &admission.files[1], "changed\n")
             ]}),
+            json!({"proposals": [
+                oversized,
+                proposal("lode/summary.md", &admission.files[1], "changed\n")
+            ]}),
         ];
         for case in cases {
             assert!(parse_response(&serde_json::to_vec(&case).unwrap(), &admission).is_err());
         }
+
+        let utf8 = Admission {
+            task: admission.task,
+            files: vec![
+                admitted("README.md", "é\n".as_bytes()),
+                admission.files[1].clone(),
+            ],
+        };
+        let mut split = proposal("README.md", &utf8.files[0], "changed\n");
+        split["byte_start"] = Value::from(1);
+        split["byte_end"] = Value::from(1);
+        let response = json!({"proposals": [
+            split,
+            proposal("lode/summary.md", &utf8.files[1], "changed\n")
+        ]});
+        assert!(parse_response(&serde_json::to_vec(&response).unwrap(), &utf8).is_err());
     }
 
     #[test]
@@ -1632,6 +1659,18 @@ mod tests {
             .unwrap(),
             continuation
         );
+        let mut legacy_prompt: Value = serde_json::from_slice(&prompt).unwrap();
+        legacy_prompt["schema"] = Value::from(1);
+        assert!(
+            Continuation::from_prompt(
+                continuation.sequence,
+                &serde_json::to_vec(&legacy_prompt).unwrap(),
+                &continuation.admission,
+                &continuation.current,
+                &continuation.command,
+            )
+            .is_err()
+        );
         assert!(parse_continuation_response(b"COMPLETE\nTests passed.", &continuation).is_err());
         let edit = continued_proposal(&continuation.sources[1], "beta corrected\n");
         let response = format!("PROPOSE 1\n{}", serde_json::to_string(&edit).unwrap());
@@ -1651,6 +1690,13 @@ mod tests {
         assert_eq!(proposal.source, b"beta revised\n");
         assert_eq!(proposal.result, b"beta corrected\n");
         fs::remove_dir_all(root).unwrap();
+        let mut supplied_digest = edit;
+        supplied_digest["result_sha256"] = Value::String("0".repeat(64));
+        let response = format!(
+            "PROPOSE 1\n{}",
+            serde_json::to_string(&supplied_digest).unwrap()
+        );
+        assert!(parse_continuation_response(response.as_bytes(), &continuation).is_err());
     }
 
     #[test]
@@ -1770,7 +1816,6 @@ mod tests {
             "byte_start": 0,
             "byte_end": source.content.len(),
             "replacement": result,
-            "result_sha256": sha256(result.as_bytes()),
         })
     }
 
