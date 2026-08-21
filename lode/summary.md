@@ -124,11 +124,13 @@ Credential-free restart rebuilds disposable render caches and reconstructs
 repeated correction and validation cycles without rerunning a command or model
 exchange.
 
-The current implementation uses complete-file candidates, a two-or-three-source
-ceiling, and host-only path selection. These are implementation constraints, not
-permanent product invariants. Planned clean cutovers replace them with
-digest-anchored ranged edits and a host-admitted canonical path/digest manifest
-selected only by numeric index.
+The current implementation uses digest-anchored ranged edits. Each model edit
+binds an admitted source digest, half-open UTF-8 byte range, exact replacement,
+and expected result digest. The host verifies and materializes the candidate
+before it enters proposal state. Prompt-size bounds replace the former fixed
+source-count ceiling. Host-only path selection remains an implementation
+constraint; Slice E replaces it with a host-admitted canonical path/digest
+manifest selected only by numeric index.
 
 The repository-task state machine, response grammar, candidate reconstruction,
 dispatch policy, and review sequencing are currently native executable code.
@@ -139,21 +141,18 @@ parts of that path. The orchestrator must move behind the public component
 contract before the product surface expands.
 
 Focused repository-loop contracts pass 34 tests, and the workspace passes 93
-tests across 12 suites. The latest credentialed dogfood scenario exercised a
-failed command, one reviewed and promoted correction, a successful command,
-explicit completion, credential-free causal reconstruction after render-cache
-deletion, and post-completion action rejection. WIT, component ABI 10, and
-module manifests remain unchanged; the kernel adds one schema-agnostic
-`DurableEventLog` wrapper, and `quartz` directly imports workspace `serde` for
-strict session facts.
+tests across 12 suites. The latest credentialed dogfood scenario admitted four
+files, rejected one wrong result digest, then materialized four 6-or-7-byte
+ranges into exact candidates while leaving every source unchanged.
+Credential-free restart reconstructed all four ranges and diffs. WIT, component
+ABI 10, kernel source, and module manifests remain unchanged.
 
 ## Next boundary
 
-The next boundary is digest-anchored ranged edits. Every candidate carries the
-admitted source digest, exact byte range, replacement bytes, and expected result
-digest. Promotion applies the range only when the live source still matches the
-admitted digest, and review renders the range without reconstructing task state
-from filenames.
+The next boundary is Slice D: move the repository-task state machine, response
+validation, generation resolution, dispatch policy, and promotion gating behind
+the public component contract. The native host retains only justified credential
+custody, privileged OS operations, and terminal I/O.
 
 Component-owned orchestration, an admitted path/digest manifest, and terminal
 diff review follow. Tool invocation remains closed:

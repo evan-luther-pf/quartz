@@ -16,11 +16,11 @@ pub(crate) const MAX_REVISION_PROMPT_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_CONTINUATION_PROMPT_BYTES: usize = 384 * 1024;
 pub(crate) const MAX_COMPLETION_SUMMARY_BYTES: usize = 4 * 1024;
 
-const REVISION_INSTRUCTIONS: &str = "Revise only the rejected proposal identified below. Return only the required JSON object. The proposal must use the rejected admitted path and matching original before_sha256, and content must be the complete replacement file. Address the exact feedback and change the rejected content. Do not use Markdown fences or commentary.";
+const REVISION_INSTRUCTIONS: &str = "Revise only the rejected proposal identified below. Return only the required JSON object. The proposal must use the rejected admitted path and matching source_sha256. Return one half-open UTF-8 byte range, exact replacement text, and the SHA-256 of the materialized result. Address the exact feedback and change the rejected result. Do not use Markdown fences or commentary.";
 
-const INSTRUCTIONS: &str = "Edit only the admitted files needed for the task. Return only the required JSON object. Every proposal must use one admitted path and matching before_sha256, and content must be the complete replacement file. Return at least two proposals. Do not use Markdown fences or commentary.";
+const INSTRUCTIONS: &str = "Edit only the admitted files needed for the task. Return only the required JSON object. Every proposal must use one admitted path and matching source_sha256. Return one half-open UTF-8 byte range, exact replacement text, and the SHA-256 of the materialized result. Return at least two proposals. Do not use Markdown fences or commentary.";
 
-const CONTINUATION_INSTRUCTIONS: &str = "Continue the same repository task from the exact approved-command evidence. Return exactly `PROPOSE <admitted-path-index>\\n<exact complete-file candidate bytes>` or `COMPLETE\\n<bounded final summary>`. PROPOSE may select only an admitted path index and must change the exact post-command source. COMPLETE is valid only when the command succeeded. Do not use Markdown fences or commentary outside the selected grammar.";
+const CONTINUATION_INSTRUCTIONS: &str = "Continue the same repository task from the exact approved-command evidence. Return exactly `PROPOSE <admitted-path-index>\\n<strict ranged-edit JSON>` or `COMPLETE\\n<bounded final summary>`. The ranged-edit object must contain only source_sha256, byte_start, byte_end, replacement, and result_sha256. PROPOSE may select only an admitted path index and must change the exact post-command source. COMPLETE is valid only when the command succeeded. Do not use Markdown fences or commentary outside the selected grammar.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Admission {
@@ -38,10 +38,13 @@ pub(crate) struct AdmittedFile {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Proposal {
     pub(crate) path: String,
-    pub(crate) before_sha256: String,
+    pub(crate) source_sha256: String,
+    pub(crate) byte_start: usize,
+    pub(crate) byte_end: usize,
     pub(crate) result_sha256: String,
-    pub(crate) before: Vec<u8>,
-    pub(crate) content: Vec<u8>,
+    pub(crate) source: Vec<u8>,
+    pub(crate) replacement: Vec<u8>,
+    pub(crate) result: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,8 +91,8 @@ impl Admission {
         task_path: &Path,
         source_paths: &[PathBuf],
     ) -> Result<Self, String> {
-        if !(2..=3).contains(&source_paths.len()) {
-            return Err("proposal admission requires two or three source files".into());
+        if source_paths.len() < 2 {
+            return Err("proposal admission requires at least two source files".into());
         }
         let repository_root = fs::canonicalize(repository_root)
             .map_err(|error| format!("canonicalize repository root: {error}"))?;
@@ -171,8 +174,11 @@ impl Admission {
             "required_response": {
                 "proposals": [{
                     "path": "one admitted path",
-                    "before_sha256": "that file's admitted SHA-256",
-                    "content": "the complete replacement file"
+                    "source_sha256": "that file's admitted SHA-256",
+                    "byte_start": "inclusive UTF-8 byte offset",
+                    "byte_end": "exclusive UTF-8 byte offset",
+                    "replacement": "exact UTF-8 replacement text, which may be empty",
+                    "result_sha256": "SHA-256 after applying the range"
                 }]
             }
         }))
@@ -227,8 +233,8 @@ impl Admission {
             .get("files")
             .and_then(Value::as_array)
             .ok_or_else(|| "proposal prompt files must be an array".to_owned())?;
-        if !(2..=3).contains(&values.len()) {
-            return Err("proposal prompt must contain two or three files".into());
+        if values.len() < 2 {
+            return Err("proposal prompt must contain at least two files".into());
         }
         let mut paths = BTreeSet::new();
         let mut files = Vec::with_capacity(values.len());
@@ -309,17 +315,22 @@ impl Revision {
             "rejection": {
                 "proposal_index": self.proposal_index,
                 "path": self.rejected.path,
-                "before_sha256": self.rejected.before_sha256,
+                "source_sha256": self.rejected.source_sha256,
+                "byte_start": self.rejected.byte_start,
+                "byte_end": self.rejected.byte_end,
+                "prior_replacement": std::str::from_utf8(&self.rejected.replacement)
+                    .expect("validated rejected replacement must remain UTF-8"),
                 "prior_result_sha256": self.rejected.result_sha256,
-                "prior_content": std::str::from_utf8(&self.rejected.content)
-                    .expect("validated rejected proposal must remain UTF-8"),
                 "feedback": self.feedback,
             },
             "required_response": {
                 "proposal": {
                     "path": "the rejected admitted path",
-                    "before_sha256": "that file's original admitted SHA-256",
-                    "content": "the complete corrected replacement file"
+                    "source_sha256": "that file's original admitted SHA-256",
+                    "byte_start": "inclusive UTF-8 byte offset",
+                    "byte_end": "exclusive UTF-8 byte offset",
+                    "replacement": "exact corrected UTF-8 replacement text",
+                    "result_sha256": "SHA-256 after applying the corrected range"
                 }
             }
         }))
@@ -407,9 +418,11 @@ impl Revision {
             &[
                 "proposal_index",
                 "path",
-                "before_sha256",
+                "source_sha256",
+                "byte_start",
+                "byte_end",
+                "prior_replacement",
                 "prior_result_sha256",
-                "prior_content",
                 "feedback",
             ],
             "revision rejection",
@@ -423,12 +436,14 @@ impl Revision {
             .get(proposal_index)
             .ok_or_else(|| format!("revision proposal index {proposal_index} is absent"))?;
         if string_field(rejection, "path", "revision rejection")? != rejected.path
-            || string_field(rejection, "before_sha256", "revision rejection")?
-                != rejected.before_sha256
+            || string_field(rejection, "source_sha256", "revision rejection")?
+                != rejected.source_sha256
+            || usize_field(rejection, "byte_start", "revision rejection")? != rejected.byte_start
+            || usize_field(rejection, "byte_end", "revision rejection")? != rejected.byte_end
+            || string_field(rejection, "prior_replacement", "revision rejection")?.as_bytes()
+                != rejected.replacement
             || string_field(rejection, "prior_result_sha256", "revision rejection")?
                 != rejected.result_sha256
-            || string_field(rejection, "prior_content", "revision rejection")?.as_bytes()
-                != rejected.content
         {
             return Err("revision rejected proposal changed".into());
         }
@@ -444,7 +459,14 @@ impl Revision {
         )?;
         exact_object(
             required.get("proposal").expect("required key checked"),
-            &["path", "before_sha256", "content"],
+            &[
+                "path",
+                "source_sha256",
+                "byte_start",
+                "byte_end",
+                "replacement",
+                "result_sha256",
+            ],
             "revision response template",
         )?;
         Ok(Self {
@@ -531,7 +553,7 @@ impl Continuation {
             "current_proposals": continuation_generations(&self.current),
             "command_finished": self.command.to_value(),
             "required_response": [
-                "PROPOSE <admitted-path-index>\\n<exact complete-file candidate bytes>",
+                "PROPOSE <admitted-path-index>\\n{\"source_sha256\":\"<post-command source SHA-256>\",\"byte_start\":<inclusive UTF-8 byte offset>,\"byte_end\":<exclusive UTF-8 byte offset>,\"replacement\":\"<exact UTF-8 replacement>\",\"result_sha256\":\"<materialized result SHA-256>\"}",
                 "COMPLETE\\n<bounded final summary>",
             ],
         });
@@ -575,7 +597,7 @@ impl Continuation {
             "continuation prompt",
         )?;
         let required_response = json!([
-            "PROPOSE <admitted-path-index>\\n<exact complete-file candidate bytes>",
+            "PROPOSE <admitted-path-index>\\n{\"source_sha256\":\"<post-command source SHA-256>\",\"byte_start\":<inclusive UTF-8 byte offset>,\"byte_end\":<exclusive UTF-8 byte offset>,\"replacement\":\"<exact UTF-8 replacement>\",\"result_sha256\":\"<materialized result SHA-256>\"}",
             "COMPLETE\\n<bounded final summary>",
         ]);
         if object.get("schema").and_then(Value::as_u64) != Some(1)
@@ -680,7 +702,7 @@ pub(crate) fn parse_continuation_response(
     let newline = remainder
         .iter()
         .position(|byte| *byte == b'\n')
-        .ok_or_else(|| "PROPOSE response has no candidate bytes".to_owned())?;
+        .ok_or_else(|| "PROPOSE response has no ranged-edit object".to_owned())?;
     let index_bytes = &remainder[..newline];
     let index_text =
         std::str::from_utf8(index_bytes).map_err(|_| "PROPOSE path index is not ASCII")?;
@@ -694,14 +716,20 @@ pub(crate) fn parse_continuation_response(
         .sources
         .get(admitted_path_index)
         .ok_or_else(|| format!("admitted path index {admitted_path_index} is absent"))?;
-    let content = remainder[newline + 1..].to_vec();
-    validate_source_bytes(&source.path, &content)?;
-    if content == source.content {
-        return Err(format!(
-            "continued proposal for `{}` does not change the post-command source",
-            source.path
-        ));
-    }
+    let wire: Value = serde_json::from_slice(&remainder[newline + 1..])
+        .map_err(|error| format!("invalid continued ranged-edit JSON: {error}"))?;
+    let edit = exact_object(
+        &wire,
+        &[
+            "source_sha256",
+            "byte_start",
+            "byte_end",
+            "replacement",
+            "result_sha256",
+        ],
+        "continued proposal",
+    )?;
+    let proposal = parse_ranged_edit(edit, &source.path, source, "continued proposal")?;
     let proposal_index = continuation
         .current
         .iter()
@@ -723,13 +751,7 @@ pub(crate) fn parse_continuation_response(
         admitted_path_index,
         proposal_index,
         revision,
-        proposal: Proposal {
-            path: source.path.clone(),
-            before_sha256: source.before_sha256.clone(),
-            result_sha256: sha256(&content),
-            before: source.content.clone(),
-            content,
-        },
+        proposal,
     })
 }
 
@@ -742,10 +764,12 @@ fn continuation_generations(current: &[ProposalGeneration]) -> Vec<Value> {
                 "admitted_path_index": generation.admitted_path_index,
                 "revision": generation.revision,
                 "path": generation.proposal.path,
-                "before_sha256": generation.proposal.before_sha256,
+                "source_sha256": generation.proposal.source_sha256,
+                "byte_start": generation.proposal.byte_start,
+                "byte_end": generation.proposal.byte_end,
+                "replacement": std::str::from_utf8(&generation.proposal.replacement)
+                    .expect("validated proposal replacement must remain UTF-8"),
                 "result_sha256": generation.proposal.result_sha256,
-                "content": std::str::from_utf8(&generation.proposal.content)
-                    .expect("validated proposal content must remain UTF-8"),
             })
         })
         .collect()
@@ -782,13 +806,15 @@ fn validate_current_generations(
             || !admitted_indices.insert(generation.admitted_path_index)
             || admitted.path != generation.proposal.path
             || generation.revision > max_revision
-            || generation.proposal.result_sha256 != sha256(&generation.proposal.content)
-            || generation.proposal.before_sha256 != sha256(&generation.proposal.before)
+            || generation.proposal.result_sha256 != sha256(&generation.proposal.result)
+            || generation.proposal.source_sha256 != sha256(&generation.proposal.source)
+            || generation.proposal.byte_start > generation.proposal.byte_end
+            || generation.proposal.byte_end > generation.proposal.source.len()
         {
             return Err("current proposal generation identity is invalid".into());
         }
-        validate_source_bytes(&generation.proposal.path, &generation.proposal.before)?;
-        validate_source_bytes(&generation.proposal.path, &generation.proposal.content)?;
+        validate_source_bytes(&generation.proposal.path, &generation.proposal.source)?;
+        validate_source_bytes(&generation.proposal.path, &generation.proposal.result)?;
     }
     Ok(())
 }
@@ -846,6 +872,70 @@ fn admitted_files_json(files: &[AdmittedFile]) -> Vec<Value> {
         .collect()
 }
 
+fn parse_ranged_edit(
+    edit: &Map<String, Value>,
+    path: &str,
+    admitted: &AdmittedFile,
+    label: &str,
+) -> Result<Proposal, String> {
+    let source_sha256 = string_field(edit, "source_sha256", label)?.to_owned();
+    validate_sha256(&source_sha256, "proposal source digest")?;
+    if source_sha256 != admitted.before_sha256 {
+        return Err(format!("proposal source digest mismatch for `{path}`"));
+    }
+    let byte_start = usize_field(edit, "byte_start", label)?;
+    let byte_end = usize_field(edit, "byte_end", label)?;
+    if byte_start > byte_end || byte_end > admitted.content.len() {
+        return Err(format!(
+            "proposal byte range {byte_start}..{byte_end} is outside `{path}`"
+        ));
+    }
+    let source_text = std::str::from_utf8(&admitted.content)
+        .map_err(|_| format!("admitted source `{path}` is not UTF-8"))?;
+    if !source_text.is_char_boundary(byte_start) || !source_text.is_char_boundary(byte_end) {
+        return Err(format!(
+            "proposal byte range {byte_start}..{byte_end} splits UTF-8 in `{path}`"
+        ));
+    }
+    let replacement = string_field(edit, "replacement", label)?
+        .as_bytes()
+        .to_vec();
+    let result_len = admitted
+        .content
+        .len()
+        .checked_sub(byte_end - byte_start)
+        .and_then(|length| length.checked_add(replacement.len()))
+        .ok_or_else(|| format!("proposal result length overflow for `{path}`"))?;
+    if result_len == 0 || result_len > MAX_SOURCE_BYTES {
+        return Err(format!(
+            "proposal result for `{path}` must contain 1..={MAX_SOURCE_BYTES} bytes"
+        ));
+    }
+    let mut result = Vec::with_capacity(result_len);
+    result.extend_from_slice(&admitted.content[..byte_start]);
+    result.extend_from_slice(&replacement);
+    result.extend_from_slice(&admitted.content[byte_end..]);
+    validate_source_bytes(path, &result)?;
+    if result == admitted.content {
+        return Err(format!("proposal for `{path}` does not change the file"));
+    }
+    let result_sha256 = string_field(edit, "result_sha256", label)?.to_owned();
+    validate_sha256(&result_sha256, "proposal result digest")?;
+    if sha256(&result) != result_sha256 {
+        return Err(format!("proposal result digest mismatch for `{path}`"));
+    }
+    Ok(Proposal {
+        path: path.to_owned(),
+        source_sha256,
+        byte_start,
+        byte_end,
+        result_sha256,
+        source: admitted.content.clone(),
+        replacement,
+        result,
+    })
+}
+
 pub(crate) fn parse_response(
     response: &[u8],
     admission: &Admission,
@@ -871,7 +961,18 @@ pub(crate) fn parse_response(
     let mut paths = BTreeSet::new();
     let mut proposals = Vec::with_capacity(values.len());
     for value in values {
-        let proposal = exact_object(value, &["path", "before_sha256", "content"], "proposal")?;
+        let proposal = exact_object(
+            value,
+            &[
+                "path",
+                "source_sha256",
+                "byte_start",
+                "byte_end",
+                "replacement",
+                "result_sha256",
+            ],
+            "proposal",
+        )?;
         let path = string_field(proposal, "path", "proposal")?.to_owned();
         if !paths.insert(path.clone()) {
             return Err(format!("duplicate proposal path `{path}`"));
@@ -879,28 +980,7 @@ pub(crate) fn parse_response(
         let admitted = admission
             .file(&path)
             .ok_or_else(|| format!("proposal path `{path}` was not admitted"))?;
-        let before_sha256 = string_field(proposal, "before_sha256", "proposal")?.to_owned();
-        if before_sha256 != admitted.before_sha256 {
-            return Err(format!("proposal before digest mismatch for `{path}`"));
-        }
-        let content = string_field(proposal, "content", "proposal")?
-            .as_bytes()
-            .to_vec();
-        if content.len() > MAX_SOURCE_BYTES {
-            return Err(format!(
-                "proposal for `{path}` exceeds {MAX_SOURCE_BYTES} bytes"
-            ));
-        }
-        if content == admitted.content {
-            return Err(format!("proposal for `{path}` does not change the file"));
-        }
-        proposals.push(Proposal {
-            path,
-            before_sha256,
-            result_sha256: sha256(&content),
-            before: admitted.content.clone(),
-            content,
-        });
+        proposals.push(parse_ranged_edit(proposal, &path, admitted, "proposal")?);
     }
     Ok(proposals)
 }
@@ -919,46 +999,38 @@ pub(crate) fn parse_revision_response(
     let object = exact_object(&value, &["proposal"], "revision response")?;
     let proposal = exact_object(
         object.get("proposal").expect("required key checked"),
-        &["path", "before_sha256", "content"],
+        &[
+            "path",
+            "source_sha256",
+            "byte_start",
+            "byte_end",
+            "replacement",
+            "result_sha256",
+        ],
         "revised proposal",
     )?;
     let path = string_field(proposal, "path", "revised proposal")?.to_owned();
-    let before_sha256 = string_field(proposal, "before_sha256", "revised proposal")?.to_owned();
-    if path != revision.rejected.path || before_sha256 != revision.rejected.before_sha256 {
-        return Err("revision response changed the rejected proposal identity".into());
+    if path != revision.rejected.path {
+        return Err("revision response changed the rejected proposal path".into());
     }
-    let content = string_field(proposal, "content", "revised proposal")?
-        .as_bytes()
-        .to_vec();
-    if content.len() > MAX_SOURCE_BYTES {
+    let admitted = revision
+        .admission
+        .file(&path)
+        .ok_or_else(|| "revision source is no longer admitted".to_owned())?;
+    let revised = parse_ranged_edit(proposal, &path, admitted, "revised proposal")?;
+    if revised.result == revision.rejected.result {
         return Err(format!(
-            "revised proposal for `{path}` exceeds {MAX_SOURCE_BYTES} bytes"
+            "revised proposal for `{path}` does not change the rejected result"
         ));
     }
-    if content == revision.rejected.before {
-        return Err(format!(
-            "revised proposal for `{path}` does not change the admitted source"
-        ));
-    }
-    if content == revision.rejected.content {
-        return Err(format!(
-            "revised proposal for `{path}` does not change the rejected generation"
-        ));
-    }
-    Ok(Proposal {
-        path,
-        before_sha256,
-        result_sha256: sha256(&content),
-        before: revision.rejected.before.clone(),
-        content,
-    })
+    Ok(revised)
 }
 
 pub(crate) fn render_diff(proposal: &Proposal) -> String {
     let before =
-        std::str::from_utf8(&proposal.before).expect("validated proposal source must remain UTF-8");
-    let after = std::str::from_utf8(&proposal.content)
-        .expect("validated proposal result must remain UTF-8");
+        std::str::from_utf8(&proposal.source).expect("validated proposal source must remain UTF-8");
+    let after =
+        std::str::from_utf8(&proposal.result).expect("validated proposal result must remain UTF-8");
     let before_lines: Vec<_> = before.split_inclusive('\n').collect();
     let after_lines: Vec<_> = after.split_inclusive('\n').collect();
     let prefix = before_lines
@@ -1021,12 +1093,15 @@ pub(crate) fn materialize(session: &Path, proposals: &[Proposal]) -> Result<Vec<
     let mut paths = Vec::with_capacity(proposals.len());
     for (index, proposal) in proposals.iter().enumerate() {
         let candidate = candidate_path(session, index);
-        atomic_write(&candidate, &proposal.content)?;
+        atomic_write(&candidate, &proposal.result)?;
         let metadata = serde_json::to_vec_pretty(&json!({
             "schema": 1,
             "index": index,
             "path": proposal.path,
-            "before_sha256": proposal.before_sha256,
+            "source_sha256": proposal.source_sha256,
+            "byte_start": proposal.byte_start,
+            "byte_end": proposal.byte_end,
+            "replacement_sha256": sha256(&proposal.replacement),
             "result_sha256": proposal.result_sha256,
             "candidate": candidate.file_name().expect("candidate file name").to_string_lossy(),
         }))
@@ -1073,7 +1148,7 @@ pub(crate) fn materialize_revision(
     proposal: &Proposal,
 ) -> Result<PathBuf, String> {
     let candidate = revision_candidate_path(session, revision.proposal_index);
-    atomic_write(&candidate, &proposal.content)?;
+    atomic_write(&candidate, &proposal.result)?;
     let metadata = serde_json::to_vec_pretty(&json!({
         "schema": 1,
         "revision": 1,
@@ -1081,7 +1156,10 @@ pub(crate) fn materialize_revision(
         "model": revision.model,
         "feedback_sha256": sha256(revision.feedback.as_bytes()),
         "path": proposal.path,
-        "before_sha256": proposal.before_sha256,
+        "source_sha256": proposal.source_sha256,
+        "byte_start": proposal.byte_start,
+        "byte_end": proposal.byte_end,
+        "replacement_sha256": sha256(&proposal.replacement),
         "rejected_result_sha256": revision.rejected.result_sha256,
         "result_sha256": proposal.result_sha256,
         "candidate": candidate.file_name().expect("candidate file name").to_string_lossy(),
@@ -1146,7 +1224,7 @@ pub(crate) fn materialize_continuation_response(
                 return Err("continued proposal revision does not match its sequence".into());
             }
             let candidate = continuation_candidate_path(session, *proposal_index, *revision);
-            atomic_write(&candidate, &proposal.content)?;
+            atomic_write(&candidate, &proposal.result)?;
             (
                 json!({
                     "schema": 1,
@@ -1159,7 +1237,10 @@ pub(crate) fn materialize_continuation_response(
                     "proposal_index": proposal_index,
                     "revision": revision,
                     "path": proposal.path,
-                    "before_sha256": proposal.before_sha256,
+                    "source_sha256": proposal.source_sha256,
+                    "byte_start": proposal.byte_start,
+                    "byte_end": proposal.byte_end,
+                    "replacement_sha256": sha256(&proposal.replacement),
                     "result_sha256": proposal.result_sha256,
                     "candidate": candidate.file_name().expect("candidate file name").to_string_lossy(),
                 }),
@@ -1237,6 +1318,14 @@ fn string_field<'a>(
         .get(field)
         .and_then(Value::as_str)
         .ok_or_else(|| format!("{label} `{field}` must be a string"))
+}
+
+fn usize_field(object: &Map<String, Value>, field: &str, label: &str) -> Result<usize, String> {
+    object
+        .get(field)
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| format!("{label} `{field}` must be a non-negative integer"))
 }
 
 fn validate_model(model: &str) -> Result<(), String> {
@@ -1322,27 +1411,21 @@ mod tests {
     }
 
     #[test]
-    fn response_requires_multiple_unique_admitted_changes() {
+    fn response_materializes_digest_anchored_ranges() {
         let admission = fixture_admission();
         let response = json!({
             "proposals": [
-                {
-                    "path": "README.md",
-                    "before_sha256": admission.files[0].before_sha256,
-                    "content": "alpha revised\n"
-                },
-                {
-                    "path": "lode/summary.md",
-                    "before_sha256": admission.files[1].before_sha256,
-                    "content": "beta revised\n"
-                }
+                proposal("README.md", &admission.files[0], "alpha revised\n"),
+                proposal("lode/summary.md", &admission.files[1], "beta revised\n")
             ]
         });
         let proposals =
             parse_response(&serde_json::to_vec(&response).unwrap(), &admission).unwrap();
         assert_eq!(proposals.len(), 2);
         assert_eq!(proposals[0].path, "README.md");
-        assert_eq!(proposals[1].content, b"beta revised\n");
+        assert_eq!(proposals[1].result, b"beta revised\n");
+        assert_eq!(proposals[1].byte_start, 0);
+        assert_eq!(proposals[1].byte_end, admission.files[1].content.len());
     }
 
     #[test]
@@ -1372,44 +1455,36 @@ mod tests {
     }
 
     #[test]
-    fn revision_accepts_only_a_changed_replacement_for_the_rejected_path() {
+    fn revision_accepts_only_a_changed_range_for_the_rejected_path() {
         let root = temporary_directory("revision");
         let admission = fixture_admission();
         let proposals = fixture_proposals(&admission);
         let revision =
             Revision::new("gpt-test", b"Correct beta.", &admission, &proposals, 1).unwrap();
         let response = json!({
-            "proposal": {
-                "path": revision.rejected.path,
-                "before_sha256": revision.rejected.before_sha256,
-                "content": "beta corrected\n"
-            }
+            "proposal": proposal(
+                &revision.rejected.path,
+                &admission.files[1],
+                "beta corrected\n"
+            )
         });
         let corrected =
             parse_revision_response(&serde_json::to_vec(&response).unwrap(), &revision).unwrap();
-        assert_eq!(corrected.content, b"beta corrected\n");
+        assert_eq!(corrected.result, b"beta corrected\n");
         let path = materialize_revision(&root, &revision, &corrected).unwrap();
         fs::write(&path, b"corrupt").unwrap();
         materialize_revision(&root, &revision, &corrected).unwrap();
-        assert_eq!(fs::read(path).unwrap(), corrected.content);
+        assert_eq!(fs::read(path).unwrap(), corrected.result);
 
-        for response in [
-            json!({"proposal": {
-                "path": "README.md",
-                "before_sha256": revision.rejected.before_sha256,
-                "content": "beta corrected\n"
-            }}),
-            json!({"proposal": {
-                "path": revision.rejected.path,
-                "before_sha256": revision.rejected.before_sha256,
-                "content": "beta revised\n"
-            }}),
-            json!({"proposal": {
-                "path": revision.rejected.path,
-                "before_sha256": revision.rejected.before_sha256,
-                "content": "beta\n"
-            }}),
-        ] {
+        let wrong_path = proposal("README.md", &admission.files[1], "beta corrected\n");
+        let unchanged = proposal(
+            &revision.rejected.path,
+            &admission.files[1],
+            std::str::from_utf8(&revision.rejected.result).unwrap(),
+        );
+        let original = proposal(&revision.rejected.path, &admission.files[1], "beta\n");
+        for response in [wrong_path, unchanged, original] {
+            let response = json!({ "proposal": response });
             assert!(
                 parse_revision_response(&serde_json::to_vec(&response).unwrap(), &revision)
                     .is_err()
@@ -1420,13 +1495,18 @@ mod tests {
 
     #[test]
     fn diff_rendering_is_exact_and_marks_missing_final_newlines() {
+        let source = b"[package]\nname = \"quartz\"\npublish = false".to_vec();
+        let result =
+            b"[package]\nname = \"quartz\"\ndescription = \"Quartz\"\npublish = false\n".to_vec();
         let proposal = Proposal {
             path: "Cargo.toml".into(),
-            before_sha256: "0".repeat(64),
-            result_sha256: "1".repeat(64),
-            before: b"[package]\nname = \"quartz\"\npublish = false".to_vec(),
-            content: b"[package]\nname = \"quartz\"\ndescription = \"Quartz\"\npublish = false\n"
-                .to_vec(),
+            source_sha256: sha256(&source),
+            byte_start: 0,
+            byte_end: source.len(),
+            result_sha256: sha256(&result),
+            source,
+            replacement: result.clone(),
+            result,
         };
         assert_eq!(
             render_diff(&proposal),
@@ -1445,24 +1525,39 @@ mod tests {
     }
 
     #[test]
-    fn response_rejects_unadmitted_duplicate_stale_and_unchanged_candidates() {
+    fn response_rejects_unadmitted_duplicate_stale_and_invalid_ranges() {
         let admission = fixture_admission();
+        let outside = admitted("outside.md", b"outside\n");
+        let mut stale = proposal("README.md", &admission.files[0], "changed\n");
+        stale["source_sha256"] = Value::String("0".repeat(64));
+        let mut bad_digest = proposal("README.md", &admission.files[0], "changed\n");
+        bad_digest["result_sha256"] = Value::String("0".repeat(64));
+        let mut invalid_range = proposal("README.md", &admission.files[0], "changed\n");
+        invalid_range["byte_end"] = Value::from(admission.files[0].content.len() + 1);
         let cases = [
             json!({"proposals": [
-                proposal("outside.md", &admission.files[0].before_sha256, "changed\n"),
-                proposal("lode/summary.md", &admission.files[1].before_sha256, "changed\n")
+                proposal("outside.md", &outside, "changed\n"),
+                proposal("lode/summary.md", &admission.files[1], "changed\n")
             ]}),
             json!({"proposals": [
-                proposal("README.md", &admission.files[0].before_sha256, "changed\n"),
-                proposal("README.md", &admission.files[0].before_sha256, "changed again\n")
+                proposal("README.md", &admission.files[0], "changed\n"),
+                proposal("README.md", &admission.files[0], "changed again\n")
             ]}),
             json!({"proposals": [
-                proposal("README.md", &"0".repeat(64), "changed\n"),
-                proposal("lode/summary.md", &admission.files[1].before_sha256, "changed\n")
+                stale,
+                proposal("lode/summary.md", &admission.files[1], "changed\n")
             ]}),
             json!({"proposals": [
-                proposal("README.md", &admission.files[0].before_sha256, "alpha\n"),
-                proposal("lode/summary.md", &admission.files[1].before_sha256, "changed\n")
+                proposal("README.md", &admission.files[0], "alpha\n"),
+                proposal("lode/summary.md", &admission.files[1], "changed\n")
+            ]}),
+            json!({"proposals": [
+                bad_digest,
+                proposal("lode/summary.md", &admission.files[1], "changed\n")
+            ]}),
+            json!({"proposals": [
+                invalid_range,
+                proposal("lode/summary.md", &admission.files[1], "changed\n")
             ]}),
         ];
         for case in cases {
@@ -1475,8 +1570,8 @@ mod tests {
         let root = temporary_directory("materialize");
         let admission = fixture_admission();
         let response = json!({"proposals": [
-            proposal("README.md", &admission.files[0].before_sha256, "alpha revised\n"),
-            proposal("lode/summary.md", &admission.files[1].before_sha256, "beta revised\n")
+            proposal("README.md", &admission.files[0], "alpha revised\n"),
+            proposal("lode/summary.md", &admission.files[1], "beta revised\n")
         ]});
         let proposals =
             parse_response(&serde_json::to_vec(&response).unwrap(), &admission).unwrap();
@@ -1488,20 +1583,37 @@ mod tests {
     }
 
     #[test]
-    fn file_admission_rejects_duplicates_and_sources_outside_the_root() {
+    fn file_admission_accepts_four_files_and_rejects_unsafe_paths() {
         let root = temporary_directory("admission");
         let repository = root.join("repository");
         fs::create_dir_all(&repository).unwrap();
         let task = root.join("task.txt");
-        let source = repository.join("source.txt");
-        let outside = root.join("outside.txt");
-        fs::write(&task, b"change both files").unwrap();
-        fs::write(&source, b"inside\n").unwrap();
-        fs::write(&outside, b"outside\n").unwrap();
-        assert!(
-            Admission::from_files(&repository, &task, &[source.clone(), source.clone()]).is_err()
+        fs::write(&task, b"change admitted files").unwrap();
+        let sources = (0..4)
+            .map(|index| {
+                let source = repository.join(format!("source-{index}.txt"));
+                fs::write(&source, format!("source {index}\n")).unwrap();
+                source
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            Admission::from_files(&repository, &task, &sources)
+                .unwrap()
+                .files
+                .len(),
+            4
         );
-        assert!(Admission::from_files(&repository, &task, &[source, outside]).is_err());
+        assert!(
+            Admission::from_files(
+                &repository,
+                &task,
+                &[sources[0].clone(), sources[0].clone()]
+            )
+            .is_err()
+        );
+        let outside = root.join("outside.txt");
+        fs::write(&outside, b"outside\n").unwrap();
+        assert!(Admission::from_files(&repository, &task, &[sources[0].clone(), outside]).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1521,8 +1633,9 @@ mod tests {
             continuation
         );
         assert!(parse_continuation_response(b"COMPLETE\nTests passed.", &continuation).is_err());
-        let response =
-            parse_continuation_response(b"PROPOSE 1\nbeta corrected\n", &continuation).unwrap();
+        let edit = continued_proposal(&continuation.sources[1], "beta corrected\n");
+        let response = format!("PROPOSE 1\n{}", serde_json::to_string(&edit).unwrap());
+        let response = parse_continuation_response(response.as_bytes(), &continuation).unwrap();
         let ContinuationResponse::Proposal {
             admitted_path_index,
             proposal_index,
@@ -1535,8 +1648,8 @@ mod tests {
         assert_eq!(admitted_path_index, 1);
         assert_eq!(proposal_index, 1);
         assert_eq!(revision, 2);
-        assert_eq!(proposal.before, b"beta revised\n");
-        assert_eq!(proposal.content, b"beta corrected\n");
+        assert_eq!(proposal.source, b"beta revised\n");
+        assert_eq!(proposal.result, b"beta corrected\n");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1632,10 +1745,10 @@ mod tests {
 
     fn fixture_proposals(admission: &Admission) -> Vec<Proposal> {
         let response = json!({"proposals": [
-            proposal("README.md", &admission.files[0].before_sha256, "alpha revised\n"),
+            proposal("README.md", &admission.files[0], "alpha revised\n"),
             proposal(
                 "lode/summary.md",
-                &admission.files[1].before_sha256,
+                &admission.files[1],
                 "beta revised\n"
             )
         ]});
@@ -1650,12 +1763,21 @@ mod tests {
         }
     }
 
-    fn proposal(path: &str, before_sha256: &str, content: &str) -> Value {
+    fn proposal(path: &str, source: &AdmittedFile, result: &str) -> Value {
         json!({
             "path": path,
-            "before_sha256": before_sha256,
-            "content": content,
+            "source_sha256": source.before_sha256,
+            "byte_start": 0,
+            "byte_end": source.content.len(),
+            "replacement": result,
+            "result_sha256": sha256(result.as_bytes()),
         })
+    }
+
+    fn continued_proposal(source: &AdmittedFile, result: &str) -> Value {
+        let mut proposal = proposal(&source.path, source, result);
+        proposal.as_object_mut().unwrap().remove("path");
+        proposal
     }
 
     fn temporary_directory(label: &str) -> PathBuf {

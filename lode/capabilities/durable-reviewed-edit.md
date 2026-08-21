@@ -2,11 +2,23 @@
 
 ## Problem
 
-Quartz can durably produce a model response and can publish one pre-admitted workspace, but sandboxed code cannot read durable response bytes. Slice 7 therefore proves editing only with a result known before activation. A coding harness needs to preserve a model-authored candidate across restart, keep the repository unchanged while that candidate is reviewed, and apply only the exact candidate the host later admits.
+Quartz can durably produce a model response and can publish one pre-admitted
+workspace, but sandboxed code cannot read a source path or reconstruct a
+repository edit without host admission. A coding harness needs to preserve
+model-authored intent across restart, keep the repository unchanged during
+review, and apply only an exact digest-anchored ranged edit the host has verified.
 
 ## Observable behavior
 
-A production-compatible provider response is committed as a bounded event payload. The process may stop with no repository mutation. A fresh runtime reconstructs that payload, and a sandboxed proposal editor selects one response fact by stable turn identity, copies its exact bytes into one host-admitted workspace, invokes the ordinary callable mutation authority, and publishes through the existing mutation ledger. The source path remains host-selected. Approval binds the candidate SHA-256 before the editor activates; denial, payload drift, stale source state, or missing authority leaves the source unchanged.
+A production response carries a source digest, half-open UTF-8 byte range, exact
+replacement bytes, and expected result digest. The host applies the range to the
+exact admitted source in memory and verifies the result digest before admitting
+the materialized bytes to the existing sandboxed proposal editor. The process
+may stop with no repository mutation. A fresh runtime reconstructs the response,
+repeats materialization from durable source evidence, and exposes only the
+verified result through one host-admitted snapshot and workspace. Approval binds
+that result SHA-256 before the editor activates; denial, range failure, digest
+drift, stale source state, or missing authority leaves the source unchanged.
 
 ## Non-goals
 
@@ -20,30 +32,37 @@ A production-compatible provider response is committed as a bounded event payloa
 
 - Durable event payload bytes remain host-owned and bounded by the existing event-stream record, per-payload, total-payload, and read-index limits.
 - Payload reads require explicit manifest capabilities and a committed event-stream provider view. They are available only during activation or callable dispatch, matching scalar event reads.
-- The proposal editor selects exactly one `agent-response` fact for its configured turn. Missing, duplicate, payload-free, or oversized candidates fail activation without touching a workspace source.
-- The current Slice 8 editor is admitted for one canonical source and exact
-  candidate digest only after the candidate is durable; it cannot widen the
-  workspace byte bound.
-- Copying payload bytes mutates only the editor fiber's private workspace buffer. Publication still requires the existing committed callable authority, exact operation/index approval, source-before digest, candidate-result digest, and durable mutation identity.
-- Candidate production and candidate application are separate runtime generations. Restart cannot change candidate bytes or provenance and cannot duplicate an already committed model exchange.
-- Without a separate promotion commit, editor replacement follows ordinary lifecycle order: the old restoration effect restores the source before the next generation reads the durable candidate and admits its workspace bytes.
-- Without promotion, removing the editor restores the original only while the source retains the published candidate digest. A committed promotion instead preserves and verifies the exact candidate under `durable-edit-promotion.md`. External drift is made durably ambiguous and is never overwritten.
+- A product proposal is one strict ranged edit. The range is half-open, bounded
+  by the exact source bytes, and begins and ends on UTF-8 boundaries.
+- Host materialization must produce the declared result digest, valid non-empty
+  UTF-8, changed bytes, and a result within the workspace bound before sandboxed
+  code receives it.
+- The proposal editor remains admitted for one canonical source and exact
+  materialized result digest; it cannot widen the workspace byte bound.
+- Copying materialized bytes mutates only the editor fiber's private workspace
+  buffer. Publication still requires the existing committed callable authority,
+  exact operation/index approval, source-before digest, candidate-result digest,
+  and durable mutation identity.
+- Candidate production and candidate application are separate runtime
+  generations. Restart cannot change range intent, materialized bytes, or
+  provenance and cannot duplicate an already committed model exchange.
+- Without a separate promotion commit, editor replacement follows ordinary
+  lifecycle order: the old restoration effect restores the source before the
+  next generation rematerializes and admits the same ranged edit.
 - Event facts, candidate payloads, exchange records, and mutation-ledger records remain honestly external. Live event access, workspace buffers, approvals, and workspace recovery effects are recovered.
 
-## Superseded implementation decisions
+## Superseded implementation decision
 
-Slice 8 treated full-file candidate bytes and host-only path selection as
-permanent safety properties. They are not architectural invariants. The
-implemented editor remains constrained that way until clean replacement:
+Slice 8 used a complete-file model payload. Slice C replaced that product
+representation with a digest-anchored ranged edit and deleted the complete-file
+parser. The existing ABI still carries verified full workspace bytes because
+the host materializes and checks the range before admission; this is mechanism,
+not a second candidate representation.
 
-- ranged edits will bind a source digest, byte range, exact replacement bytes,
-  and expected result digest instead of copying a complete-file candidate;
-- a host-admitted manifest will retain canonical paths and digests, while the
-  model may select only numeric manifest indices. Model-authored path strings
-  and ambient filesystem discovery remain prohibited.
-
-There is no compatibility path: each later slice replaces the old candidate or
-selection representation and migrates all callers before deleting it.
+Host-only path selection remains until Slice E admits a canonical path/digest
+manifest selected only by numeric index. Model-authored path strings and ambient
+filesystem discovery remain prohibited. That change will also be a clean
+cutover with no compatibility path.
 
 ## Public contract
 

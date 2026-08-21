@@ -33,10 +33,10 @@
 - **Exchange grant** — one exact adapter identity, durable ledger path, byte bounds, and timeout admitted to a component by numeric index.
 - **Exchange ledger** — the checksummed append-only record of started and terminal external invocations used to prevent unsafe retries and replay exact successes.
 - **Staged response** — bounded adapter output held by a provider fiber during callable dispatch and transferred only through committed callable authority.
-- **Reviewed candidate** — one bounded durable model-response payload whose
-  exact digest is admitted for a fixed workspace only after proposal
-  generation completes.
-- **Proposal generation** — one exact original or corrected candidate for an
+- **Reviewed candidate** — one bounded digest-anchored ranged edit carrying an
+  admitted source identity, a half-open UTF-8 byte range, exact replacement
+  bytes, and the expected materialized result identity.
+- **Proposal generation** — one exact original or corrected ranged edit for an
   admitted path; only the latest completed generation remains promotable.
 - **Approved command attempt** — one exact user-approved argv with a synchronized
   start fact and at most one terminal fact; a started-only attempt is

@@ -108,10 +108,11 @@ Neighboring prompt, response, exchange, promotion, and mutation files are
 operation evidence or disposable render caches; they cannot supply missing
 session history or authorize an action.
 
-The proposal command admits two or three exact UTF-8 files, commits one bounded
-production turn, validates multiple path-bound complete-file candidates, and
-leaves every source unchanged. Resume reconstructs all generations and renders
-exact diffs without credentials or another exchange. Revision records one
+The proposal command admits at least two exact UTF-8 files, commits one bounded
+production turn, validates multiple digest-anchored ranged edits, materializes
+each candidate from its admitted source, and leaves every source unchanged.
+Resume reconstructs all generations and renders exact diffs without credentials
+or another exchange. Revision records one
 explicit bounded rejection, preserves the original admission and response, and
 runs at most one correction turn for the selected path. Promotion resolves only
 the current candidate generation through the existing workspace, mutation, and
@@ -126,11 +127,10 @@ reconstructs as interrupted/unknown, is never run during resume, and blocks
 later session facts. After a completed nonterminal continuation, another command
 requires a separate renewed approval.
 
-Each finished command is consumed by one sequence-numbered continuation that
-binds the exact command facts, current proposal generations, and post-command
-admitted sources. Its strict response is either `PROPOSE
-<admitted-path-index>` followed by complete replacement bytes, or `COMPLETE`
-followed by a bounded summary. A correction must be separately promoted before
+A finished command is consumed by a sequence-numbered continuation that returns
+`PROPOSE <admitted-path-index>` followed by one strict digest-anchored ranged
+edit, or `COMPLETE` followed by a bounded summary. A correction must be
+separately promoted before
 another exact argv can run. Command success alone never completes the task;
 explicit `COMPLETE` closes the session against later commands, continuations,
 revisions, and promotions.

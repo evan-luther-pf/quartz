@@ -39,7 +39,7 @@ Commands:
   --reviewed-edit <directory>
   --promote-edit <directory>
   --production-model <model> <prompt> <journal>
-  --propose <model> <task> <session-dir> <source> <source> [source]
+  --propose <model> <task> <session-dir> <source> <source> [source ...]
   --resume-proposals <session-dir>
   --revise-proposal <model> <session-dir> <index> <feedback>
   --promote-proposal <session-dir> <index>
@@ -222,24 +222,22 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CliCommand, Stri
             let model = required_arg(
                 &mut args,
                 command,
-                "<model> <task> <session> <source> <source> [source]",
+                "<model> <task> <session> <source> <source> [source ...]",
             )?;
             let task = path_arg(
                 &mut args,
                 command,
-                "<model> <task> <session> <source> <source> [source]",
+                "<model> <task> <session> <source> <source> [source ...]",
             )?;
             let session = path_arg(
                 &mut args,
                 command,
-                "<model> <task> <session> <source> <source> [source]",
+                "<model> <task> <session> <source> <source> [source ...]",
             )?;
             let sources: Vec<PathBuf> = args.by_ref().map(PathBuf::from).collect();
-            if !(2..=3).contains(&sources.len())
-                || sources.iter().any(|path| path.as_os_str().is_empty())
-            {
+            if sources.len() < 2 || sources.iter().any(|path| path.as_os_str().is_empty()) {
                 return Err(
-                    "`--propose` requires two or three non-empty <source> paths; try `quartz --help`"
+                    "`--propose` requires at least two non-empty <source> paths; try `quartz --help`"
                         .into(),
                 );
             }
@@ -1638,6 +1636,7 @@ impl ProposalSession {
     }
 }
 
+#[cfg(test)]
 fn reconstruct_base_proposals(
     session: &Path,
 ) -> Result<(proposals::Admission, Vec<proposals::Proposal>), Box<dyn std::error::Error>> {
@@ -2137,7 +2136,7 @@ fn display_proposals(
 ) -> Result<(), Box<dyn std::error::Error>> {
     for (index, candidate) in state.proposals.iter().enumerate() {
         let base_path = proposals::candidate_path(session, index);
-        if fs::read(&base_path)? != candidate.content {
+        if fs::read(&base_path)? != candidate.result {
             return Err(format!("materialized candidate {index} changed").into());
         }
         let current_revision = state
@@ -2169,7 +2168,7 @@ fn display_proposals(
             }
             Some(ProposalRevisionState::Completed { request, proposal }) => {
                 let path = proposals::revision_candidate_path(session, index);
-                if fs::read(&path)? != proposal.content {
+                if fs::read(&path)? != proposal.result {
                     return Err(
                         format!("materialized revision for proposal {index} changed").into(),
                     );
@@ -2250,7 +2249,7 @@ fn display_continuation(
                 },
         } => {
             let path = proposals::continuation_candidate_path(session, *proposal_index, *revision);
-            if fs::read(&path)? != proposal.content {
+            if fs::read(&path)? != proposal.result {
                 return Err(format!(
                     "materialized continuation {} proposal changed",
                     request.sequence
@@ -2290,7 +2289,11 @@ fn display_continuation(
 
 fn display_proposal(candidate: &proposals::Proposal, path: &Path) {
     println!("  path={}", candidate.path);
-    println!("  before_sha256={}", candidate.before_sha256);
+    println!("  source_sha256={}", candidate.source_sha256);
+    println!(
+        "  byte_range={}..{}",
+        candidate.byte_start, candidate.byte_end
+    );
     println!("  result_sha256={}", candidate.result_sha256);
     println!("  candidate={}", path.display());
     print!("{}", proposals::render_diff(candidate));
@@ -2511,13 +2514,13 @@ fn run_proposal_promotion(session: &Path, index: usize) -> Result<(), Box<dyn st
     let candidate_path = current.path.clone();
     let repository_root = repository_root()?;
     let source = proposals::resolve_source(&repository_root, &candidate.path)?;
-    if fs::read(&candidate_path)? != candidate.content {
+    if fs::read(&candidate_path)? != candidate.result {
         return Err(format!("proposal candidate {index} changed before approval").into());
     }
     let (journal, mutation) = proposal_promotion_paths(&session, index, current.revision);
     let live = fs::read(&source)?;
     let live_digest = digest(&live);
-    if live_digest != candidate.before_sha256
+    if live_digest != candidate.source_sha256
         && !(live_digest == candidate.result_sha256 && journal.exists() && mutation.exists())
     {
         return Err(format!(
@@ -2558,18 +2561,18 @@ fn run_proposal_promotion(session: &Path, index: usize) -> Result<(), Box<dyn st
     let mut runtime = Runtime::open_persistent(proposal_limits(), persistence())?;
     runtime.apply_tree(desired)?;
     active_id(&runtime, "root/promoter")?;
-    if fs::read(&source)? != candidate.content {
+    if fs::read(&source)? != candidate.result {
         return Err(format!("proposal {index} promotion produced different bytes").into());
     }
     drop(runtime);
 
     let mut restarted = Runtime::open_persistent(proposal_limits(), persistence())?;
     active_id(&restarted, "root/promoter")?;
-    if fs::read(&source)? != candidate.content {
+    if fs::read(&source)? != candidate.result {
         return Err(format!("proposal {index} changed after restart").into());
     }
     restarted.shutdown_persistent()?;
-    if !restarted.is_observationally_clean() || fs::read(&source)? != candidate.content {
+    if !restarted.is_observationally_clean() || fs::read(&source)? != candidate.result {
         return Err(format!("proposal {index} did not retain a clean promotion").into());
     }
     session_log.append(session::SessionFact::ProposalPromoted {
@@ -2621,7 +2624,7 @@ fn proposal_promotion_tree(
                             mutation,
                             operation,
                             format!("approved proposal {}", candidate.path),
-                            candidate.before_sha256.clone(),
+                            candidate.source_sha256.clone(),
                             candidate.result_sha256.clone(),
                             proposals::MAX_SOURCE_BYTES,
                         )?]),
@@ -3132,12 +3135,19 @@ mod cli_tests {
                 "session",
                 "README.md",
                 "lode/summary.md",
+                "lode/terminology.md",
+                "lode/practices.md",
             ]),
             Ok(CliCommand::Propose {
                 model: "model".into(),
                 task: PathBuf::from("task"),
                 session: PathBuf::from("session"),
-                sources: vec![PathBuf::from("README.md"), PathBuf::from("lode/summary.md"),],
+                sources: vec![
+                    PathBuf::from("README.md"),
+                    PathBuf::from("lode/summary.md"),
+                    PathBuf::from("lode/terminology.md"),
+                    PathBuf::from("lode/practices.md"),
+                ],
             })
         );
         assert_eq!(
@@ -3201,20 +3211,7 @@ mod cli_tests {
             ),
             (
                 &["--propose", "model", "task", "session", "one"][..],
-                "requires two or three",
-            ),
-            (
-                &[
-                    "--propose",
-                    "model",
-                    "task",
-                    "session",
-                    "one",
-                    "two",
-                    "three",
-                    "four",
-                ][..],
-                "requires two or three",
+                "requires at least two",
             ),
             (
                 &["--revise-proposal", "model", "session", "bad", "feedback"][..],
@@ -3278,10 +3275,13 @@ mod proposal_runtime_tests {
         fs::write(&candidate_path, result).unwrap();
         let candidate = proposals::Proposal {
             path: "source.txt".into(),
-            before_sha256: digest(before),
+            source_sha256: digest(before),
+            byte_start: 0,
+            byte_end: before.len(),
             result_sha256: digest(result),
-            before: before.to_vec(),
-            content: result.to_vec(),
+            source: before.to_vec(),
+            replacement: result.to_vec(),
+            result: result.to_vec(),
         };
         let fixtures = PathBuf::from(env!("QUARTZ_FIXTURE_DIR"));
 
@@ -3351,16 +3351,8 @@ mod proposal_runtime_tests {
         };
         let base_response = serde_json::to_vec(&serde_json::json!({
             "proposals": [
-                {
-                    "path": "alpha.txt",
-                    "before_sha256": admission.files[0].before_sha256,
-                    "content": "alpha rejected\n"
-                },
-                {
-                    "path": "beta.txt",
-                    "before_sha256": admission.files[1].before_sha256,
-                    "content": "beta accepted\n"
-                }
+                ranged_proposal("alpha.txt", &admission.files[0], "alpha rejected\n"),
+                ranged_proposal("beta.txt", &admission.files[1], "beta accepted\n")
             ]
         }))
         .unwrap();
@@ -3376,11 +3368,11 @@ mod proposal_runtime_tests {
         .unwrap();
         let revision_prompt = revision.prompt_bytes().unwrap();
         let revision_response = serde_json::to_vec(&serde_json::json!({
-            "proposal": {
-                "path": "alpha.txt",
-                "before_sha256": admission.files[0].before_sha256,
-                "content": "alpha corrected\n"
-            }
+            "proposal": ranged_proposal(
+                "alpha.txt",
+                &admission.files[0],
+                "alpha corrected\n"
+            )
         }))
         .unwrap();
         let mut log = session::SessionLog::open(&session).unwrap();
@@ -3417,10 +3409,10 @@ mod proposal_runtime_tests {
 
         let state = reconstruct_proposal_session(&session).unwrap();
         let current = state.current(&session, 0).unwrap();
-        assert_eq!(current.proposal.content, b"alpha corrected\n");
-        assert_eq!(fs::read(current.path).unwrap(), current.proposal.content);
+        assert_eq!(current.proposal.result, b"alpha corrected\n");
+        assert_eq!(fs::read(current.path).unwrap(), current.proposal.result);
         let sibling = state.current(&session, 1).unwrap();
-        assert_eq!(sibling.proposal.content, b"beta accepted\n");
+        assert_eq!(sibling.proposal.result, b"beta accepted\n");
         fs::remove_file(proposals::revision_prompt_path(&session)).unwrap();
         fs::remove_file(proposals::revision_candidate_path(&session, 0)).unwrap();
         fs::remove_file(session.join("revision-1.json")).unwrap();
@@ -3481,16 +3473,8 @@ mod proposal_runtime_tests {
         };
         let response = serde_json::to_vec(&serde_json::json!({
             "proposals": [
-                {
-                    "path": "alpha.txt",
-                    "before_sha256": admission.files[0].before_sha256,
-                    "content": "alpha proposed\n"
-                },
-                {
-                    "path": "beta.txt",
-                    "before_sha256": admission.files[1].before_sha256,
-                    "content": "beta proposed\n"
-                }
+                ranged_proposal("alpha.txt", &admission.files[0], "alpha proposed\n"),
+                ranged_proposal("beta.txt", &admission.files[1], "beta proposed\n")
             ]
         }))
         .unwrap();
@@ -3642,7 +3626,7 @@ mod proposal_runtime_tests {
             Arc::new(FixedExchange::success(
                 "failed-command-correction",
                 request.prompt_bytes().unwrap(),
-                b"PROPOSE 0\nalpha corrected after failure\n".to_vec(),
+                continuation_proposal(0, &request.sources[0], "alpha corrected after failure\n"),
                 calls.clone(),
             )),
         )
@@ -3652,7 +3636,7 @@ mod proposal_runtime_tests {
         let corrected = reconstructed.current(&session, 0).unwrap();
         assert_eq!(corrected.revision, 2);
         assert_eq!(
-            corrected.proposal.content,
+            corrected.proposal.result,
             b"alpha corrected after failure\n"
         );
         assert_eq!(fs::read(&sources[0]).unwrap(), b"alpha proposed\n");
@@ -4002,7 +3986,11 @@ mod proposal_runtime_tests {
             Arc::new(FixedExchange::success(
                 "first-cycle-correction",
                 correction.prompt_bytes().unwrap(),
-                b"PROPOSE 0\nalpha corrected before interruption\n".to_vec(),
+                continuation_proposal(
+                    0,
+                    &correction.sources[0],
+                    "alpha corrected before interruption\n",
+                ),
                 Arc::new(AtomicU64::new(0)),
             )),
         )
@@ -4087,16 +4075,8 @@ mod proposal_runtime_tests {
         };
         let response = serde_json::to_vec(&serde_json::json!({
             "proposals": [
-                {
-                    "path": paths[0],
-                    "before_sha256": admission.files[0].before_sha256,
-                    "content": "alpha proposed\n"
-                },
-                {
-                    "path": paths[1],
-                    "before_sha256": admission.files[1].before_sha256,
-                    "content": "beta proposed\n"
-                }
+                ranged_proposal(&paths[0], &admission.files[0], "alpha proposed\n"),
+                ranged_proposal(&paths[1], &admission.files[1], "beta proposed\n")
             ]
         }))
         .unwrap();
@@ -4206,6 +4186,35 @@ mod proposal_runtime_tests {
             before_sha256: digest(content),
             content: content.to_vec(),
         }
+    }
+
+    fn ranged_proposal(
+        path: &str,
+        source: &proposals::AdmittedFile,
+        result: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "path": path,
+            "source_sha256": source.before_sha256,
+            "byte_start": 0,
+            "byte_end": source.content.len(),
+            "replacement": result,
+            "result_sha256": digest(result.as_bytes()),
+        })
+    }
+
+    fn continuation_proposal(
+        index: usize,
+        source: &proposals::AdmittedFile,
+        result: &str,
+    ) -> Vec<u8> {
+        let mut proposal = ranged_proposal(&source.path, source, result);
+        proposal.as_object_mut().unwrap().remove("path");
+        format!(
+            "PROPOSE {index}\n{}",
+            serde_json::to_string(&proposal).unwrap()
+        )
+        .into_bytes()
     }
 
     fn temporary_directory() -> PathBuf {

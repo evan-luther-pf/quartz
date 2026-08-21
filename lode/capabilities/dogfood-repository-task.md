@@ -11,13 +11,14 @@ resident in the native executable rather than a component.
 ## Observable behavior
 
 `quartz --propose <model> <task-path> <session-dir> <source> <source>
-[source]` currently admits two or three exact UTF-8 repository files and one
-bounded task. The host canonicalizes the sources beneath the repository root,
-records their relative paths, SHA-256 identities, and bytes, and submits one
-bounded immutable prompt through the existing production exchange. The response
-is one strict JSON object containing at least two unique, path-bound complete-file
-candidates selected from the admitted sources. Proposal production never mutates
-the repository.
+[source ...]` admits at least two exact UTF-8 repository files and one bounded
+task. The host canonicalizes the sources beneath the repository root, records
+their relative paths, SHA-256 identities, and bytes, and submits one bounded
+immutable prompt through the existing production exchange. The response is one
+strict JSON object containing at least two unique, path-bound ranged edits. Each
+edit names the admitted source SHA-256, a half-open UTF-8 byte range, exact
+replacement bytes, and the expected materialized result SHA-256. Proposal
+production never mutates the repository.
 
 `quartz --resume-proposals <session-dir>` reconstructs proposal state from the
 ordered facts in `<session-dir>/session.qe` without credentials or another
@@ -27,8 +28,9 @@ superseded, rejected, interrupted, and completed state.
 `quartz --revise-proposal <model> <session-dir> <index> <feedback-path>` records
 one explicit bounded rejection and may emit one correction exchange for the
 selected current generation. The correction is bound to the original admission,
-model, source, before digest, rejected bytes, and feedback. Interrupted exchange
-state remains interrupted/unknown and is never implicitly retried.
+model, source digest, rejected byte range, replacement and result identities,
+and feedback. Interrupted exchange state remains interrupted/unknown and is
+never implicitly retried.
 
 `quartz --promote-proposal <session-dir> <index>` is the user's exact approval of
 the displayed current candidate. It publishes and retains that candidate through
@@ -52,7 +54,7 @@ The exact response grammar is:
 
 ```text
 PROPOSE <admitted-path-index>
-<exact complete-file candidate bytes>
+{"source_sha256":"<post-command source SHA-256>","byte_start":<inclusive UTF-8 byte offset>,"byte_end":<exclusive UTF-8 byte offset>,"replacement":"<exact UTF-8 replacement>","result_sha256":"<materialized result SHA-256>"}
 ```
 
 or:
@@ -89,21 +91,17 @@ and policy behind a component boundary, migrate every caller, and delete the
 native implementation. It must first identify any missing ABI primitive exactly;
 adding a broad orchestrator-specific host API is not an acceptable substitute.
 
-## Superseded implementation decisions
+## Superseded implementation decision
 
-Two current restrictions are implementation constraints, not product
-invariants:
+Host-only source selection remains an implementation constraint, not a product
+invariant. Slice E admits a bounded manifest of canonical paths and digests and
+permits the model to select numeric manifest indices. The host continues to own
+every path identity; model-authored path strings and ambient filesystem discovery
+remain prohibited.
 
-- Complete-file candidates and the two-or-three-source ceiling remain only until
-  Slice C replaces them with digest-anchored ranged edits carrying a source
-  digest, byte range, exact replacement bytes, and expected result digest.
-- Host-only source selection remains only until Slice E admits a bounded manifest
-  of canonical paths and digests and permits the model to select numeric manifest
-  indices. The host continues to own every path identity; model-authored path
-  strings and ambient filesystem discovery remain prohibited.
-
-Both are clean cutovers. There are no compatibility shims, dual parsers, legacy
-aliases, or permanent translation layers.
+Complete-file candidates and the two-or-three-source ceiling were removed by
+the ranged-edit cutover. There is no legacy parser, alias, or translation layer.
+The later manifest change is likewise a clean cutover.
 
 ## Non-goals
 
@@ -123,11 +121,18 @@ aliases, or permanent translation layers.
 - Every admitted source is a canonical regular file beneath one canonical
   repository root. Before bytes, byte length, and SHA-256 identity are exact and
   bounded.
+- A ranged edit uses a half-open byte range whose endpoints are UTF-8 boundaries
+  in the exact admitted source. Replacement bytes are UTF-8, may be empty, and
+  must produce a changed, non-empty result within the source byte bound.
+- The host materializes `source[..start] + replacement + source[end..]` and
+  verifies the declared result SHA-256 before the edit enters proposal state.
+  Review and promotion use only that verified materialization.
 - Initial responses, revisions, and continuations are strict bounded grammars.
   Invalid or ambiguous durable responses remain evidence and never trigger an
   automatic exchange retry.
-- Candidate review precedes mutation approval. Promotion is a separate exact
-  authority bound to source, before and result digests, operation identity,
+- Candidate review precedes mutation approval. Promotion first requires the live
+  source to retain the ranged edit's admitted source digest, then uses a separate
+  exact authority bound to source and result digests, operation identity,
   workspace index, and approving provider identity.
 - Command approval binds the executable, every argument, working directory,
   repository identity, admitted-file identities, and attempt identity. The
@@ -213,10 +218,12 @@ publication, and promotion capabilities still bound actual source mutation.
 Their results enter task state only after an exact session fact commits.
 
 Each command argument is non-empty and capped at 4 KiB; total argument bytes are
-capped at 32 KiB. Candidate bytes are UTF-8 and capped at 32 KiB. Rejection
-feedback and completion summaries are UTF-8 and capped at 4 KiB. Individual
-session facts, the total session log, prompt, response, workspace, and
-operation-ledger records remain independently bounded.
+capped at 32 KiB. Each admitted source and materialized result is UTF-8 and
+capped at 32 KiB; prompt size independently bounds the admitted file count.
+Replacement bytes share the response bound and may be empty. Rejection feedback
+and completion summaries are UTF-8 and capped at 4 KiB. Individual session
+facts, the total session log, prompt, response, workspace, and operation-ledger
+records remain independently bounded.
 
 ## Acceptance scenario
 
@@ -239,21 +246,24 @@ operation-ledger records remain independently bounded.
 
 ## Verification
 
-Focused contracts cover exact chronological reconstruction, failed-command
-correction followed by successful completion, restart across repeated cycles,
-every started-only external-operation class, sequence and terminal-identity
-tampering, cache deletion, stale promotion, and post-completion closure.
+Focused contracts cover strict range grammar, source and result digest binding,
+UTF-8 boundaries, empty replacement, materialization from validated bytes,
+four-file admission, revision and continuation ranges, exact chronological
+reconstruction, repeated correction cycles, every started-only external-operation
+class, sequence and identity tampering, stale promotion, and post-completion
+closure.
 
-The credentialed Slice B dogfood session emitted one failed command, one
-reviewed and promoted correction, one successful command, and explicit
-completion. Credential-free restart reconstructed both command results, both
-model decisions, promotions, and completion after all materialized candidate,
-prompt, response-metadata, and completion-summary caches were deleted. Attempts
-to command, revise, promote, or continue after completion each exited 2 without
-emitting work.
+The credentialed Slice C dogfood run admitted four files. An unassisted response
+with a wrong result digest failed closed before candidate admission. A bounded
+retry whose task supplied the four expected result digests produced four exact
+ranges (`14..21`, `13..20`, `14..21`, and `14..21`) replacing only `pending`
+with `ready`. The host materialized and verified all four candidates, the
+sources retained their admitted digests, and the final release executable
+reconstructed all four diffs without credentials.
 
 `cargo test -p quartz --bin quartz` passes 34 focused contracts.
-`cargo test --workspace --all-targets` passes 93 tests across 12 suites. WIT,
-component ABI 10, and module manifests are unchanged. The kernel adds only the
-schema-agnostic `DurableEventLog` wrapper described in `durable-events.md`;
-`quartz` adds a direct workspace `serde` dependency for strict session facts.
+`cargo test --workspace --all-targets` passes 93 tests across 12 suites. Twenty
+release runs measure 3.220 ms p50 cold readiness, 3.000 MiB p50 idle RSS, and a
+14.173 MiB executable: respectively +3.4%, +3.2%, and -6.2% against the Slice 0
+budget. The release profile strips symbols and uses thin LTO. WIT, component ABI
+10, kernel source, and module manifests are unchanged.
