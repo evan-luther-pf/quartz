@@ -10,6 +10,10 @@ pub(crate) const MAX_TASK_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_SOURCE_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_PROMPT_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_FEEDBACK_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_REVISION_PROMPT_BYTES: usize = 256 * 1024;
+
+const REVISION_INSTRUCTIONS: &str = "Revise only the rejected proposal identified below. Return only the required JSON object. The proposal must use the rejected admitted path and matching original before_sha256, and content must be the complete replacement file. Address the exact feedback and change the rejected content. Do not use Markdown fences or commentary.";
 
 const INSTRUCTIONS: &str = "Edit only the admitted files needed for the task. Return only the required JSON object. Every proposal must use one admitted path and matching before_sha256, and content must be the complete replacement file. Return at least two proposals. Do not use Markdown fences or commentary.";
 
@@ -33,6 +37,15 @@ pub(crate) struct Proposal {
     pub(crate) result_sha256: String,
     pub(crate) before: Vec<u8>,
     pub(crate) content: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Revision {
+    pub(crate) model: String,
+    pub(crate) proposal_index: usize,
+    pub(crate) feedback: String,
+    pub(crate) admission: Admission,
+    pub(crate) rejected: Proposal,
 }
 
 impl Admission {
@@ -223,6 +236,207 @@ impl Admission {
     }
 }
 
+impl Revision {
+    pub(crate) fn new(
+        model: &str,
+        feedback: &[u8],
+        admission: &Admission,
+        proposals: &[Proposal],
+        proposal_index: usize,
+    ) -> Result<Self, String> {
+        validate_model(model)?;
+        let feedback = validate_feedback(feedback)?;
+        let rejected = proposals
+            .get(proposal_index)
+            .ok_or_else(|| format!("proposal index {proposal_index} is absent"))?
+            .clone();
+        let revision = Self {
+            model: model.to_owned(),
+            proposal_index,
+            feedback,
+            admission: admission.clone(),
+            rejected,
+        };
+        revision.prompt_bytes()?;
+        Ok(revision)
+    }
+
+    pub(crate) fn prompt_bytes(&self) -> Result<Vec<u8>, String> {
+        let admission_prompt = self.admission.prompt_bytes()?;
+        let prompt = serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "instructions": REVISION_INSTRUCTIONS,
+            "model": self.model,
+            "admission": {
+                "prompt_sha256": sha256(&admission_prompt),
+                "task": self.admission.task,
+                "files": admitted_files_json(&self.admission.files),
+            },
+            "rejection": {
+                "proposal_index": self.proposal_index,
+                "path": self.rejected.path,
+                "before_sha256": self.rejected.before_sha256,
+                "prior_result_sha256": self.rejected.result_sha256,
+                "prior_content": std::str::from_utf8(&self.rejected.content)
+                    .expect("validated rejected proposal must remain UTF-8"),
+                "feedback": self.feedback,
+            },
+            "required_response": {
+                "proposal": {
+                    "path": "the rejected admitted path",
+                    "before_sha256": "that file's original admitted SHA-256",
+                    "content": "the complete corrected replacement file"
+                }
+            }
+        }))
+        .map_err(|error| format!("serialize revision prompt: {error}"))?;
+        if prompt.len() > MAX_REVISION_PROMPT_BYTES {
+            return Err(format!(
+                "generated revision prompt is {} bytes; limit is {MAX_REVISION_PROMPT_BYTES}",
+                prompt.len()
+            ));
+        }
+        Ok(prompt)
+    }
+
+    pub(crate) fn from_prompt(
+        prompt: &[u8],
+        admission: &Admission,
+        proposals: &[Proposal],
+    ) -> Result<Self, String> {
+        if prompt.is_empty() || prompt.len() > MAX_REVISION_PROMPT_BYTES {
+            return Err(format!(
+                "durable revision prompt must contain 1..={MAX_REVISION_PROMPT_BYTES} bytes"
+            ));
+        }
+        let value: Value = serde_json::from_slice(prompt)
+            .map_err(|error| format!("invalid durable revision prompt JSON: {error}"))?;
+        let object = exact_object(
+            &value,
+            &[
+                "schema",
+                "instructions",
+                "model",
+                "admission",
+                "rejection",
+                "required_response",
+            ],
+            "revision prompt",
+        )?;
+        if object.get("schema").and_then(Value::as_u64) != Some(1) {
+            return Err("unsupported revision prompt schema".into());
+        }
+        if string_field(object, "instructions", "revision prompt")? != REVISION_INSTRUCTIONS {
+            return Err("revision prompt instructions changed".into());
+        }
+        let model = string_field(object, "model", "revision prompt")?.to_owned();
+        validate_model(&model)?;
+
+        let admitted = exact_object(
+            object.get("admission").expect("required key checked"),
+            &["prompt_sha256", "task", "files"],
+            "revision admission",
+        )?;
+        let prompt_sha256 = string_field(admitted, "prompt_sha256", "revision admission")?;
+        validate_sha256(prompt_sha256, "revision admission prompt digest")?;
+        if prompt_sha256 != sha256(&admission.prompt_bytes()?) {
+            return Err("revision admission prompt digest changed".into());
+        }
+        if string_field(admitted, "task", "revision admission")? != admission.task {
+            return Err("revision admission task changed".into());
+        }
+        let files = admitted
+            .get("files")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "revision admission files must be an array".to_owned())?;
+        if files.len() != admission.files.len() {
+            return Err("revision admission file count changed".into());
+        }
+        for (value, expected) in files.iter().zip(&admission.files) {
+            let file = exact_object(
+                value,
+                &["path", "before_sha256", "content"],
+                "revision admitted file",
+            )?;
+            if string_field(file, "path", "revision admitted file")? != expected.path
+                || string_field(file, "before_sha256", "revision admitted file")?
+                    != expected.before_sha256
+                || string_field(file, "content", "revision admitted file")?.as_bytes()
+                    != expected.content
+            {
+                return Err("revision admitted file changed".into());
+            }
+        }
+
+        let rejection = exact_object(
+            object.get("rejection").expect("required key checked"),
+            &[
+                "proposal_index",
+                "path",
+                "before_sha256",
+                "prior_result_sha256",
+                "prior_content",
+                "feedback",
+            ],
+            "revision rejection",
+        )?;
+        let proposal_index = rejection
+            .get("proposal_index")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| "revision proposal index must be a non-negative integer".to_owned())?;
+        let rejected = proposals
+            .get(proposal_index)
+            .ok_or_else(|| format!("revision proposal index {proposal_index} is absent"))?;
+        if string_field(rejection, "path", "revision rejection")? != rejected.path
+            || string_field(rejection, "before_sha256", "revision rejection")?
+                != rejected.before_sha256
+            || string_field(rejection, "prior_result_sha256", "revision rejection")?
+                != rejected.result_sha256
+            || string_field(rejection, "prior_content", "revision rejection")?.as_bytes()
+                != rejected.content
+        {
+            return Err("revision rejected proposal changed".into());
+        }
+        let feedback = validate_feedback(
+            string_field(rejection, "feedback", "revision rejection")?.as_bytes(),
+        )?;
+        let required = exact_object(
+            object
+                .get("required_response")
+                .expect("required key checked"),
+            &["proposal"],
+            "revision required response",
+        )?;
+        exact_object(
+            required.get("proposal").expect("required key checked"),
+            &["path", "before_sha256", "content"],
+            "revision response template",
+        )?;
+        Ok(Self {
+            model,
+            proposal_index,
+            feedback,
+            admission: admission.clone(),
+            rejected: rejected.clone(),
+        })
+    }
+}
+
+fn admitted_files_json(files: &[AdmittedFile]) -> Vec<Value> {
+    files
+        .iter()
+        .map(|file| {
+            json!({
+                "path": file.path,
+                "before_sha256": file.before_sha256,
+                "content": std::str::from_utf8(&file.content)
+                    .expect("validated admission content must remain UTF-8"),
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn parse_response(
     response: &[u8],
     admission: &Admission,
@@ -280,6 +494,55 @@ pub(crate) fn parse_response(
         });
     }
     Ok(proposals)
+}
+
+pub(crate) fn parse_revision_response(
+    response: &[u8],
+    revision: &Revision,
+) -> Result<Proposal, String> {
+    if response.is_empty() || response.len() > MAX_RESPONSE_BYTES {
+        return Err(format!(
+            "revision response must contain 1..={MAX_RESPONSE_BYTES} bytes"
+        ));
+    }
+    let value: Value = serde_json::from_slice(response)
+        .map_err(|error| format!("invalid revision response JSON: {error}"))?;
+    let object = exact_object(&value, &["proposal"], "revision response")?;
+    let proposal = exact_object(
+        object.get("proposal").expect("required key checked"),
+        &["path", "before_sha256", "content"],
+        "revised proposal",
+    )?;
+    let path = string_field(proposal, "path", "revised proposal")?.to_owned();
+    let before_sha256 = string_field(proposal, "before_sha256", "revised proposal")?.to_owned();
+    if path != revision.rejected.path || before_sha256 != revision.rejected.before_sha256 {
+        return Err("revision response changed the rejected proposal identity".into());
+    }
+    let content = string_field(proposal, "content", "revised proposal")?
+        .as_bytes()
+        .to_vec();
+    if content.len() > MAX_SOURCE_BYTES {
+        return Err(format!(
+            "revised proposal for `{path}` exceeds {MAX_SOURCE_BYTES} bytes"
+        ));
+    }
+    if content == revision.rejected.before {
+        return Err(format!(
+            "revised proposal for `{path}` does not change the admitted source"
+        ));
+    }
+    if content == revision.rejected.content {
+        return Err(format!(
+            "revised proposal for `{path}` does not change the rejected generation"
+        ));
+    }
+    Ok(Proposal {
+        path,
+        before_sha256,
+        result_sha256: sha256(&content),
+        before: revision.rejected.before.clone(),
+        content,
+    })
 }
 
 pub(crate) fn render_diff(proposal: &Proposal) -> String {
@@ -369,6 +632,56 @@ pub(crate) fn candidate_path(session: &Path, index: usize) -> PathBuf {
     session.join(format!("proposal-{index}.candidate"))
 }
 
+pub(crate) fn revision_prompt_path(session: &Path) -> PathBuf {
+    session.join("revision-1.prompt")
+}
+
+pub(crate) fn revision_journal_path(session: &Path) -> PathBuf {
+    session.join("revision-1.qj")
+}
+
+pub(crate) fn materialize_revision_prompt(
+    session: &Path,
+    prompt: &[u8],
+) -> Result<PathBuf, String> {
+    if prompt.is_empty() || prompt.len() > MAX_REVISION_PROMPT_BYTES {
+        return Err(format!(
+            "revision prompt must contain 1..={MAX_REVISION_PROMPT_BYTES} bytes"
+        ));
+    }
+    let path = revision_prompt_path(session);
+    atomic_write(&path, prompt)?;
+    Ok(path)
+}
+
+pub(crate) fn revision_candidate_path(session: &Path, proposal_index: usize) -> PathBuf {
+    session.join(format!("proposal-{proposal_index}.revision-1.candidate"))
+}
+
+pub(crate) fn materialize_revision(
+    session: &Path,
+    revision: &Revision,
+    proposal: &Proposal,
+) -> Result<PathBuf, String> {
+    let candidate = revision_candidate_path(session, revision.proposal_index);
+    atomic_write(&candidate, &proposal.content)?;
+    let metadata = serde_json::to_vec_pretty(&json!({
+        "schema": 1,
+        "revision": 1,
+        "proposal_index": revision.proposal_index,
+        "model": revision.model,
+        "feedback_sha256": sha256(revision.feedback.as_bytes()),
+        "path": proposal.path,
+        "before_sha256": proposal.before_sha256,
+        "rejected_result_sha256": revision.rejected.result_sha256,
+        "result_sha256": proposal.result_sha256,
+        "candidate": candidate.file_name().expect("candidate file name").to_string_lossy(),
+    }))
+    .map_err(|error| format!("serialize proposal revision metadata: {error}"))?;
+    atomic_write(&session.join("revision-1.json"), &metadata)?;
+    Ok(candidate)
+}
+
 pub(crate) fn resolve_source(repository_root: &Path, path: &str) -> Result<PathBuf, String> {
     validate_relative_path(path)?;
     let root = fs::canonicalize(repository_root)
@@ -407,6 +720,27 @@ fn string_field<'a>(
         .get(field)
         .and_then(Value::as_str)
         .ok_or_else(|| format!("{label} `{field}` must be a string"))
+}
+
+fn validate_model(model: &str) -> Result<(), String> {
+    if model.is_empty() || model.len() > 128 || model.chars().any(char::is_control) {
+        return Err("revision model must contain 1..=128 non-control UTF-8 bytes".into());
+    }
+    Ok(())
+}
+
+fn validate_feedback(feedback: &[u8]) -> Result<String, String> {
+    if feedback.is_empty() || feedback.len() > MAX_FEEDBACK_BYTES {
+        return Err(format!(
+            "revision feedback must contain 1..={MAX_FEEDBACK_BYTES} UTF-8 bytes"
+        ));
+    }
+    let feedback =
+        std::str::from_utf8(feedback).map_err(|_| "revision feedback is not UTF-8".to_owned())?;
+    if feedback.trim().is_empty() {
+        return Err("revision feedback must contain non-whitespace text".into());
+    }
+    Ok(feedback.to_owned())
 }
 
 fn validate_relative_path(path: &str) -> Result<(), String> {
@@ -492,6 +826,79 @@ mod tests {
         assert_eq!(proposals.len(), 2);
         assert_eq!(proposals[0].path, "README.md");
         assert_eq!(proposals[1].content, b"beta revised\n");
+    }
+
+    #[test]
+    fn revision_round_trip_binds_rejection_feedback_and_original_admission() {
+        let admission = fixture_admission();
+        let proposals = fixture_proposals(&admission);
+        let revision = Revision::new(
+            "gpt-test",
+            b"Use a more precise label.\n",
+            &admission,
+            &proposals,
+            1,
+        )
+        .unwrap();
+        let prompt = revision.prompt_bytes().unwrap();
+        assert_eq!(
+            Revision::from_prompt(&prompt, &admission, &proposals).unwrap(),
+            revision
+        );
+
+        let mut value: Value = serde_json::from_slice(&prompt).unwrap();
+        value["admission"]["prompt_sha256"] = Value::String("0".repeat(64));
+        assert!(
+            Revision::from_prompt(&serde_json::to_vec(&value).unwrap(), &admission, &proposals)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn revision_accepts_only_a_changed_replacement_for_the_rejected_path() {
+        let root = temporary_directory("revision");
+        let admission = fixture_admission();
+        let proposals = fixture_proposals(&admission);
+        let revision =
+            Revision::new("gpt-test", b"Correct beta.", &admission, &proposals, 1).unwrap();
+        let response = json!({
+            "proposal": {
+                "path": revision.rejected.path,
+                "before_sha256": revision.rejected.before_sha256,
+                "content": "beta corrected\n"
+            }
+        });
+        let corrected =
+            parse_revision_response(&serde_json::to_vec(&response).unwrap(), &revision).unwrap();
+        assert_eq!(corrected.content, b"beta corrected\n");
+        let path = materialize_revision(&root, &revision, &corrected).unwrap();
+        fs::write(&path, b"corrupt").unwrap();
+        materialize_revision(&root, &revision, &corrected).unwrap();
+        assert_eq!(fs::read(path).unwrap(), corrected.content);
+
+        for response in [
+            json!({"proposal": {
+                "path": "README.md",
+                "before_sha256": revision.rejected.before_sha256,
+                "content": "beta corrected\n"
+            }}),
+            json!({"proposal": {
+                "path": revision.rejected.path,
+                "before_sha256": revision.rejected.before_sha256,
+                "content": "beta revised\n"
+            }}),
+            json!({"proposal": {
+                "path": revision.rejected.path,
+                "before_sha256": revision.rejected.before_sha256,
+                "content": "beta\n"
+            }}),
+        ] {
+            assert!(
+                parse_revision_response(&serde_json::to_vec(&response).unwrap(), &revision)
+                    .is_err()
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -589,6 +996,18 @@ mod tests {
                 admitted("lode/summary.md", b"beta\n"),
             ],
         }
+    }
+
+    fn fixture_proposals(admission: &Admission) -> Vec<Proposal> {
+        let response = json!({"proposals": [
+            proposal("README.md", &admission.files[0].before_sha256, "alpha revised\n"),
+            proposal(
+                "lode/summary.md",
+                &admission.files[1].before_sha256,
+                "beta revised\n"
+            )
+        ]});
+        parse_response(&serde_json::to_vec(&response).unwrap(), admission).unwrap()
     }
 
     fn admitted(path: &str, content: &[u8]) -> AdmittedFile {

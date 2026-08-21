@@ -28,8 +28,8 @@
 - `capabilities/durable-edit-promotion.md` — separate durable retention
   authority, restoration ownership transfer, and restart-safe promoted bytes.
 - `capabilities/dogfood-repository-task.md` — end-to-end credentialed edits,
-  resumable multi-proposal sessions, explicit review and promotion, and
-  approved post-edit command evidence.
+  resumable multi-proposal and correction sessions, explicit review and
+  promotion, and approved post-edit command evidence.
 
 ## Research
 

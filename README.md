@@ -83,14 +83,19 @@ OPENAI_API_KEY="$OPENAI_API_KEY" cargo run --release -p quartz -- \
   path/to/source-a path/to/source-b
 cargo run --release -p quartz -- \
   --resume-proposals /path/to/session
+printf 'Replace the rejected wording with a precise alternative.' > /tmp/quartz-feedback.txt
+OPENAI_API_KEY="$OPENAI_API_KEY" cargo run --release -p quartz -- \
+  --revise-proposal gpt-5.4 /path/to/session 0 /tmp/quartz-feedback.txt
 cargo run --release -p quartz -- \
   --promote-proposal /path/to/session 0
 ```
 
 The proposal command admits two or three exact UTF-8 files, commits one bounded
 production turn, validates multiple path-bound complete-file candidates, and
-leaves every source unchanged. Resume reconstructs the candidates and renders
-exact diffs without credentials or another exchange. Promotion is an explicit
-per-candidate action through the existing workspace, mutation, and retention
-authorities; it verifies the committed bytes after restart before recovering
-all live authority.
+leaves every source unchanged. Resume reconstructs all generations and renders
+exact diffs without credentials or another exchange. Revision records one
+explicit bounded rejection, preserves the original admission and response, and
+runs at most one correction turn for the selected path. Promotion resolves only
+the current candidate generation through the existing workspace, mutation, and
+retention authorities; it verifies committed bytes after restart before
+recovering all live authority.

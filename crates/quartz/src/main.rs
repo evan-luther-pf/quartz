@@ -39,6 +39,7 @@ Commands:
   --production-model <model> <prompt> <journal>
   --propose <model> <task> <session> <source> <source> [source]
   --resume-proposals <session>
+  --revise-proposal <model> <session> <index> <feedback>
   --promote-proposal <session> <index>
 ";
 
@@ -73,6 +74,12 @@ enum CliCommand {
         sources: Vec<PathBuf>,
     },
     ResumeProposals(PathBuf),
+    ReviseProposal {
+        model: String,
+        session: PathBuf,
+        index: usize,
+        feedback: PathBuf,
+    },
     PromoteProposal {
         session: PathBuf,
         index: usize,
@@ -130,9 +137,16 @@ fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), Box<dyn std::er
             session,
             sources,
         } => run_multi_proposal(&model, &task, &session, &sources)?,
+        CliCommand::ReviseProposal {
+            model,
+            session,
+            index,
+            feedback,
+        } => run_proposal_revision(&model, &session, index, &feedback)?,
         CliCommand::ResumeProposals(session) => {
-            let proposals = reconstruct_proposals(&session)?;
-            display_proposals(&session, &proposals)?;
+            let session = fs::canonicalize(session)?;
+            let state = reconstruct_proposal_session(&session)?;
+            display_proposals(&session, &state)?;
         }
         CliCommand::PromoteProposal { session, index } => run_proposal_promotion(&session, index)?,
     }
@@ -220,6 +234,22 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CliCommand, Stri
                 task,
                 session,
                 sources,
+            }
+        }
+        "--revise-proposal" => {
+            let expected = "<model> <session> <index> <feedback>";
+            let model = required_arg(&mut args, command, expected)?;
+            let session = path_arg(&mut args, command, expected)?;
+            let value = required_arg(&mut args, command, expected)?;
+            let index = value
+                .parse()
+                .map_err(|_| format!("invalid proposal index: `{value}`"))?;
+            let feedback = path_arg(&mut args, command, expected)?;
+            CliCommand::ReviseProposal {
+                model,
+                session,
+                index,
+                feedback,
             }
         }
         "--resume-proposals" => {
@@ -1113,45 +1143,272 @@ fn run_multi_proposal(
         run_exchange_turn_with_limits(&prompt, &journal, adapter, proposal_limits())?;
     let candidates = proposals::parse_response(&response, &admission)?;
     proposals::materialize(&session, &candidates)?;
-    display_proposals(&session, &candidates)?;
+    display_proposals(
+        &session,
+        &ProposalSession {
+            proposals: candidates,
+            revision: None,
+        },
+    )?;
     println!("response provenance: {provenance}");
     println!("proposal turn reconstructed; no source changed");
     Ok(())
 }
 
-fn reconstruct_proposals(
+fn run_proposal_revision(
+    model: &str,
     session: &Path,
-) -> Result<Vec<proposals::Proposal>, Box<dyn std::error::Error>> {
+    index: usize,
+    feedback: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let session = fs::canonicalize(session)?;
-    let journal = session.join("turn.qj");
-    let (prompt, response) = read_durable_proposal_turn(&journal)?;
-    let admission = proposals::Admission::from_prompt(&prompt)?;
-    let candidates = proposals::parse_response(&response, &admission)?;
-    proposals::materialize(&session, &candidates)?;
-    Ok(candidates)
+    let (admission, candidates) = reconstruct_base_proposals(&session)?;
+    let journal = proposals::revision_journal_path(&session);
+    let mut prompt_is_durable = false;
+    let expected = if journal.exists() {
+        match read_durable_proposal_turn(&journal)? {
+            DurableProposalTurn::Completed { prompt, response } => {
+                let durable = proposals::Revision::from_prompt(&prompt, &admission, &candidates)?;
+                validate_revision_selector(&durable, model, index)?;
+                proposals::parse_revision_response(&response, &durable)?;
+                let state = reconstruct_proposal_session(&session)?;
+                display_proposals(&session, &state)?;
+                println!("revision turn reconstructed; no exchange emitted");
+                return Ok(());
+            }
+            DurableProposalTurn::Interrupted { prompt } => {
+                let durable = proposals::Revision::from_prompt(&prompt, &admission, &candidates)?;
+                validate_revision_selector(&durable, model, index)?;
+                return Err(
+                    "revision turn ended interrupted/unknown; it will not be retried".into(),
+                );
+            }
+            DurableProposalTurn::Pending {
+                prompt: Some(prompt),
+            } => {
+                prompt_is_durable = true;
+                let durable = proposals::Revision::from_prompt(&prompt, &admission, &candidates)?;
+                validate_revision_selector(&durable, model, index)?;
+                durable
+            }
+            DurableProposalTurn::Pending { prompt: None } => proposals::Revision::new(
+                model,
+                &fs::read(feedback)?,
+                &admission,
+                &candidates,
+                index,
+            )?,
+        }
+    } else {
+        proposals::Revision::new(model, &fs::read(feedback)?, &admission, &candidates, index)?
+    };
+    let prompt_bytes = expected.prompt_bytes()?;
+    let prompt_path = proposals::revision_prompt_path(&session);
+    if prompt_is_durable {
+        proposals::materialize_revision_prompt(&session, &prompt_bytes)?;
+    } else if prompt_path.exists() {
+        if fs::read(&prompt_path)? != prompt_bytes {
+            return Err("revision prompt cache changed or describes another rejection".into());
+        }
+    } else {
+        proposals::materialize_revision_prompt(&session, &prompt_bytes)?;
+    }
+
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .map_err(|_| "OPENAI_API_KEY is required to start or resume --revise-proposal")?;
+    let adapter = Arc::new(openai::OpenAiResponses::new(api_key, model.to_owned())?);
+    let (response, provenance) =
+        run_exchange_turn_with_limits(&prompt_path, &journal, adapter, proposal_limits())?;
+    let corrected = proposals::parse_revision_response(&response, &expected)?;
+    proposals::materialize_revision(&session, &expected, &corrected)?;
+    let state = reconstruct_proposal_session(&session)?;
+    display_proposals(&session, &state)?;
+    println!("response provenance: {provenance}");
+    println!("revision turn reconstructed; no source changed");
+    Ok(())
 }
 
-fn display_proposals(
-    session: &Path,
-    candidates: &[proposals::Proposal],
+fn validate_revision_selector(
+    revision: &proposals::Revision,
+    model: &str,
+    index: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for (index, candidate) in candidates.iter().enumerate() {
-        let path = proposals::candidate_path(session, index);
-        if fs::read(&path)? != candidate.content {
-            return Err(format!("materialized candidate {index} changed").into());
-        }
-        println!("proposal {index}: {}", candidate.path);
-        println!("  before_sha256={}", candidate.before_sha256);
-        println!("  result_sha256={}", candidate.result_sha256);
-        println!("  candidate={}", path.display());
-        print!("{}", proposals::render_diff(candidate));
+    if revision.model != model || revision.proposal_index != index {
+        return Err("durable revision belongs to another model or proposal index".into());
     }
     Ok(())
 }
 
+struct ProposalSession {
+    proposals: Vec<proposals::Proposal>,
+    revision: Option<ProposalRevisionState>,
+}
+
+enum ProposalRevisionState {
+    Pending(proposals::Revision),
+    Interrupted(proposals::Revision),
+    Completed {
+        request: proposals::Revision,
+        proposal: proposals::Proposal,
+    },
+}
+
+enum DurableProposalTurn {
+    Pending { prompt: Option<Vec<u8>> },
+    Interrupted { prompt: Vec<u8> },
+    Completed { prompt: Vec<u8>, response: Vec<u8> },
+}
+
+impl ProposalSession {
+    fn current(
+        &self,
+        session: &Path,
+        index: usize,
+    ) -> Result<(&proposals::Proposal, PathBuf), Box<dyn std::error::Error>> {
+        let original = self
+            .proposals
+            .get(index)
+            .ok_or_else(|| format!("proposal index {index} is absent"))?;
+        match &self.revision {
+            Some(ProposalRevisionState::Completed { request, proposal })
+                if request.proposal_index == index =>
+            {
+                Ok((proposal, proposals::revision_candidate_path(session, index)))
+            }
+            Some(ProposalRevisionState::Pending(request))
+            | Some(ProposalRevisionState::Interrupted(request))
+                if request.proposal_index == index =>
+            {
+                Err(format!("proposal {index} was rejected and has no completed correction").into())
+            }
+            _ => Ok((original, proposals::candidate_path(session, index))),
+        }
+    }
+}
+
+fn reconstruct_base_proposals(
+    session: &Path,
+) -> Result<(proposals::Admission, Vec<proposals::Proposal>), Box<dyn std::error::Error>> {
+    let (prompt, response) = match read_durable_proposal_turn(&session.join("turn.qj"))? {
+        DurableProposalTurn::Completed { prompt, response } => (prompt, response),
+        DurableProposalTurn::Pending { .. } => {
+            return Err("initial proposal turn is not terminal".into());
+        }
+        DurableProposalTurn::Interrupted { .. } => {
+            return Err("initial proposal turn ended interrupted/unknown".into());
+        }
+    };
+    let admission = proposals::Admission::from_prompt(&prompt)?;
+    let candidates = proposals::parse_response(&response, &admission)?;
+    proposals::materialize(session, &candidates)?;
+    Ok((admission, candidates))
+}
+
+fn reconstruct_proposal_session(
+    session: &Path,
+) -> Result<ProposalSession, Box<dyn std::error::Error>> {
+    let session = fs::canonicalize(session)?;
+    let (admission, candidates) = reconstruct_base_proposals(&session)?;
+    let revision_journal = proposals::revision_journal_path(&session);
+    let revision = if revision_journal.exists() {
+        match read_durable_proposal_turn(&revision_journal)? {
+            DurableProposalTurn::Pending {
+                prompt: Some(prompt),
+            } => {
+                let request = proposals::Revision::from_prompt(&prompt, &admission, &candidates)?;
+                proposals::materialize_revision_prompt(&session, &prompt)?;
+                Some(ProposalRevisionState::Pending(request))
+            }
+            DurableProposalTurn::Pending { prompt: None } => {
+                return Err("revision journal has no durable rejection prompt".into());
+            }
+            DurableProposalTurn::Interrupted { prompt } => {
+                let request = proposals::Revision::from_prompt(&prompt, &admission, &candidates)?;
+                proposals::materialize_revision_prompt(&session, &prompt)?;
+                Some(ProposalRevisionState::Interrupted(request))
+            }
+            DurableProposalTurn::Completed { prompt, response } => {
+                let request = proposals::Revision::from_prompt(&prompt, &admission, &candidates)?;
+                proposals::materialize_revision_prompt(&session, &prompt)?;
+                let proposal = proposals::parse_revision_response(&response, &request)?;
+                proposals::materialize_revision(&session, &request, &proposal)?;
+                Some(ProposalRevisionState::Completed { request, proposal })
+            }
+        }
+    } else if proposals::revision_prompt_path(&session).exists() {
+        return Err(
+            "revision prompt exists without durable turn evidence; rerun `--revise-proposal`"
+                .into(),
+        );
+    } else {
+        None
+    };
+    Ok(ProposalSession {
+        proposals: candidates,
+        revision,
+    })
+}
+
+fn display_proposals(
+    session: &Path,
+    state: &ProposalSession,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (index, candidate) in state.proposals.iter().enumerate() {
+        let base_path = proposals::candidate_path(session, index);
+        if fs::read(&base_path)? != candidate.content {
+            return Err(format!("materialized candidate {index} changed").into());
+        }
+        let revision = state.revision.as_ref().filter(|revision| match revision {
+            ProposalRevisionState::Pending(request)
+            | ProposalRevisionState::Interrupted(request)
+            | ProposalRevisionState::Completed { request, .. } => request.proposal_index == index,
+        });
+        println!(
+            "proposal {index} revision 0: {}",
+            if revision.is_some() {
+                "superseded"
+            } else {
+                "current"
+            }
+        );
+        display_proposal(candidate, &base_path);
+        match revision {
+            Some(ProposalRevisionState::Pending(request)) => {
+                println!("proposal {index} revision 1: pending");
+                println!("  rejection_feedback={:?}", request.feedback);
+            }
+            Some(ProposalRevisionState::Interrupted(request)) => {
+                println!("proposal {index} revision 1: interrupted/unknown");
+                println!("  rejection_feedback={:?}", request.feedback);
+            }
+            Some(ProposalRevisionState::Completed { request, proposal }) => {
+                let path = proposals::revision_candidate_path(session, index);
+                if fs::read(&path)? != proposal.content {
+                    return Err(
+                        format!("materialized revision for proposal {index} changed").into(),
+                    );
+                }
+                println!("proposal {index} revision 1: current");
+                println!("  rejection_feedback={:?}", request.feedback);
+                display_proposal(proposal, &path);
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+fn display_proposal(candidate: &proposals::Proposal, path: &Path) {
+    println!("  path={}", candidate.path);
+    println!("  before_sha256={}", candidate.before_sha256);
+    println!("  result_sha256={}", candidate.result_sha256);
+    println!("  candidate={}", path.display());
+    print!("{}", proposals::render_diff(candidate));
+}
+
 fn read_durable_proposal_turn(
     journal: &Path,
-) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
+) -> Result<DurableProposalTurn, Box<dyn std::error::Error>> {
     let fixtures = PathBuf::from(env!("QUARTZ_FIXTURE_DIR"));
     let events = journal.with_extension("qe");
     let mut runtime = Runtime::open_persistent(
@@ -1161,50 +1418,61 @@ fn read_durable_proposal_turn(
             .with_event_stream_paths(vec![events]),
     )?;
     let records = runtime.events();
-    let payload = |kind| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let payload = |kind| -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
         let matches: Vec<_> = records
             .iter()
             .filter(|event| event.value >> 56 == kind && ((event.value >> 48) & 0xff) == 1)
             .collect();
-        if matches.len() != 1 {
+        if matches.len() > 1 {
             return Err(format!(
-                "durable proposal turn has {} facts of kind {kind}; expected one",
+                "durable proposal turn has {} facts of kind {kind}; expected at most one",
                 matches.len()
             )
             .into());
         }
-        matches[0]
-            .payload
-            .as_ref()
-            .map(|payload| payload.bytes.clone())
-            .ok_or_else(|| format!("durable proposal fact kind {kind} has no payload").into())
+        matches
+            .first()
+            .map(|event| {
+                event
+                    .payload
+                    .as_ref()
+                    .map(|payload| payload.bytes.clone())
+                    .ok_or_else(|| {
+                        format!("durable proposal fact kind {kind} has no payload").into()
+                    })
+            })
+            .transpose()
     };
-    if records
-        .iter()
-        .filter(|event| event.value >> 56 == 7 && ((event.value >> 48) & 0xff) == 1)
-        .count()
-        != 1
-    {
-        return Err("durable proposal turn is not terminal".into());
-    }
     let prompt = payload(1)?;
     let response = payload(5)?;
+    let stop_count = records
+        .iter()
+        .filter(|event| event.value >> 56 == 7 && ((event.value >> 48) & 0xff) == 1)
+        .count();
+    let interrupted_count = records
+        .iter()
+        .filter(|event| event.value >> 56 == 8 && ((event.value >> 48) & 0xff) == 1)
+        .count();
     runtime.shutdown_persistent()?;
     if !runtime.is_observationally_clean() {
         return Err("proposal reconstruction authority did not recover".into());
     }
-    Ok((prompt, response))
+    match (stop_count, interrupted_count, prompt, response) {
+        (0, 0 | 1, prompt, _) => Ok(DurableProposalTurn::Pending { prompt }),
+        (1, 0, Some(prompt), Some(response)) => {
+            Ok(DurableProposalTurn::Completed { prompt, response })
+        }
+        (1, 1, Some(prompt), None) => Ok(DurableProposalTurn::Interrupted { prompt }),
+        _ => Err("durable proposal turn has an invalid terminal fact sequence".into()),
+    }
 }
 
 fn run_proposal_promotion(session: &Path, index: usize) -> Result<(), Box<dyn std::error::Error>> {
     let session = fs::canonicalize(session)?;
-    let candidates = reconstruct_proposals(&session)?;
-    let candidate = candidates
-        .get(index)
-        .ok_or_else(|| format!("proposal index {index} is absent"))?;
+    let state = reconstruct_proposal_session(&session)?;
+    let (candidate, candidate_path) = state.current(&session, index)?;
     let repository_root = repository_root()?;
     let source = proposals::resolve_source(&repository_root, &candidate.path)?;
-    let candidate_path = proposals::candidate_path(&session, index);
     if fs::read(&candidate_path)? != candidate.content {
         return Err(format!("proposal candidate {index} changed before approval").into());
     }
@@ -1307,6 +1575,9 @@ fn proposal_promotion_tree(
 
 fn proposal_limits() -> Limits {
     Limits {
+        max_snapshot_bytes: 256 * 1024,
+        max_payload_bytes: 256 * 1024,
+        max_payload_total_bytes: 1024 * 1024,
         max_event_record_bytes: 512 * 1024,
         max_exchange_record_bytes: 512 * 1024,
         max_mutation_record_bytes: 512 * 1024,
@@ -1368,9 +1639,23 @@ fn run_exchange_turn_with_limits(
     let prompt = fs::canonicalize(prompt)?;
     let prompt_bytes = fs::read(&prompt)?;
     std::str::from_utf8(&prompt_bytes)?;
+    if prompt_bytes.len() > limits.max_payload_bytes {
+        return Err(format!(
+            "production prompt is {} bytes; admitted limit is {}",
+            prompt_bytes.len(),
+            limits.max_payload_bytes
+        )
+        .into());
+    }
     let events = journal.with_extension("qe");
     let exchange = journal.with_extension("qx");
-    let desired = production_tree(&fixtures, &prompt, &exchange, adapter.identity());
+    let desired = production_tree(
+        &fixtures,
+        &prompt,
+        &exchange,
+        adapter.identity(),
+        limits.max_payload_bytes,
+    );
     let mut completed = None;
 
     for _ in 0..8 {
@@ -1471,6 +1756,7 @@ fn production_tree(
     prompt: &Path,
     exchange: &Path,
     adapter: &str,
+    max_request_bytes: usize,
 ) -> ComponentTree {
     let event_grant = || EventGrant::new("quartz.agent", "repository-turn", 2);
     ComponentTree {
@@ -1486,7 +1772,7 @@ fn production_tree(
             .with_exchange_grants(vec![ExchangeGrant::new(
                 adapter,
                 exchange,
-                64 * 1024,
+                max_request_bytes,
                 64 * 1024,
                 120_000,
             )]),
@@ -1729,6 +2015,7 @@ mod cli_tests {
             "--production-model",
             "--propose",
             "--resume-proposals",
+            "--revise-proposal",
             "--promote-proposal",
         ] {
             assert!(USAGE.contains(command), "usage omitted {command}");
@@ -1795,6 +2082,15 @@ mod cli_tests {
             })
         );
         assert_eq!(
+            parse(&["--revise-proposal", "model", "session", "1", "feedback.txt",]),
+            Ok(CliCommand::ReviseProposal {
+                model: "model".into(),
+                session: PathBuf::from("session"),
+                index: 1,
+                feedback: PathBuf::from("feedback.txt"),
+            })
+        );
+        assert_eq!(
             parse(&["--resume-proposals", "session"]),
             Ok(CliCommand::ResumeProposals(PathBuf::from("session")))
         );
@@ -1839,6 +2135,14 @@ mod cli_tests {
                     "four",
                 ][..],
                 "requires two or three",
+            ),
+            (
+                &["--revise-proposal", "model", "session", "bad", "feedback"][..],
+                "invalid proposal index",
+            ),
+            (
+                &["--revise-proposal", "model", "session", "0"][..],
+                "requires <model> <session> <index> <feedback>",
             ),
             (
                 &["--promote-proposal", "session", "bad"][..],
@@ -1941,6 +2245,197 @@ mod proposal_runtime_tests {
         assert!(restarted.is_observationally_clean());
         assert_eq!(fs::read(&source).unwrap(), result);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn revision_turn_reconstructs_current_generation_without_duplicate_exchange() {
+        let session = temporary_directory();
+        let admission = proposals::Admission {
+            task: "revise both files".into(),
+            files: vec![
+                admitted("alpha.txt", b"alpha\n"),
+                admitted("beta.txt", b"beta\n"),
+            ],
+        };
+        let base_prompt = admission.prompt_bytes().unwrap();
+        let base_response = serde_json::to_vec(&serde_json::json!({
+            "proposals": [
+                {
+                    "path": "alpha.txt",
+                    "before_sha256": admission.files[0].before_sha256,
+                    "content": "alpha rejected\n"
+                },
+                {
+                    "path": "beta.txt",
+                    "before_sha256": admission.files[1].before_sha256,
+                    "content": "beta accepted\n"
+                }
+            ]
+        }))
+        .unwrap();
+        let base_prompt_path = session.join("admission.prompt");
+        fs::write(&base_prompt_path, &base_prompt).unwrap();
+        let base_calls = Arc::new(AtomicU64::new(0));
+        run_exchange_turn_with_limits(
+            &base_prompt_path,
+            &session.join("turn.qj"),
+            Arc::new(FixedExchange::success(
+                "base-revision-test",
+                base_prompt,
+                base_response,
+                base_calls.clone(),
+            )),
+            proposal_limits(),
+        )
+        .unwrap();
+        let (_, proposals) = reconstruct_base_proposals(&session).unwrap();
+        let revision = proposals::Revision::new(
+            "test-model",
+            b"Use the corrected alpha label.",
+            &admission,
+            &proposals,
+            0,
+        )
+        .unwrap();
+        let revision_prompt = revision.prompt_bytes().unwrap();
+        let revision_response = serde_json::to_vec(&serde_json::json!({
+            "proposal": {
+                "path": "alpha.txt",
+                "before_sha256": admission.files[0].before_sha256,
+                "content": "alpha corrected\n"
+            }
+        }))
+        .unwrap();
+        let revision_prompt_path =
+            proposals::materialize_revision_prompt(&session, &revision_prompt).unwrap();
+        let revision_calls = Arc::new(AtomicU64::new(0));
+        let revision_adapter = Arc::new(FixedExchange::success(
+            "correction-revision-test",
+            revision_prompt,
+            revision_response,
+            revision_calls.clone(),
+        ));
+        let revision_journal = proposals::revision_journal_path(&session);
+        run_exchange_turn_with_limits(
+            &revision_prompt_path,
+            &revision_journal,
+            revision_adapter.clone(),
+            proposal_limits(),
+        )
+        .unwrap();
+        run_exchange_turn_with_limits(
+            &revision_prompt_path,
+            &revision_journal,
+            revision_adapter,
+            proposal_limits(),
+        )
+        .unwrap();
+        assert_eq!(base_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(revision_calls.load(Ordering::Relaxed), 1);
+
+        let state = reconstruct_proposal_session(&session).unwrap();
+        let (current, path) = state.current(&session, 0).unwrap();
+        assert_eq!(current.content, b"alpha corrected\n");
+        assert_eq!(fs::read(path).unwrap(), current.content);
+        let (sibling, _) = state.current(&session, 1).unwrap();
+        assert_eq!(sibling.content, b"beta accepted\n");
+        fs::remove_file(proposals::revision_prompt_path(&session)).unwrap();
+        fs::remove_file(proposals::revision_candidate_path(&session, 0)).unwrap();
+        fs::remove_file(session.join("revision-1.json")).unwrap();
+        run_proposal_revision("test-model", &session, 0, &session.join("missing-feedback"))
+            .unwrap();
+        assert!(proposals::revision_prompt_path(&session).is_file());
+        assert!(proposals::revision_candidate_path(&session, 0).is_file());
+        assert!(session.join("revision-1.json").is_file());
+        fs::remove_dir_all(session).unwrap();
+    }
+
+    #[test]
+    fn interrupted_revision_exchange_is_terminal_and_never_retried() {
+        let root = temporary_directory();
+        let prompt = root.join("revision-1.prompt");
+        let journal = root.join("revision-1.qj");
+        fs::write(&prompt, b"durable rejected proposal feedback").unwrap();
+        let calls = Arc::new(AtomicU64::new(0));
+        let adapter = Arc::new(FixedExchange::ambiguous(
+            "ambiguous-revision-test",
+            b"durable rejected proposal feedback".to_vec(),
+            calls.clone(),
+        ));
+        assert!(
+            run_exchange_turn_with_limits(&prompt, &journal, adapter.clone(), proposal_limits())
+                .is_err()
+        );
+        assert!(
+            run_exchange_turn_with_limits(&prompt, &journal, adapter, proposal_limits()).is_err()
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            read_durable_proposal_turn(&journal).unwrap(),
+            DurableProposalTurn::Interrupted { .. }
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    struct FixedExchange {
+        identity: &'static str,
+        expected: Vec<u8>,
+        response: Result<Vec<u8>, ExchangeFailure>,
+        calls: Arc<AtomicU64>,
+    }
+
+    impl FixedExchange {
+        fn success(
+            identity: &'static str,
+            expected: Vec<u8>,
+            response: Vec<u8>,
+            calls: Arc<AtomicU64>,
+        ) -> Self {
+            Self {
+                identity,
+                expected,
+                response: Ok(response),
+                calls,
+            }
+        }
+
+        fn ambiguous(identity: &'static str, expected: Vec<u8>, calls: Arc<AtomicU64>) -> Self {
+            Self {
+                identity,
+                expected,
+                response: Err(ExchangeFailure::Ambiguous),
+                calls,
+            }
+        }
+    }
+
+    impl ExchangeAdapter for FixedExchange {
+        fn identity(&self) -> &str {
+            self.identity
+        }
+
+        fn exchange(
+            &self,
+            request: &[u8],
+            _timeout: Duration,
+            _max_response_bytes: usize,
+        ) -> Result<ExchangeResponse, ExchangeFailure> {
+            assert_eq!(request, self.expected);
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.response.clone().map(|bytes| ExchangeResponse {
+                provenance: format!("test:{}", self.identity),
+                bytes,
+                usage: 1,
+            })
+        }
+    }
+
+    fn admitted(path: &str, content: &[u8]) -> proposals::AdmittedFile {
+        proposals::AdmittedFile {
+            path: path.into(),
+            before_sha256: digest(content),
+            content: content.to_vec(),
+        }
     }
 
     fn temporary_directory() -> PathBuf {

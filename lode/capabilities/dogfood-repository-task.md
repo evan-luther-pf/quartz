@@ -257,3 +257,103 @@ presentation.
   The production turn, derived proposal metadata and candidates, and separate
   promotion journals and mutation ledgers remain under
   `.quartz/dogfood-multi-proposal/`.
+
+## Resumable proposal correction
+
+### Problem
+
+A completed proposal session reconstructs exact candidates, but its production
+conversation ends after the first response. Rejecting one candidate loses the
+feedback at the process boundary, and a replacement would require an unrelated
+new turn with no durable binding to the original admission or response.
+
+### Observable behavior
+
+`quartz --revise-proposal <model> <session-dir> <index> <feedback-path>`
+records one explicit rejection and runs at most one follow-up model turn for
+that session. The bounded revision prompt contains the requested model, exact
+original task and admitted file snapshot set, selected proposal index and
+bytes, prior result digest, and exact UTF-8 feedback. The response must contain
+one complete-file replacement for that same admitted path and before digest.
+
+`quartz --resume-proposals <session-dir>` reconstructs the original and
+revision turns without credentials. It renders the rejected generation as
+superseded, the corrected generation as current, and every unaffected proposal
+as current. `--promote-proposal` resolves only the current generation; a
+rejected proposal with no completed correction cannot be promoted.
+
+### Non-goals
+
+- More than one follow-up turn per session, automatic retries, command-result
+  ingestion, validation orchestration, or an open-ended conversation format.
+- Model-selected paths or tools, automatic approval, atomic multi-file
+  publication, merge handling, or rollback of promoted siblings.
+- A new kernel capability, WIT revision, provider registry, or prompt
+  framework.
+
+### Invariants
+
+- The original `turn.qj`, event stream, exchange ledger, admission prompt, and
+  proposal caches remain unchanged. Revision 1 uses separate prompt, journal,
+  event-stream, exchange-ledger, metadata, and candidate paths.
+- The revision prompt's committed user-prompt payload is the durable rejection
+  and feedback record. The assistant payload is the corrected-candidate source
+  of truth. Files beside the ledgers are reconstructible caches.
+- Revision parsing revalidates the complete original admission, its prompt
+  digest, selected index, path, before digest, prior result digest and bytes,
+  feedback bound, model identity, and exact response shape.
+- The correction must differ from both the admitted source and rejected
+  generation. Unaffected proposal bytes and identities cannot change.
+- A started revision exchange without a durable successful result remains
+  `interrupted/unknown`; reopening never emits it again. No correction is
+  materialized and the rejected generation remains non-promotable.
+- Revision request snapshots and payloads are independently capped at 256 KiB;
+  feedback is capped at 4 KiB; response and candidate limits remain 64 KiB and
+  32 KiB. OpenAI's 1,024-output-token cap remains unchanged.
+- Rejection, feedback, exchange, and promotion records are irreversible
+  external facts. Recovery closes live authority without deleting history.
+
+### Public contract
+
+No WIT or kernel API changes. The executable composes a second instance of the
+existing production turn for the revision and gives it a separate durable
+ledger set. Existing ABI 10 promotion resolves the reconstructed current
+candidate path and otherwise remains unchanged.
+
+### Acceptance scenario
+
+1. Produce two proposals from one fresh credentialed session and leave both
+   admitted sources unchanged.
+2. Persist explicit bounded feedback rejecting one displayed candidate.
+3. Complete one credentialed revision turn for only that candidate.
+4. Terminate and reconstruct the original admission, rejection, feedback,
+   superseded candidate, corrected candidate, and unaffected sibling without
+   credentials or another exchange.
+5. Obtain separate approval for the corrected candidate and unaffected sibling,
+   then promote each through existing ABI 10 authorities.
+6. Reopen both promotion runtimes, verify exact retained bytes, recover all live
+   authority, and retain the two turn histories and promotion ledgers.
+
+### Verification
+
+- One initial `gpt-5.4` turn proposed description-only changes for
+  `crates/quartz/Cargo.toml` and `crates/quartz-kernel/Cargo.toml` without
+  changing either source. Proposal 0 digest
+  `1e0d2282b462277c0bc3e278ec301a84b6a201d546e669fba7a5cbbcb9e601fd`
+  was rejected with exact bounded wording feedback.
+- One revision turn retained that feedback in its committed prompt and produced
+  corrected proposal 0 digest
+  `29c35546dc921646c7a07da1a1738a88e84632a089fd30613842582ee2c003f7`.
+  A credential-free process reconstructed the superseded and corrected
+  generations, unaffected proposal 1 digest
+  `fec6d4412890f0393c8ceb450c13360b08baec5174aa6911b5b5b5836969e1c2`,
+  and exact diffs. Reinvoking the completed revision emitted no exchange.
+- The user separately approved the corrected proposal and unaffected sibling.
+  Independent ABI 10 promotions reconstructed both retained digests after
+  restart and recovered to clean contexts.
+- `cargo test -p quartz --bin quartz` passed 19 focused contracts.
+  `cargo test --workspace --all-targets` passed 78 tests across 12 suites.
+  Initial and revision prompts, journals, event streams, exchange ledgers,
+  derived generation metadata and candidates, and promotion ledgers remain
+  under `.quartz/dogfood-proposal-correction/`. No kernel, WIT, component
+  manifest, or package dependency changed.

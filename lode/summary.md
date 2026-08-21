@@ -149,13 +149,29 @@ description-only diffs, and durably promoted each user-approved digest. The
 workspace test command then passed 74 tests across 12 suites. No kernel, WIT,
 package dependency, retry path, or atomic multi-file transaction was added.
 
+Proposal sessions now support one explicit correction turn. A revision binds
+the requested model, complete original admission, rejected proposal identity
+and bytes, and bounded feedback into a second durable prompt. Restart
+reconstructs the rejection, superseded generation, corrected current
+generation, and unaffected siblings without credentials; rerunning a completed
+revision emits no exchange. Promotion resolves only the current generation.
+
+The correction dogfood run rejected the first of two package-description
+proposals, committed exact feedback, and received one corrected candidate in a
+second `gpt-5.4` turn. A credential-free process reconstructed both turn
+histories and all proposal states. The user separately approved the correction
+and unaffected sibling; ABI 10 promotion retained both exact digests after
+restart and recovered cleanly. The workspace test command passed 78 tests
+across 12 suites. No kernel, WIT, or dependency change was required.
+
 ## Next boundary
 
-The orchestration path remains one bounded proposal turn rather than an agent
-loop. It cannot yet carry a rejection or command result into a subsequent turn
-while preserving the admitted repository snapshot set and prior durable
-evidence. That resumable correction boundary should be exercised before adding
-model-selected tools or another kernel capability.
+The correction boundary accepts explicit human feedback but not execution
+evidence. The next production gap is one host-approved, bounded command result
+committed into a subsequent model turn without automatic retry, ambient shell
+authority, or an open-ended tool loop. That boundary should reuse the existing
+explicit argv approval and durable exchange contracts before model-selected
+tools or another kernel capability.
 
 ## Non-goals
 
