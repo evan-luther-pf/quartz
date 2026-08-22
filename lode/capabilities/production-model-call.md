@@ -22,9 +22,10 @@ A sandboxed client submits one host-admitted UTF-8 prompt through `quartz.agent/
 - One runtime receives at most one explicit host exchange adapter. A component can use it only through a matching `ExchangeGrant`; no global adapter registry exists.
 - API credentials, endpoint configuration, and HTTP response objects remain host-side. Guest code receives only a status or usage scalar and normalized response bytes.
 - The request is the exact payload of one committed event visible through the caller's committed event-stream provider. Missing, ungranted, non-UTF-8, or oversized input is rejected before network emission.
-- A synchronized started record without a successful terminal result is never retried. Terminal failures retain one bounded non-secret category: `authentication`, `request-rejected`, `remote-failed`, `empty-response`, `response-limit`, `protocol`, or `ambiguous`. A started-only record is durably closed as `ambiguous` during replay before the component observes it.
+- A synchronized started record without a successful terminal result is never retried. HTTP rejection retains `authentication` or `request-rejected`. Terminal Responses objects retain only `remote-failed:<allowlisted-code>`, `remote-cancelled`, or `incomplete:<allowlisted-reason>`; other adapter failures retain `empty-response`, `response-limit`, `protocol`, or `ambiguous`. Unknown remote codes and incomplete reasons become `other`.
 - Reusing an invocation identity with a different request digest fails closed.
-- OpenAI generation is capped at 1,024 output tokens; response bytes, usage, provenance, and digest are independently bounded and synchronized in the exchange ledger before they can enter the event outbox.
+- OpenAI generation is capped at 4,096 output tokens after a schema-3 dogfood run retained `incomplete:max_output_tokens` at the prior 1,024-token ceiling. Response bytes remain independently bounded; usage, provenance, and digest are synchronized in the exchange ledger before they can enter the event outbox.
+- A terminal Responses object retains `usage.total_tokens` when present and may retain only a lowercase SHA-256 of its response ID for correlation. Raw response IDs, error messages, response bodies, headers, credentials, prompts, and source content never enter the failure record or diagnostic.
 - The host supplies the deadline to the adapter and independently stops waiting at that deadline. The adapter bounds create and polling work by the same deadline. Timeout is durably terminal and ambiguous; Quartz does not claim remote cancellation or safe retry.
 - Callable dispatch releases the core borrow and marks exactly one provider in flight. That provider may call only its declared `event-count`, `read-event`, and `exchange` imports; concurrent or nested provider invocation fails closed. At most one adapter worker may remain outstanding, and a new invocation cannot emit while it is running.
 - Component recovery closes the exchange ledger, clears staged response authority, and joins any timed-out adapter worker before reporting a clean context. Durable ledger records and API emissions remain external.
@@ -37,10 +38,11 @@ ABI 7 adds three host capabilities:
 - `exchange(event-index, invocation) -> s64` runs or reconstructs one bounded exchange during the invoked provider's callable dispatch and returns usage, or a negative Quartz status;
 - `resume-exchange(event-grant-index, value) -> status` queues the response transferred from that provider as one durable event payload through the existing transactional outbox.
 
-An `ExchangeGrant` binds an adapter identity, ledger path, request and response byte limits, and timeout. `Runtime::new_with_exchange` and `Runtime::open_persistent_with_exchange` install the one explicit host adapter. The adapter contract accepts opaque UTF-8 request bytes and a deadline and returns bounded normalized bytes, provenance, and non-negative usage; failures use the seven terminal categories above. The runtime stops waiting at the deadline and tracks a still-running worker until exchange recovery joins it.
+An `ExchangeGrant` binds an adapter identity, ledger path, request and response byte limits, and timeout. `Runtime::new_with_exchange` and `Runtime::open_persistent_with_exchange` install the one explicit host adapter. The adapter contract accepts opaque UTF-8 request bytes and a deadline and returns bounded normalized bytes, provenance, and non-negative usage. Typed terminal failures carry only allowlisted code/reason enums, optional bounded usage, and an optional validated response-ID digest. The runtime stops waiting at the deadline and tracks a still-running worker until exchange recovery joins it.
 
-Exchange ledger schema 2 uses the eight-byte magic `QUARTZX2`. Failed records
-contain only the fixed category; request identity remains a SHA-256 digest.
+Exchange ledger schema 3 uses the eight-byte magic `QUARTZX3`. Failed records
+contain only the typed failure and safe terminal metadata; request identity
+remains a SHA-256 digest.
 
 The production provider implements the existing `quartz.agent/provider@1` callable, so deterministic and production providers follow the same dependency and replacement lifecycle. Its facts retain the existing bit layout and use the existing user-prompt, provider-request, assistant-message, usage, stop, and interrupted/unknown kinds. The user-prompt and assistant-message facts carry durable payloads. The assistant scalar projection stores usage so the following activation can commit the separate usage fact without transient state.
 
@@ -57,8 +59,8 @@ The production provider implements the existing `quartz.agent/provider@1` callab
 1. Start with one admitted prompt snapshot, the public submit gateway, production client, production provider, production loop, event storage, and one explicit exchange adapter.
 2. Commit the prompt payload through the public gateway, then terminate the process.
 3. A fresh process commits the stable provider request and terminates.
-4. A fresh loop activation invokes the provider callable; the provider synchronizes exchange intent, starts one background Responses API request, polls its identity to completion under the host deadline, synchronizes normalized response text and usage, and the loop commits one assistant payload.
-5. Fresh processes commit usage and one stop. Restart reconstructs the exact response bytes, usage, invocation identity, and terminal state without a second API request.
+4. A fresh loop activation invokes the provider callable; the provider synchronizes exchange intent, starts one background Responses API request, polls its identity to a terminal state under the host deadline, and synchronizes either normalized response text and usage or one safe terminal failure with optional usage and response-ID digest.
+5. Fresh processes reconstruct a success or exact terminal failure without a second API request. Successful turns then commit usage and one stop.
 6. Replacing the provider withdraws the old exchange registration before the new provider opens the same ledger; committed history does not change.
 7. Removing the application and persistence roots recovers all live exchange, event, snapshot, callable, and component authority while durable records remain external.
 

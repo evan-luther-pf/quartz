@@ -14,7 +14,10 @@ pub use component::{
     ComponentSpec, ComponentTree, ContextObservation, FiberId, FiberState, Limits, TraceEvent,
 };
 pub use composition::CompositionPatch;
-pub use exchange::{ExchangeAdapter, ExchangeFailure, ExchangeGrant, ExchangeResponse};
+pub use exchange::{
+    ExchangeAdapter, ExchangeFailure, ExchangeGrant, ExchangeResponse, ExchangeTerminalMetadata,
+    IncompleteReason, RemoteErrorCode,
+};
 pub use journal::{DurableEventLog, DurablePayload, EventGrant, EventRecord, SnapshotGrant};
 pub use manifest::{
     ABI_VERSION, BindingKind, ComponentDeclaration, HostCapability, InterfaceId, Manifest,

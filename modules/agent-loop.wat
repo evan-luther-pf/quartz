@@ -368,7 +368,7 @@
         i64.lt_s
         if
           local.get $response
-          i64.const -17
+          i64.const -26
           i64.ge_s
           local.get $response
           i64.const -10
@@ -445,7 +445,7 @@
         i64.lt_s
         if
           local.get $response
-          i64.const -17
+          i64.const -26
           i64.ge_s
           local.get $response
           i64.const -10
@@ -508,7 +508,7 @@
         i64.lt_s
         if
           local.get $response
-          i64.const -17
+          i64.const -26
           i64.ge_s
           local.get $response
           i64.const -10

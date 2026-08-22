@@ -30,11 +30,19 @@ pub(crate) const STATUS_BUSY: i32 = 9;
 pub(crate) const STATUS_AMBIGUOUS: i32 = 10;
 pub(crate) const STATUS_AUTHENTICATION: i32 = 11;
 pub(crate) const STATUS_REQUEST_REJECTED: i32 = 12;
-pub(crate) const STATUS_REMOTE_FAILED: i32 = 13;
+pub(crate) const STATUS_REMOTE_FAILED_OTHER: i32 = 13;
 pub(crate) const STATUS_EMPTY_RESPONSE: i32 = 14;
 pub(crate) const STATUS_RESPONSE_LIMIT: i32 = 15;
 pub(crate) const STATUS_PROTOCOL: i32 = 16;
 pub(crate) const STATUS_EXCHANGE_AMBIGUOUS: i32 = 17;
+pub(crate) const STATUS_REMOTE_CANCELLED: i32 = 19;
+pub(crate) const STATUS_INCOMPLETE_MAX_OUTPUT_TOKENS: i32 = 20;
+pub(crate) const STATUS_INCOMPLETE_CONTENT_FILTER: i32 = 21;
+pub(crate) const STATUS_INCOMPLETE_OTHER: i32 = 22;
+pub(crate) const STATUS_REMOTE_FAILED_SERVER_ERROR: i32 = 23;
+pub(crate) const STATUS_REMOTE_FAILED_RATE_LIMIT: i32 = 24;
+pub(crate) const STATUS_REMOTE_FAILED_INVALID_PROMPT: i32 = 25;
+pub(crate) const STATUS_REMOTE_FAILED_VECTOR_STORE_TIMEOUT: i32 = 26;
 
 pub(crate) struct HostState {
     pub(crate) core: Weak<RefCell<Core>>,

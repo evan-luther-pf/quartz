@@ -3,8 +3,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use quartz_kernel::{ExchangeAdapter, ExchangeFailure, ExchangeResponse};
+use quartz_kernel::{
+    ExchangeAdapter, ExchangeFailure, ExchangeResponse, ExchangeTerminalMetadata, IncompleteReason,
+    RemoteErrorCode,
+};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 pub(crate) struct OpenAiResponses {
     api_key: String,
@@ -58,7 +62,7 @@ impl ExchangeAdapter for OpenAiResponses {
                 }
                 Some("queued" | "in_progress") => {}
                 Some("failed" | "cancelled" | "incomplete") => {
-                    return Err(ExchangeFailure::RemoteFailed);
+                    return Err(terminal_response_failure(&envelope)?);
                 }
                 Some(_) | None => return Err(ExchangeFailure::Protocol),
             }
@@ -94,7 +98,7 @@ fn request_body(model: &str, prompt: &str) -> Value {
         "input": prompt,
         "background": true,
         "store": false,
-        "max_output_tokens": 1024
+        "max_output_tokens": 4096
     })
 }
 
@@ -111,8 +115,73 @@ fn http_failure(status: u16) -> ExchangeFailure {
     match status {
         401 | 403 => ExchangeFailure::Authentication,
         400..=499 => ExchangeFailure::RequestRejected,
-        _ => ExchangeFailure::RemoteFailed,
+        _ => ExchangeFailure::remote_failed_other(),
     }
+}
+
+fn terminal_response_failure(response: &Value) -> Result<ExchangeFailure, ExchangeFailure> {
+    match response.get("status").and_then(Value::as_str) {
+        Some("failed") => failed_response(response),
+        Some("cancelled") => Ok(ExchangeFailure::RemoteCancelled {
+            terminal: terminal_metadata(response)?,
+        }),
+        Some("incomplete") => incomplete_response(response),
+        _ => Err(ExchangeFailure::Protocol),
+    }
+}
+
+fn failed_response(response: &Value) -> Result<ExchangeFailure, ExchangeFailure> {
+    let code = match response.pointer("/error/code").and_then(Value::as_str) {
+        Some("server_error") => RemoteErrorCode::ServerError,
+        Some("rate_limit_exceeded") => RemoteErrorCode::RateLimitExceeded,
+        Some("invalid_prompt") => RemoteErrorCode::InvalidPrompt,
+        Some("vector_store_timeout") => RemoteErrorCode::VectorStoreTimeout,
+        Some(_) | None => RemoteErrorCode::Other,
+    };
+    Ok(ExchangeFailure::RemoteFailed {
+        code,
+        terminal: terminal_metadata(response)?,
+    })
+}
+
+fn incomplete_response(response: &Value) -> Result<ExchangeFailure, ExchangeFailure> {
+    let reason = match response
+        .pointer("/incomplete_details/reason")
+        .and_then(Value::as_str)
+    {
+        Some("max_output_tokens") => IncompleteReason::MaxOutputTokens,
+        Some("content_filter") => IncompleteReason::ContentFilter,
+        Some(_) | None => IncompleteReason::Other,
+    };
+    Ok(ExchangeFailure::Incomplete {
+        reason,
+        terminal: terminal_metadata(response)?,
+    })
+}
+
+fn terminal_metadata(response: &Value) -> Result<ExchangeTerminalMetadata, ExchangeFailure> {
+    let usage = response
+        .pointer("/usage/total_tokens")
+        .and_then(Value::as_u64);
+    if usage.is_some_and(|usage| usage > i64::MAX as u64) {
+        return Err(ExchangeFailure::Protocol);
+    }
+    let response_id_sha256 = response
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(|id| {
+            let mut output = String::with_capacity(64);
+            for byte in Sha256::digest(id.as_bytes()) {
+                use std::fmt::Write as _;
+                write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
+            }
+            output
+        });
+    Ok(ExchangeTerminalMetadata {
+        usage,
+        response_id_sha256,
+    })
 }
 
 fn read_envelope(
@@ -186,7 +255,7 @@ mod tests {
         assert_eq!(body["input"], "prompt");
         assert_eq!(body["background"], true);
         assert_eq!(body["store"], false);
-        assert_eq!(body["max_output_tokens"], 1024);
+        assert_eq!(body["max_output_tokens"], 4096);
     }
 
     #[test]
@@ -234,7 +303,7 @@ mod tests {
         assert_eq!(http_failure(403), ExchangeFailure::Authentication);
         assert_eq!(http_failure(400), ExchangeFailure::RequestRejected);
         assert_eq!(http_failure(429), ExchangeFailure::RequestRejected);
-        assert_eq!(http_failure(500), ExchangeFailure::RemoteFailed);
+        assert_eq!(http_failure(500), ExchangeFailure::remote_failed_other());
 
         let empty = normalize_response(
             json!({
@@ -249,5 +318,78 @@ mod tests {
             normalize_response(json!({"output": []}), 64),
             Err(ExchangeFailure::Protocol)
         );
+    }
+
+    #[test]
+    fn retains_only_safe_terminal_response_details() {
+        let failed = terminal_response_failure(&json!({
+            "id": "resp_sensitive_identifier",
+            "status": "failed",
+            "error": {
+                "code": "server_error",
+                "message": "unsafe provider message"
+            },
+            "usage": {"total_tokens": 321}
+        }))
+        .unwrap();
+        let debug = format!("{failed:?}");
+        assert!(!debug.contains("unsafe provider message"));
+        assert!(!debug.contains("resp_sensitive_identifier"));
+        let ExchangeFailure::RemoteFailed { code, terminal } = failed else {
+            panic!("expected failed response")
+        };
+        assert_eq!(code, RemoteErrorCode::ServerError);
+        assert_eq!(terminal.usage, Some(321));
+        assert_eq!(terminal.response_id_sha256.as_deref().unwrap().len(), 64);
+
+        assert!(matches!(
+            terminal_response_failure(&json!({
+                "id": "resp_cancelled",
+                "status": "cancelled",
+                "usage": {"total_tokens": 12}
+            })),
+            Ok(ExchangeFailure::RemoteCancelled {
+                terminal: ExchangeTerminalMetadata {
+                    usage: Some(12),
+                    response_id_sha256: Some(_),
+                }
+            })
+        ));
+
+        for (reason, expected) in [
+            ("max_output_tokens", IncompleteReason::MaxOutputTokens),
+            ("content_filter", IncompleteReason::ContentFilter),
+            ("future_reason", IncompleteReason::Other),
+        ] {
+            assert!(matches!(
+                terminal_response_failure(&json!({
+                    "id": "resp_incomplete",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": reason},
+                    "usage": {"total_tokens": 456}
+                })),
+                Ok(ExchangeFailure::Incomplete {
+                    reason: actual,
+                    terminal: ExchangeTerminalMetadata {
+                        usage: Some(456),
+                        response_id_sha256: Some(_),
+                    },
+                }) if actual == expected
+            ));
+        }
+
+        assert!(matches!(
+            terminal_response_failure(&json!({
+                "status": "failed",
+                "error": {"code": "future_error", "message": "not retained"}
+            })),
+            Ok(ExchangeFailure::RemoteFailed {
+                code: RemoteErrorCode::Other,
+                terminal: ExchangeTerminalMetadata {
+                    usage: None,
+                    response_id_sha256: None,
+                }
+            })
+        ));
     }
 }

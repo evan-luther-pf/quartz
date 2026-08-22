@@ -13,12 +13,12 @@ use crate::{ComponentTree, CompositionPatch, Error, Limits, Result};
 const COMPOSITION_MAGIC: &[u8; 8] = b"QUARTZJ2";
 const EVENT_MAGIC: &[u8; 8] = b"QUARTZE2";
 const HEADER_LEN: usize = 12;
-const EXCHANGE_MAGIC: &[u8; 8] = b"QUARTZX2";
+const EXCHANGE_MAGIC: &[u8; 8] = b"QUARTZX3";
 const MUTATION_MAGIC: &[u8; 8] = b"QUARTZM2";
 const CHECKSUM_LEN: usize = 32;
 const COMPOSITION_SCHEMA_VERSION: u32 = 2;
 const EVENT_SCHEMA_VERSION: u32 = 2;
-const EXCHANGE_SCHEMA_VERSION: u32 = 2;
+const EXCHANGE_SCHEMA_VERSION: u32 = 3;
 const MUTATION_SCHEMA_VERSION: u32 = 2;
 
 type FramedPayloads = Vec<(u64, Vec<u8>)>;
@@ -227,20 +227,47 @@ pub(crate) struct MutationLedgerIdentity<'a> {
 #[serde(deny_unknown_fields, rename_all = "kebab-case", tag = "kind")]
 pub(crate) enum ExchangeLedgerOutcome {
     Started,
-    Succeeded { payload: DurablePayload, usage: u64 },
-    Failed { failure: ExchangeLedgerFailure },
+    Succeeded {
+        payload: DurablePayload,
+        usage: u64,
+    },
+    Failed {
+        failure: ExchangeLedgerFailure,
+        usage: Option<u64>,
+        response_id_sha256: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(deny_unknown_fields, rename_all = "kebab-case", tag = "category")]
 pub(crate) enum ExchangeLedgerFailure {
     Authentication,
     RequestRejected,
-    RemoteFailed,
+    RemoteFailed { code: ExchangeRemoteErrorCode },
+    RemoteCancelled,
+    Incomplete { reason: ExchangeIncompleteReason },
     EmptyResponse,
     ResponseLimit,
     Protocol,
     Ambiguous,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExchangeRemoteErrorCode {
+    ServerError,
+    RateLimitExceeded,
+    InvalidPrompt,
+    VectorStoreTimeout,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExchangeIncompleteReason {
+    MaxOutputTokens,
+    ContentFilter,
+    Other,
 }
 
 pub(crate) struct Journal {
@@ -557,14 +584,7 @@ impl ExchangeLedger {
                     "exchange record has invalid identity".into(),
                 ));
             }
-            if let ExchangeLedgerOutcome::Succeeded { payload, usage } = &record.outcome {
-                validate_exchange_payload(payload)?;
-                if *usage > i64::MAX as u64 {
-                    return Err(Error::ExchangeCorrupt(
-                        "exchange usage exceeds the signed ABI range".into(),
-                    ));
-                }
-            }
+            Self::validate_exchange_outcome(&record.outcome)?;
             match records.get(&record.invocation) {
                 None if record.outcome == ExchangeLedgerOutcome::Started => {
                     records.insert(record.invocation, (record.request_sha256, record.outcome));
@@ -637,16 +657,39 @@ impl ExchangeLedger {
                 "invalid terminal exchange invocation {invocation}"
             )));
         }
-        if let ExchangeLedgerOutcome::Succeeded { payload, usage } = &outcome {
-            validate_exchange_payload(payload)?;
-            if *usage > i64::MAX as u64 {
-                return Err(Error::ExchangeCorrupt(
-                    "exchange usage exceeds the signed ABI range".into(),
-                ));
-            }
-        }
+        Self::validate_exchange_outcome(&outcome)?;
         self.append(invocation, request_sha256.clone(), outcome.clone())?;
         self.records.insert(invocation, (request_sha256, outcome));
+        Ok(())
+    }
+
+    fn validate_exchange_outcome(outcome: &ExchangeLedgerOutcome) -> Result<()> {
+        match outcome {
+            ExchangeLedgerOutcome::Succeeded { payload, usage } => {
+                validate_exchange_payload(payload)?;
+                if *usage > i64::MAX as u64 {
+                    return Err(Error::ExchangeCorrupt(
+                        "exchange usage exceeds the signed ABI range".into(),
+                    ));
+                }
+            }
+            ExchangeLedgerOutcome::Failed {
+                usage,
+                response_id_sha256,
+                ..
+            } => {
+                if usage.is_some_and(|usage| usage > i64::MAX as u64)
+                    || response_id_sha256
+                        .as_deref()
+                        .is_some_and(|digest| !valid_sha256(digest))
+                {
+                    return Err(Error::ExchangeCorrupt(
+                        "exchange terminal metadata is invalid".into(),
+                    ));
+                }
+            }
+            ExchangeLedgerOutcome::Started => {}
+        }
         Ok(())
     }
 

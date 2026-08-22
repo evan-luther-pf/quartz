@@ -6,13 +6,17 @@ use crate::{
     component::{FiberId, TraceEvent},
     fiber::{Core, InternalState, Inverse},
     journal::{
-        DurablePayload, ExchangeLedger, ExchangeLedgerFailure, ExchangeLedgerOutcome, sha256_hex,
+        DurablePayload, ExchangeIncompleteReason, ExchangeLedger, ExchangeLedgerFailure,
+        ExchangeLedgerOutcome, ExchangeRemoteErrorCode, sha256_hex,
     },
     wasm_host::{
         STATUS_AMBIGUOUS, STATUS_AUTHENTICATION, STATUS_COLLISION, STATUS_DENIED,
-        STATUS_EMPTY_RESPONSE, STATUS_EXCHANGE_AMBIGUOUS, STATUS_INVALID, STATUS_LIMIT, STATUS_OK,
-        STATUS_PROTOCOL, STATUS_REMOTE_FAILED, STATUS_REQUEST_REJECTED, STATUS_RESPONSE_LIMIT,
-        STATUS_UNDECLARED, STATUS_UNSATISFIED,
+        STATUS_EMPTY_RESPONSE, STATUS_EXCHANGE_AMBIGUOUS, STATUS_INCOMPLETE_CONTENT_FILTER,
+        STATUS_INCOMPLETE_MAX_OUTPUT_TOKENS, STATUS_INCOMPLETE_OTHER, STATUS_INVALID, STATUS_LIMIT,
+        STATUS_OK, STATUS_PROTOCOL, STATUS_REMOTE_CANCELLED, STATUS_REMOTE_FAILED_INVALID_PROMPT,
+        STATUS_REMOTE_FAILED_OTHER, STATUS_REMOTE_FAILED_RATE_LIMIT,
+        STATUS_REMOTE_FAILED_SERVER_ERROR, STATUS_REMOTE_FAILED_VECTOR_STORE_TIMEOUT,
+        STATUS_REQUEST_REJECTED, STATUS_RESPONSE_LIMIT, STATUS_UNDECLARED, STATUS_UNSATISFIED,
     },
 };
 
@@ -51,15 +55,102 @@ pub struct ExchangeResponse {
     pub usage: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExchangeFailure {
     Authentication,
     RequestRejected,
-    RemoteFailed,
+    RemoteFailed {
+        code: RemoteErrorCode,
+        terminal: ExchangeTerminalMetadata,
+    },
+    RemoteCancelled {
+        terminal: ExchangeTerminalMetadata,
+    },
+    Incomplete {
+        reason: IncompleteReason,
+        terminal: ExchangeTerminalMetadata,
+    },
     EmptyResponse,
     ResponseLimit,
     Protocol,
     Ambiguous,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ExchangeTerminalMetadata {
+    pub usage: Option<u64>,
+    pub response_id_sha256: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoteErrorCode {
+    ServerError,
+    RateLimitExceeded,
+    InvalidPrompt,
+    VectorStoreTimeout,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IncompleteReason {
+    MaxOutputTokens,
+    ContentFilter,
+    Other,
+}
+
+impl ExchangeFailure {
+    pub fn remote_failed_other() -> Self {
+        Self::RemoteFailed {
+            code: RemoteErrorCode::Other,
+            terminal: ExchangeTerminalMetadata::default(),
+        }
+    }
+
+    fn into_ledger(self) -> (ExchangeLedgerFailure, Option<u64>, Option<String>) {
+        match self {
+            Self::Authentication => (ExchangeLedgerFailure::Authentication, None, None),
+            Self::RequestRejected => (ExchangeLedgerFailure::RequestRejected, None, None),
+            Self::RemoteFailed { code, terminal } => (
+                ExchangeLedgerFailure::RemoteFailed {
+                    code: match code {
+                        RemoteErrorCode::ServerError => ExchangeRemoteErrorCode::ServerError,
+                        RemoteErrorCode::RateLimitExceeded => {
+                            ExchangeRemoteErrorCode::RateLimitExceeded
+                        }
+                        RemoteErrorCode::InvalidPrompt => ExchangeRemoteErrorCode::InvalidPrompt,
+                        RemoteErrorCode::VectorStoreTimeout => {
+                            ExchangeRemoteErrorCode::VectorStoreTimeout
+                        }
+                        RemoteErrorCode::Other => ExchangeRemoteErrorCode::Other,
+                    },
+                },
+                terminal.usage,
+                terminal.response_id_sha256,
+            ),
+            Self::RemoteCancelled { terminal } => (
+                ExchangeLedgerFailure::RemoteCancelled,
+                terminal.usage,
+                terminal.response_id_sha256,
+            ),
+            Self::Incomplete { reason, terminal } => (
+                ExchangeLedgerFailure::Incomplete {
+                    reason: match reason {
+                        IncompleteReason::MaxOutputTokens => {
+                            ExchangeIncompleteReason::MaxOutputTokens
+                        }
+                        IncompleteReason::ContentFilter => ExchangeIncompleteReason::ContentFilter,
+                        IncompleteReason::Other => ExchangeIncompleteReason::Other,
+                    },
+                },
+                terminal.usage,
+                terminal.response_id_sha256,
+            ),
+            Self::EmptyResponse => (ExchangeLedgerFailure::EmptyResponse, None, None),
+            Self::ResponseLimit => (ExchangeLedgerFailure::ResponseLimit, None, None),
+            Self::Protocol => (ExchangeLedgerFailure::Protocol, None, None),
+            Self::Ambiguous => (ExchangeLedgerFailure::Ambiguous, None, None),
+        }
+    }
 }
 
 pub trait ExchangeAdapter: Send + Sync {
@@ -218,6 +309,8 @@ impl Core {
             if outcome == ExchangeLedgerOutcome::Started {
                 outcome = ExchangeLedgerOutcome::Failed {
                     failure: ExchangeLedgerFailure::Ambiguous,
+                    usage: None,
+                    response_id_sha256: None,
                 };
                 if let Err(error) = self
                     .exchange
@@ -271,10 +364,14 @@ impl Core {
         let outcome = match received {
             Ok(Ok(response)) if response.bytes.is_empty() => ExchangeLedgerOutcome::Failed {
                 failure: ExchangeLedgerFailure::EmptyResponse,
+                usage: None,
+                response_id_sha256: None,
             },
             Ok(Ok(response)) if response.bytes.len() > grant.max_response_bytes => {
                 ExchangeLedgerOutcome::Failed {
                     failure: ExchangeLedgerFailure::ResponseLimit,
+                    usage: None,
+                    response_id_sha256: None,
                 }
             }
             Ok(Ok(response))
@@ -284,6 +381,8 @@ impl Core {
             {
                 ExchangeLedgerOutcome::Failed {
                     failure: ExchangeLedgerFailure::Protocol,
+                    usage: None,
+                    response_id_sha256: None,
                 }
             }
             Ok(Ok(response)) => ExchangeLedgerOutcome::Succeeded {
@@ -294,21 +393,20 @@ impl Core {
                 },
                 usage: response.usage,
             },
-            Ok(Err(failure)) => ExchangeLedgerOutcome::Failed {
-                failure: match failure {
-                    ExchangeFailure::Authentication => ExchangeLedgerFailure::Authentication,
-                    ExchangeFailure::RequestRejected => ExchangeLedgerFailure::RequestRejected,
-                    ExchangeFailure::RemoteFailed => ExchangeLedgerFailure::RemoteFailed,
-                    ExchangeFailure::EmptyResponse => ExchangeLedgerFailure::EmptyResponse,
-                    ExchangeFailure::ResponseLimit => ExchangeLedgerFailure::ResponseLimit,
-                    ExchangeFailure::Protocol => ExchangeLedgerFailure::Protocol,
-                    ExchangeFailure::Ambiguous => ExchangeLedgerFailure::Ambiguous,
-                },
-            },
+            Ok(Err(failure)) => {
+                let (failure, usage, response_id_sha256) = failure.into_ledger();
+                ExchangeLedgerOutcome::Failed {
+                    failure,
+                    usage,
+                    response_id_sha256,
+                }
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
             | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 ExchangeLedgerOutcome::Failed {
                     failure: ExchangeLedgerFailure::Ambiguous,
+                    usage: None,
+                    response_id_sha256: None,
                 }
             }
         };
@@ -340,11 +438,31 @@ impl Core {
                 record.staged_usage = Some(usage);
                 usage as i64
             }
-            ExchangeLedgerOutcome::Failed { failure } => {
+            ExchangeLedgerOutcome::Failed { failure, .. } => {
                 -(match failure {
                     ExchangeLedgerFailure::Authentication => STATUS_AUTHENTICATION,
                     ExchangeLedgerFailure::RequestRejected => STATUS_REQUEST_REJECTED,
-                    ExchangeLedgerFailure::RemoteFailed => STATUS_REMOTE_FAILED,
+                    ExchangeLedgerFailure::RemoteFailed { code } => match code {
+                        ExchangeRemoteErrorCode::ServerError => STATUS_REMOTE_FAILED_SERVER_ERROR,
+                        ExchangeRemoteErrorCode::RateLimitExceeded => {
+                            STATUS_REMOTE_FAILED_RATE_LIMIT
+                        }
+                        ExchangeRemoteErrorCode::InvalidPrompt => {
+                            STATUS_REMOTE_FAILED_INVALID_PROMPT
+                        }
+                        ExchangeRemoteErrorCode::VectorStoreTimeout => {
+                            STATUS_REMOTE_FAILED_VECTOR_STORE_TIMEOUT
+                        }
+                        ExchangeRemoteErrorCode::Other => STATUS_REMOTE_FAILED_OTHER,
+                    },
+                    ExchangeLedgerFailure::RemoteCancelled => STATUS_REMOTE_CANCELLED,
+                    ExchangeLedgerFailure::Incomplete { reason } => match reason {
+                        ExchangeIncompleteReason::MaxOutputTokens => {
+                            STATUS_INCOMPLETE_MAX_OUTPUT_TOKENS
+                        }
+                        ExchangeIncompleteReason::ContentFilter => STATUS_INCOMPLETE_CONTENT_FILTER,
+                        ExchangeIncompleteReason::Other => STATUS_INCOMPLETE_OTHER,
+                    },
                     ExchangeLedgerFailure::EmptyResponse => STATUS_EMPTY_RESPONSE,
                     ExchangeLedgerFailure::ResponseLimit => STATUS_RESPONSE_LIMIT,
                     ExchangeLedgerFailure::Protocol => STATUS_PROTOCOL,

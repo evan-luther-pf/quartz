@@ -143,10 +143,11 @@ Task outcome is truthful at the process boundary. Only explicit `COMPLETE`
 leaves the repository-task root active and returns exit 0. Stop and terminal
 exchange failures produce fixed non-secret categories in generic
 `FiberState::Failed`; `quartz task` inspects only that state, shuts down cleanly,
-and returns exit 2. Exchange ledger schema 2 preserves authentication,
-request-rejected, remote-failed, empty-response, response-limit, protocol, and
-ambiguous outcomes. Replay returns the same category without another adapter
-call; diagnostics expose no exchange body, header, credential, task, or source.
+and returns exit 2. Exchange ledger schema 3 distinguishes failed, cancelled,
+and incomplete Responses outcomes, retains optional terminal usage and a hashed
+response ID, and rejects unsafe metadata. Replay returns the same category
+without another adapter call; diagnostics expose no message, body, header,
+credential, task, source, or raw response ID.
 
 This workflow required no WIT extension. ABI 11's generic snapshot, exchange,
 event, workspace, and callable capabilities carry the repository-task protocol;
@@ -157,9 +158,9 @@ The executable and component directory form a relocatable bundle;
 
 ## Next boundary
 
-Slice D, including truthful task outcome semantics, is closed. Slice E remains
-uncommitted until its bounded repository manifest and window contract is
-accepted.
+Slice D, including truthful and structured provider outcome semantics, is
+closed. The latest real task reached a successful provider response but failed
+its digest-bound proposal range checks. Slice E remains uncommitted.
 
 ## Non-goals
 

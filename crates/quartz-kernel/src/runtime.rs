@@ -25,12 +25,20 @@ fn terminal_failure_category(status: i32) -> Option<&'static str> {
     match status {
         11 => Some("authentication"),
         12 => Some("request-rejected"),
-        13 => Some("remote-failed"),
+        13 => Some("remote-failed:other"),
         14 => Some("empty-response"),
         15 => Some("response-limit"),
         16 => Some("protocol"),
         17 => Some("ambiguous"),
         18 => Some("stop"),
+        19 => Some("remote-cancelled"),
+        20 => Some("incomplete:max_output_tokens"),
+        21 => Some("incomplete:content_filter"),
+        22 => Some("incomplete:other"),
+        23 => Some("remote-failed:server_error"),
+        24 => Some("remote-failed:rate_limit_exceeded"),
+        25 => Some("remote-failed:invalid_prompt"),
+        26 => Some("remote-failed:vector_store_timeout"),
         _ => None,
     }
 }

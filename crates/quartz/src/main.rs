@@ -267,18 +267,22 @@ impl ExchangeAdapter for TerminalAdapter {
             .or_else(|| value.get("diff"))
             .and_then(|value| value.as_str())
         {
-            writeln!(stdout, "{display}").map_err(|_| ExchangeFailure::RemoteFailed)?;
+            writeln!(stdout, "{display}").map_err(|_| ExchangeFailure::remote_failed_other())?;
         } else if value.get("argv").is_some() {
-            writeln!(stdout, "command {}", value).map_err(|_| ExchangeFailure::RemoteFailed)?;
+            writeln!(stdout, "command {}", value)
+                .map_err(|_| ExchangeFailure::remote_failed_other())?;
             writeln!(stdout, "Approve with 'approve' or stop with 'stop'.")
-                .map_err(|_| ExchangeFailure::RemoteFailed)?;
+                .map_err(|_| ExchangeFailure::remote_failed_other())?;
         } else {
-            writeln!(stdout, "promotion {}", value).map_err(|_| ExchangeFailure::RemoteFailed)?;
+            writeln!(stdout, "promotion {}", value)
+                .map_err(|_| ExchangeFailure::remote_failed_other())?;
             writeln!(stdout, "Approve with 'approve'; any other response stops.")
-                .map_err(|_| ExchangeFailure::RemoteFailed)?;
+                .map_err(|_| ExchangeFailure::remote_failed_other())?;
         }
-        write!(stdout, "> ").map_err(|_| ExchangeFailure::RemoteFailed)?;
-        stdout.flush().map_err(|_| ExchangeFailure::RemoteFailed)?;
+        write!(stdout, "> ").map_err(|_| ExchangeFailure::remote_failed_other())?;
+        stdout
+            .flush()
+            .map_err(|_| ExchangeFailure::remote_failed_other())?;
         let mut line = String::new();
         std::io::stdin()
             .read_line(&mut line)
@@ -473,8 +477,22 @@ fn task_outcome(state: Option<FiberState>) -> Result<(), String> {
         Some(FiberState::Failed(category)) => Err(format!(
             "task failed: {}",
             match category.as_str() {
-                "authentication" | "request-rejected" | "remote-failed" | "empty-response"
-                | "response-limit" | "protocol" | "ambiguous" | "stop" => category.as_str(),
+                "authentication"
+                | "request-rejected"
+                | "remote-failed:server_error"
+                | "remote-failed:rate_limit_exceeded"
+                | "remote-failed:invalid_prompt"
+                | "remote-failed:vector_store_timeout"
+                | "remote-failed:other"
+                | "remote-cancelled"
+                | "incomplete:max_output_tokens"
+                | "incomplete:content_filter"
+                | "incomplete:other"
+                | "empty-response"
+                | "response-limit"
+                | "protocol"
+                | "ambiguous"
+                | "stop" => category.as_str(),
                 _ => "protocol",
             }
         )),
@@ -1992,7 +2010,15 @@ mod cli_tests {
         for category in [
             "authentication",
             "request-rejected",
-            "remote-failed",
+            "remote-failed:server_error",
+            "remote-failed:rate_limit_exceeded",
+            "remote-failed:invalid_prompt",
+            "remote-failed:vector_store_timeout",
+            "remote-failed:other",
+            "remote-cancelled",
+            "incomplete:max_output_tokens",
+            "incomplete:content_filter",
+            "incomplete:other",
             "empty-response",
             "response-limit",
             "protocol",
@@ -2020,6 +2046,7 @@ mod repository_task_component_tests {
     use super::*;
     use crate::commands::CommandFinished;
     use parking_lot::Mutex;
+    use quartz_kernel::{ExchangeTerminalMetadata, IncompleteReason, RemoteErrorCode};
     use std::{
         collections::VecDeque,
         sync::atomic::{AtomicU64, Ordering},
@@ -2105,7 +2132,7 @@ mod repository_task_component_tests {
             _max_response_bytes: usize,
         ) -> Result<ExchangeResponse, ExchangeFailure> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            match self.failure {
+            match self.failure.clone() {
                 Some(failure) => Err(failure),
                 None => Ok(ExchangeResponse {
                     provenance: "scripted:invalid".into(),
@@ -2455,14 +2482,69 @@ mod repository_task_component_tests {
 
     #[test]
     fn terminal_exchange_categories_fail_the_root_and_replay_without_calls() {
-        for (failure, category) in [
-            (Some(ExchangeFailure::Authentication), "authentication"),
-            (Some(ExchangeFailure::RequestRejected), "request-rejected"),
-            (Some(ExchangeFailure::RemoteFailed), "remote-failed"),
-            (Some(ExchangeFailure::EmptyResponse), "empty-response"),
-            (Some(ExchangeFailure::ResponseLimit), "response-limit"),
-            (None, "protocol"),
-            (Some(ExchangeFailure::Ambiguous), "ambiguous"),
+        let metadata = |usage, byte: char| ExchangeTerminalMetadata {
+            usage: Some(usage),
+            response_id_sha256: Some(byte.to_string().repeat(64)),
+        };
+        for (failure, category, terminal_usage) in [
+            (
+                Some(ExchangeFailure::Authentication),
+                "authentication",
+                None,
+            ),
+            (
+                Some(ExchangeFailure::RequestRejected),
+                "request-rejected",
+                None,
+            ),
+            (
+                Some(ExchangeFailure::RemoteFailed {
+                    code: RemoteErrorCode::ServerError,
+                    terminal: metadata(101, 'a'),
+                }),
+                "remote-failed:server_error",
+                Some(101),
+            ),
+            (
+                Some(ExchangeFailure::RemoteCancelled {
+                    terminal: metadata(102, 'b'),
+                }),
+                "remote-cancelled",
+                Some(102),
+            ),
+            (
+                Some(ExchangeFailure::Incomplete {
+                    reason: IncompleteReason::MaxOutputTokens,
+                    terminal: metadata(103, 'c'),
+                }),
+                "incomplete:max_output_tokens",
+                Some(103),
+            ),
+            (
+                Some(ExchangeFailure::Incomplete {
+                    reason: IncompleteReason::ContentFilter,
+                    terminal: metadata(104, 'd'),
+                }),
+                "incomplete:content_filter",
+                Some(104),
+            ),
+            (
+                Some(ExchangeFailure::Incomplete {
+                    reason: IncompleteReason::Other,
+                    terminal: metadata(105, 'e'),
+                }),
+                "incomplete:other",
+                Some(105),
+            ),
+            (
+                Some(ExchangeFailure::remote_failed_other()),
+                "remote-failed:other",
+                None,
+            ),
+            (Some(ExchangeFailure::EmptyResponse), "empty-response", None),
+            (Some(ExchangeFailure::ResponseLimit), "response-limit", None),
+            (None, "protocol", None),
+            (Some(ExchangeFailure::Ambiguous), "ambiguous", None),
         ] {
             let root = std::env::temp_dir().join(format!(
                 "quartz-repository-outcome-{category}-{}",
@@ -2520,6 +2602,16 @@ mod repository_task_component_tests {
             let mut runtime =
                 Runtime::open_persistent_with_exchanges(limits, persistence(), adapters()).unwrap();
             runtime.apply_tree(app).unwrap();
+            if let Some(usage) = terminal_usage {
+                let ledger = String::from_utf8_lossy(
+                    &fs::read(session.join("repository-model-provider.qx")).unwrap(),
+                )
+                .into_owned();
+                assert!(ledger.contains(&format!(r#""usage":{usage}"#)));
+                assert!(ledger.contains("response_id_sha256"));
+                assert!(!ledger.contains("response body"));
+                assert!(!ledger.contains("error message"));
+            }
             let failed = Some(FiberState::Failed(category.into()));
             assert_eq!(runtime.fiber_state("repository-task"), failed);
             assert_eq!(

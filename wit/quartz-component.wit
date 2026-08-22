@@ -111,9 +111,10 @@ world module {
   export start: func(config: u64) -> u64;
 
   /// Run one atomic activation iteration: zero continues and one completes.
-  /// Negative 11..18 fail with authentication, request-rejected, remote-failed,
-  /// empty-response, response-limit, protocol, ambiguous, or stop respectively;
-  /// other negative Quartz statuses remain ordinary lifecycle failures.
+  /// Negative 11..18 fail with base terminal categories; 19 is cancelled,
+  /// 20..22 are incomplete max-output/content-filter/other, and 23..26 are
+  /// allowlisted remote failure codes. Other negative Quartz statuses remain
+  /// ordinary lifecycle failures.
   export step: func(instance: u64) -> s32;
 
   /// Handle one synchronous callable-coeffect request without host reentry.

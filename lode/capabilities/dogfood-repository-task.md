@@ -153,16 +153,25 @@ ambiguity, stale and tampered facts, A-to-B orchestrator replacement, and
 relocated component discovery. The release acceptance path and a copied clean
 bundle load real external components.
 
-Outcome contracts deterministically fake all seven exchange categories, an
+Outcome contracts deterministically fake every terminal exchange category, an
 invalid model response, and user stop. They assert the root's generic failed
-state, exit-2 result, identical category after restart with zero adapter calls,
-and clean shutdown. Explicit completion remains the only exit-0 path.
+state, exit-2 result, safe terminal metadata, identical category after restart
+with zero adapter calls, and clean shutdown. Explicit completion remains the
+only exit-0 path.
 
-The first real documentation dogfood after this correction made one model
-request and received durable `remote-failed` with zero usage tokens. Quartz
-reported `task failed: remote-failed`, returned exit 2 after 9 seconds, left
-both admitted files unchanged, and did not request review, promotion, or command
-authority. This is a truthful failed run, not a completed documentation patch.
+Schema-3 provider dogfood identified the prior opaque failure exactly. At the
+1,024-token ceiling, the terminal Response was
+`incomplete:max_output_tokens`, usage was 4,672 tokens, and the response ID was
+retained only as SHA-256. Quartz returned exit 2 after 8 seconds without review,
+mutation, or command authority. The ceiling then rose deliberately to 4,096
+while response-byte bounds stayed unchanged.
+
+The one fresh 4,096-token run completed the provider exchange with 4,084 usage
+tokens and a 1,919-byte response, then the component failed `protocol`: the
+otherwise well-shaped two-proposal response selected README byte range
+5362..5532 against a 4,782-byte admitted source. No review, mutation, promotion,
+or command ran. Reopening the session returned the same failure in 0.59 seconds;
+the provider ledger SHA-256 was unchanged, proving zero repeated model calls.
 
 The credentialed smoke command is:
 

@@ -96,10 +96,10 @@ object, or `COMPLETE` followed by a summary. Failure always continues through
 `PROPOSE`; `COMPLETE` is accepted only after command success.
 
 Only explicit `COMPLETE` returns exit 0. Stop or a terminal model, terminal, or
-command exchange failure recovers live state and returns exit 2 with one
-non-secret category such as `authentication`, `request-rejected`,
-`remote-failed`, `empty-response`, `response-limit`, `protocol`, or
-`ambiguous`. Reopening a failed session reconstructs that category without
+command exchange failure recovers live state and returns exit 2. Responses
+failures retain only allowlisted codes or reasons, optional terminal usage, and
+an optional hashed response ID; raw provider diagnostics are never persisted or
+printed. Reopening a failed session reconstructs the same result without
 repeating the external operation.
 
 The authoritative `session/task.qe` event stream reconstructs every transition.
