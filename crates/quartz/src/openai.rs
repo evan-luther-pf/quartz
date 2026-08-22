@@ -170,18 +170,20 @@ fn terminal_metadata(response: &Value) -> Result<ExchangeTerminalMetadata, Excha
         .get("id")
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())
-        .map(|id| {
-            let mut output = String::with_capacity(64);
-            for byte in Sha256::digest(id.as_bytes()) {
-                use std::fmt::Write as _;
-                write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
-            }
-            output
-        });
+        .map(response_id_sha256);
     Ok(ExchangeTerminalMetadata {
         usage,
         response_id_sha256,
     })
+}
+
+fn response_id_sha256(id: &str) -> String {
+    let mut output = String::with_capacity(64);
+    for byte in Sha256::digest(id.as_bytes()) {
+        use std::fmt::Write as _;
+        write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    output
 }
 
 fn read_envelope(
@@ -239,7 +241,7 @@ fn normalize_response(
     }
     Ok(ExchangeResponse {
         bytes: output.into_bytes(),
-        provenance: format!("openai:{id}"),
+        provenance: format!("openai:sha256:{}", response_id_sha256(id)),
         usage,
     })
 }
@@ -277,7 +279,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response.bytes, b"Quartz works.");
-        assert_eq!(response.provenance, "openai:resp_123");
+        assert_eq!(
+            response.provenance,
+            format!("openai:sha256:{}", response_id_sha256("resp_123"))
+        );
         assert_eq!(response.usage, 12);
     }
 
