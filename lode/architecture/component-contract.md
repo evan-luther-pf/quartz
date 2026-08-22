@@ -97,6 +97,10 @@ imports:
 - `start(config)`, `step(instance)`, `invoke(instance, operation, arg0, arg1)`,
   and `drop(instance)` implement bounded activation, synchronous callable
   dispatch, and disposal;
+- negative `step` results may use the generic terminal failure codes; the runtime
+  maps only those fixed codes to bounded category labels in
+  `FiberState::Failed`, while other component errors remain ordinary bounded
+  lifecycle failures;
 - `set-state` performs an invertible fiber-owned context mutation;
 - `publish` installs a declared scalar coeffect with a structural inverse;
 - `resolve` reads a scalar slot only through the fiber's committed provider view;
@@ -263,22 +267,24 @@ shutdown, and asserts a clean live context.
 
 ### Repository-task verification
 
-`cargo test --workspace` passes 75 contracts across 13 suites. The standalone
+`cargo test --workspace` passes 79 contracts across 13 suites. The standalone
 repository-task crate adds four native unit contracts for strict
 initial/revision/continuation grammar, repeated correction, command evidence,
 UTF-8 and digest bounds, unknown fields, and completion gating. The kernel also
 checks that recovery accepts a contiguous chain of promoted correction
-generations while rejecting unrecorded source drift. Two host integration
-contracts load the real WASM artifact, exercise A-to-B governed replacement,
-exact argv, promotion-before-command, failed-command correction, explicit
-success completion, final restart, and no repeated exchange or process call.
-Slice 6 remains the generic started/terminal exchange crash contract, including
-terminal ambiguity and cached-success replay.
+generations while rejecting unrecorded source drift. Host integration contracts
+load the real WASM artifact and cover A-to-B governed replacement, exact argv,
+promotion-before-command, failed-command correction, explicit success
+completion, every terminal exchange category, invalid-response protocol
+failure, user stop, clean failed-root recovery, identical replay without adapter
+calls, final restart, and no repeated exchange or process call. Slice 6 retains
+the generic started/terminal exchange crash contracts, including durable
+ambiguity and cached-success replay.
 
 Release packaging writes 50 manifest-bearing WASM files into `components/`
 beside the executable and deletes stale staged artifacts first. On arm64 macOS,
 the current stripped release executable is 17,804,800 bytes, the component
-directory is 1,489,501 bytes, and each repository-task artifact is 236,273
+directory is 1,489,807 bytes, and each repository-task artifact is 236,321
 bytes. Copying the executable and directory to `/tmp/quartz-relocated-smoke`
 and running `quartz --acceptance` loaded the relocated artifacts, completed the
 full scenario, and reported a clean context without `QUARTZ_COMPONENT_DIR`.

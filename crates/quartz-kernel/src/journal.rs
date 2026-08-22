@@ -13,12 +13,12 @@ use crate::{ComponentTree, CompositionPatch, Error, Limits, Result};
 const COMPOSITION_MAGIC: &[u8; 8] = b"QUARTZJ2";
 const EVENT_MAGIC: &[u8; 8] = b"QUARTZE2";
 const HEADER_LEN: usize = 12;
-const EXCHANGE_MAGIC: &[u8; 8] = b"QUARTZX1";
+const EXCHANGE_MAGIC: &[u8; 8] = b"QUARTZX2";
 const MUTATION_MAGIC: &[u8; 8] = b"QUARTZM2";
 const CHECKSUM_LEN: usize = 32;
 const COMPOSITION_SCHEMA_VERSION: u32 = 2;
 const EVENT_SCHEMA_VERSION: u32 = 2;
-const EXCHANGE_SCHEMA_VERSION: u32 = 1;
+const EXCHANGE_SCHEMA_VERSION: u32 = 2;
 const MUTATION_SCHEMA_VERSION: u32 = 2;
 
 type FramedPayloads = Vec<(u64, Vec<u8>)>;
@@ -234,9 +234,13 @@ pub(crate) enum ExchangeLedgerOutcome {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum ExchangeLedgerFailure {
-    Rejected,
+    Authentication,
+    RequestRejected,
+    RemoteFailed,
+    EmptyResponse,
+    ResponseLimit,
+    Protocol,
     Ambiguous,
-    Limit,
 }
 
 pub(crate) struct Journal {

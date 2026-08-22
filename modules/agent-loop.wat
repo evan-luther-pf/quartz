@@ -368,8 +368,12 @@
         i64.lt_s
         if
           local.get $response
+          i64.const -17
+          i64.ge_s
+          local.get $response
           i64.const -10
-          i64.eq
+          i64.le_s
+          i32.and
           if
             i64.const 8
             local.get $turn
@@ -441,8 +445,12 @@
         i64.lt_s
         if
           local.get $response
+          i64.const -17
+          i64.ge_s
+          local.get $response
           i64.const -10
-          i64.eq
+          i64.le_s
+          i32.and
           if
             i64.const 8
             local.get $turn
@@ -500,8 +508,12 @@
         i64.lt_s
         if
           local.get $response
+          i64.const -17
+          i64.ge_s
+          local.get $response
           i64.const -10
-          i64.eq
+          i64.le_s
+          i32.and
           if
             i64.const 8
             local.get $turn

@@ -31,6 +31,27 @@ is reviewed and promoted before the next monotonic command attempt. Started-only
 model, terminal, command, publication, or promotion operations remain terminal
 unknown and are never retried.
 
+## Outcome semantics
+
+The repository-task root reaches successful `Active` quiescence only after an
+explicit valid `COMPLETE` response following a successful command. User stop,
+exchange authentication failure, request rejection, remote failure, empty
+response, response limit, protocol failure, and ambiguity terminate activation
+with distinct bounded generic failure categories.
+
+The native `quartz task` path reads only the root's public `FiberState`; it does
+not parse repository-task facts or infer product policy. It records the failed
+state, performs ordinary persistent shutdown, then reports the category and
+returns exit 2. Explicit completion returns exit 0. Diagnostics contain only
+the category: never response bodies, headers, credentials, task text, or source
+content.
+
+A terminal exchange failure is synchronized in the exchange ledger before the
+component observes it. Replay reconstructs the exact same category without
+calling the adapter. A started-only exchange is durably closed as `ambiguous`
+on replay and likewise emits no second external request. Both success and
+failure shutdown recover every live fiber, capability, and accumulated effect.
+
 ## Proposal protocol
 
 Initial responses contain only `proposals`. Each proposal contains exactly:
@@ -131,6 +152,17 @@ successful explicit completion, restart at every external boundary, terminal
 ambiguity, stale and tampered facts, A-to-B orchestrator replacement, and
 relocated component discovery. The release acceptance path and a copied clean
 bundle load real external components.
+
+Outcome contracts deterministically fake all seven exchange categories, an
+invalid model response, and user stop. They assert the root's generic failed
+state, exit-2 result, identical category after restart with zero adapter calls,
+and clean shutdown. Explicit completion remains the only exit-0 path.
+
+The first real documentation dogfood after this correction made one model
+request and received durable `remote-failed` with zero usage tokens. Quartz
+reported `task failed: remote-failed`, returned exit 2 after 9 seconds, left
+both admitted files unchanged, and did not request review, promotion, or command
+authority. This is a truthful failed run, not a completed documentation patch.
 
 The credentialed smoke command is:
 

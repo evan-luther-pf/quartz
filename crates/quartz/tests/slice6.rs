@@ -433,7 +433,7 @@ fn write_started_exchange(path: &Path, invocation: u64, request: &[u8]) {
     write_exchange_records(
         path,
         vec![serde_json::json!({
-            "schema": 1,
+            "schema": 2,
             "invocation": invocation,
             "request_sha256": sha256(request),
             "outcome": {"kind": "started"}
@@ -453,13 +453,13 @@ fn write_succeeded_exchange(
         path,
         vec![
             serde_json::json!({
-                "schema": 1,
+                "schema": 2,
                 "invocation": invocation,
                 "request_sha256": request_sha256,
                 "outcome": {"kind": "started"}
             }),
             serde_json::json!({
-                "schema": 1,
+                "schema": 2,
                 "invocation": invocation,
                 "request_sha256": request_sha256,
                 "outcome": {
@@ -478,7 +478,7 @@ fn write_succeeded_exchange(
 
 fn write_exchange_records(path: &Path, records: Vec<serde_json::Value>) {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"QUARTZX1");
+    bytes.extend_from_slice(b"QUARTZX2");
     for (index, record) in records.into_iter().enumerate() {
         let payload = serde_json::to_vec(&record).unwrap();
         let sequence = index as u64 + 1;

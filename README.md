@@ -95,6 +95,13 @@ return either `PROPOSE <source-index>` followed by one strict ranged-edit JSON
 object, or `COMPLETE` followed by a summary. Failure always continues through
 `PROPOSE`; `COMPLETE` is accepted only after command success.
 
+Only explicit `COMPLETE` returns exit 0. Stop or a terminal model, terminal, or
+command exchange failure recovers live state and returns exit 2 with one
+non-secret category such as `authentication`, `request-rejected`,
+`remote-failed`, `empty-response`, `response-limit`, `protocol`, or
+`ambiguous`. Reopening a failed session reconstructs that category without
+repeating the external operation.
+
 The authoritative `session/task.qe` event stream reconstructs every transition.
 Re-running a completed session performs no model, terminal, command, mutation,
 or promotion again. Exchange, mutation, promotion, and composition journals are

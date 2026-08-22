@@ -110,8 +110,10 @@ world module {
   /// Create activation-local state. This call must not mutate the context.
   export start: func(config: u64) -> u64;
 
-  /// Run one atomic activation iteration: zero continues, one completes, and a
-  /// negative Quartz status fails activation.
+  /// Run one atomic activation iteration: zero continues and one completes.
+  /// Negative 11..18 fail with authentication, request-rejected, remote-failed,
+  /// empty-response, response-limit, protocol, ambiguous, or stop respectively;
+  /// other negative Quartz statuses remain ordinary lifecycle failures.
   export step: func(instance: u64) -> s32;
 
   /// Handle one synchronous callable-coeffect request without host reentry.

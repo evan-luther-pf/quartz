@@ -34,13 +34,13 @@ impl ExchangeAdapter for OpenAiResponses {
         timeout: Duration,
         max_response_bytes: usize,
     ) -> Result<ExchangeResponse, ExchangeFailure> {
-        let prompt = std::str::from_utf8(request).map_err(|_| ExchangeFailure::Rejected)?;
+        let prompt = std::str::from_utf8(request).map_err(|_| ExchangeFailure::Protocol)?;
         let envelope_limit = max_response_bytes
             .saturating_mul(8)
             .clamp(1024 * 1024, 8 * 1024 * 1024);
         let deadline = Instant::now()
             .checked_add(timeout)
-            .ok_or(ExchangeFailure::Rejected)?;
+            .ok_or(ExchangeFailure::Protocol)?;
         let mut response = request_agent(timeout)
             .post("https://api.openai.com/v1/responses")
             .header("Authorization", format!("Bearer {}", self.api_key))
@@ -48,11 +48,7 @@ impl ExchangeAdapter for OpenAiResponses {
             .map_err(|_| ExchangeFailure::Ambiguous)?;
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
-            return if (400..500).contains(&status) {
-                Err(ExchangeFailure::Rejected)
-            } else {
-                Err(ExchangeFailure::Ambiguous)
-            };
+            return Err(http_failure(status));
         }
         let mut envelope = read_envelope(&mut response, envelope_limit)?;
         loop {
@@ -61,8 +57,10 @@ impl ExchangeAdapter for OpenAiResponses {
                     return normalize_response(envelope, max_response_bytes);
                 }
                 Some("queued" | "in_progress") => {}
-                Some(_) => return Err(ExchangeFailure::Rejected),
-                None => return Err(ExchangeFailure::Ambiguous),
+                Some("failed" | "cancelled" | "incomplete") => {
+                    return Err(ExchangeFailure::RemoteFailed);
+                }
+                Some(_) | None => return Err(ExchangeFailure::Protocol),
             }
 
             let remaining = deadline
@@ -75,14 +73,15 @@ impl ExchangeAdapter for OpenAiResponses {
             let id = envelope
                 .get("id")
                 .and_then(Value::as_str)
-                .ok_or(ExchangeFailure::Ambiguous)?;
+                .ok_or(ExchangeFailure::Protocol)?;
             let mut response = request_agent(remaining)
                 .get(format!("https://api.openai.com/v1/responses/{id}"))
                 .header("Authorization", format!("Bearer {}", self.api_key))
                 .call()
                 .map_err(|_| ExchangeFailure::Ambiguous)?;
-            if !(200..300).contains(&response.status().as_u16()) {
-                return Err(ExchangeFailure::Ambiguous);
+            let status = response.status().as_u16();
+            if !(200..300).contains(&status) {
+                return Err(http_failure(status));
             }
             envelope = read_envelope(&mut response, envelope_limit)?;
         }
@@ -108,6 +107,14 @@ fn request_agent(timeout: Duration) -> ureq::Agent {
     ureq::Agent::new_with_config(config)
 }
 
+fn http_failure(status: u16) -> ExchangeFailure {
+    match status {
+        401 | 403 => ExchangeFailure::Authentication,
+        400..=499 => ExchangeFailure::RequestRejected,
+        _ => ExchangeFailure::RemoteFailed,
+    }
+}
+
 fn read_envelope(
     response: &mut ureq::http::Response<ureq::Body>,
     limit: usize,
@@ -117,8 +124,11 @@ fn read_envelope(
         .with_config()
         .limit(limit as u64)
         .read_to_vec()
-        .map_err(|_| ExchangeFailure::Ambiguous)?;
-    serde_json::from_slice(&body).map_err(|_| ExchangeFailure::Ambiguous)
+        .map_err(|error| match error {
+            ureq::Error::BodyExceedsLimit(_) => ExchangeFailure::ResponseLimit,
+            _ => ExchangeFailure::Ambiguous,
+        })?;
+    serde_json::from_slice(&body).map_err(|_| ExchangeFailure::Protocol)
 }
 
 fn normalize_response(
@@ -128,16 +138,16 @@ fn normalize_response(
     let id = response
         .get("id")
         .and_then(Value::as_str)
-        .ok_or(ExchangeFailure::Ambiguous)?;
+        .ok_or(ExchangeFailure::Protocol)?;
     let usage = response
         .pointer("/usage/total_tokens")
         .and_then(Value::as_u64)
-        .ok_or(ExchangeFailure::Ambiguous)?;
+        .ok_or(ExchangeFailure::Protocol)?;
     let mut output = String::new();
     for item in response
         .get("output")
         .and_then(Value::as_array)
-        .ok_or(ExchangeFailure::Ambiguous)?
+        .ok_or(ExchangeFailure::Protocol)?
     {
         let Some(content) = item.get("content").and_then(Value::as_array) else {
             continue;
@@ -147,16 +157,16 @@ fn normalize_response(
                 let text = part
                     .get("text")
                     .and_then(Value::as_str)
-                    .ok_or(ExchangeFailure::Ambiguous)?;
+                    .ok_or(ExchangeFailure::Protocol)?;
                 output.push_str(text);
                 if output.len() > max_response_bytes {
-                    return Err(ExchangeFailure::Rejected);
+                    return Err(ExchangeFailure::ResponseLimit);
                 }
             }
         }
     }
     if output.is_empty() {
-        return Err(ExchangeFailure::Rejected);
+        return Err(ExchangeFailure::EmptyResponse);
     }
     Ok(ExchangeResponse {
         bytes: output.into_bytes(),
@@ -215,6 +225,29 @@ mod tests {
             }),
             4,
         );
-        assert!(matches!(result, Err(ExchangeFailure::Rejected)));
+        assert!(matches!(result, Err(ExchangeFailure::ResponseLimit)));
+    }
+
+    #[test]
+    fn classifies_non_secret_terminal_failures() {
+        assert_eq!(http_failure(401), ExchangeFailure::Authentication);
+        assert_eq!(http_failure(403), ExchangeFailure::Authentication);
+        assert_eq!(http_failure(400), ExchangeFailure::RequestRejected);
+        assert_eq!(http_failure(429), ExchangeFailure::RequestRejected);
+        assert_eq!(http_failure(500), ExchangeFailure::RemoteFailed);
+
+        let empty = normalize_response(
+            json!({
+                "id": "resp_123",
+                "usage": {"total_tokens": 0},
+                "output": []
+            }),
+            64,
+        );
+        assert_eq!(empty, Err(ExchangeFailure::EmptyResponse));
+        assert_eq!(
+            normalize_response(json!({"output": []}), 64),
+            Err(ExchangeFailure::Protocol)
+        );
     }
 }

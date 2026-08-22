@@ -45,9 +45,9 @@ as one Rust workspace:
   snapshots, bounded payload reads and workspaces, host exchange, publication,
   and promotion authority, Wasmtime loading, replacement, and rollback.
 - `crates/quartz` — Slice 0 through Slice 9 executable scenarios, contract tests,
-  and bounded proposal, correction, approved-command, and continuation
-  orchestration. Repository-task policy here is a recorded component-boundary
-  violation, not an approved native-host convention.
+  credential-bearing and terminal/process adapters, canonical task admission,
+  and generic root-fiber CLI outcome handling. Repository-task policy lives only
+  in the external component.
 - `wit/quartz-component.wit` — public component/host boundary.
 - `modules` — real WebAssembly component sources and embedded manifests used by
   the executable acceptance paths.

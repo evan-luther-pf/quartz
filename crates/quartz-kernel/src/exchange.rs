@@ -9,7 +9,9 @@ use crate::{
         DurablePayload, ExchangeLedger, ExchangeLedgerFailure, ExchangeLedgerOutcome, sha256_hex,
     },
     wasm_host::{
-        STATUS_AMBIGUOUS, STATUS_COLLISION, STATUS_DENIED, STATUS_INVALID, STATUS_LIMIT, STATUS_OK,
+        STATUS_AMBIGUOUS, STATUS_AUTHENTICATION, STATUS_COLLISION, STATUS_DENIED,
+        STATUS_EMPTY_RESPONSE, STATUS_EXCHANGE_AMBIGUOUS, STATUS_INVALID, STATUS_LIMIT, STATUS_OK,
+        STATUS_PROTOCOL, STATUS_REMOTE_FAILED, STATUS_REQUEST_REJECTED, STATUS_RESPONSE_LIMIT,
         STATUS_UNDECLARED, STATUS_UNSATISFIED,
     },
 };
@@ -51,7 +53,12 @@ pub struct ExchangeResponse {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExchangeFailure {
-    Rejected,
+    Authentication,
+    RequestRejected,
+    RemoteFailed,
+    EmptyResponse,
+    ResponseLimit,
+    Protocol,
     Ambiguous,
 }
 
@@ -207,7 +214,22 @@ impl Core {
                 }
             }
         };
-        if let Some(outcome) = recovered {
+        if let Some(mut outcome) = recovered {
+            if outcome == ExchangeLedgerOutcome::Started {
+                outcome = ExchangeLedgerOutcome::Failed {
+                    failure: ExchangeLedgerFailure::Ambiguous,
+                };
+                if let Err(error) = self
+                    .exchange
+                    .get_mut(&fiber)
+                    .expect("exchange registration checked above")
+                    .ledger
+                    .append_terminal(invocation, request_sha256.clone(), outcome.clone())
+                {
+                    self.exchange_failure = Some(error);
+                    return -(STATUS_INVALID as i64);
+                }
+            }
             return self.stage_exchange_outcome(fiber, outcome);
         }
         let mut running = Vec::new();
@@ -247,30 +269,43 @@ impl Core {
             let _ = worker.join();
         }
         let outcome = match received {
-            Ok(Ok(response))
-                if !response.bytes.is_empty()
-                    && response.bytes.len() <= grant.max_response_bytes
-                    && response.usage <= i64::MAX as u64
-                    && !response.provenance.is_empty()
-                    && std::str::from_utf8(&response.bytes).is_ok() =>
-            {
-                ExchangeLedgerOutcome::Succeeded {
-                    payload: DurablePayload {
-                        provenance: response.provenance,
-                        sha256: sha256_hex(&response.bytes),
-                        bytes: response.bytes,
-                    },
-                    usage: response.usage,
+            Ok(Ok(response)) if response.bytes.is_empty() => ExchangeLedgerOutcome::Failed {
+                failure: ExchangeLedgerFailure::EmptyResponse,
+            },
+            Ok(Ok(response)) if response.bytes.len() > grant.max_response_bytes => {
+                ExchangeLedgerOutcome::Failed {
+                    failure: ExchangeLedgerFailure::ResponseLimit,
                 }
             }
-            Ok(Ok(_)) => ExchangeLedgerOutcome::Failed {
-                failure: ExchangeLedgerFailure::Limit,
+            Ok(Ok(response))
+                if response.usage > i64::MAX as u64
+                    || response.provenance.is_empty()
+                    || std::str::from_utf8(&response.bytes).is_err() =>
+            {
+                ExchangeLedgerOutcome::Failed {
+                    failure: ExchangeLedgerFailure::Protocol,
+                }
+            }
+            Ok(Ok(response)) => ExchangeLedgerOutcome::Succeeded {
+                payload: DurablePayload {
+                    provenance: response.provenance,
+                    sha256: sha256_hex(&response.bytes),
+                    bytes: response.bytes,
+                },
+                usage: response.usage,
             },
-            Ok(Err(ExchangeFailure::Rejected)) => ExchangeLedgerOutcome::Failed {
-                failure: ExchangeLedgerFailure::Rejected,
+            Ok(Err(failure)) => ExchangeLedgerOutcome::Failed {
+                failure: match failure {
+                    ExchangeFailure::Authentication => ExchangeLedgerFailure::Authentication,
+                    ExchangeFailure::RequestRejected => ExchangeLedgerFailure::RequestRejected,
+                    ExchangeFailure::RemoteFailed => ExchangeLedgerFailure::RemoteFailed,
+                    ExchangeFailure::EmptyResponse => ExchangeLedgerFailure::EmptyResponse,
+                    ExchangeFailure::ResponseLimit => ExchangeLedgerFailure::ResponseLimit,
+                    ExchangeFailure::Protocol => ExchangeLedgerFailure::Protocol,
+                    ExchangeFailure::Ambiguous => ExchangeLedgerFailure::Ambiguous,
+                },
             },
-            Ok(Err(ExchangeFailure::Ambiguous))
-            | Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
             | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 ExchangeLedgerOutcome::Failed {
                     failure: ExchangeLedgerFailure::Ambiguous,
@@ -305,7 +340,17 @@ impl Core {
                 record.staged_usage = Some(usage);
                 usage as i64
             }
-            ExchangeLedgerOutcome::Failed { .. } => -(STATUS_AMBIGUOUS as i64),
+            ExchangeLedgerOutcome::Failed { failure } => {
+                -(match failure {
+                    ExchangeLedgerFailure::Authentication => STATUS_AUTHENTICATION,
+                    ExchangeLedgerFailure::RequestRejected => STATUS_REQUEST_REJECTED,
+                    ExchangeLedgerFailure::RemoteFailed => STATUS_REMOTE_FAILED,
+                    ExchangeLedgerFailure::EmptyResponse => STATUS_EMPTY_RESPONSE,
+                    ExchangeLedgerFailure::ResponseLimit => STATUS_RESPONSE_LIMIT,
+                    ExchangeLedgerFailure::Protocol => STATUS_PROTOCOL,
+                    ExchangeLedgerFailure::Ambiguous => STATUS_EXCHANGE_AMBIGUOUS,
+                } as i64)
+            }
         }
     }
 }

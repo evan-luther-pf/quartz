@@ -15,6 +15,14 @@ const MODE_MODEL: u64 = 1;
 const MODE_TERMINAL: u64 = 2;
 const MODE_COMMAND: u64 = 3;
 const MODE_AUTHORITY: u64 = 4;
+const FAILURE_AUTHENTICATION: i32 = 11;
+const FAILURE_REQUEST_REJECTED: i32 = 12;
+const FAILURE_REMOTE_FAILED: i32 = 13;
+const FAILURE_EMPTY_RESPONSE: i32 = 14;
+const FAILURE_RESPONSE_LIMIT: i32 = 15;
+const FAILURE_PROTOCOL: i32 = 16;
+const FAILURE_AMBIGUOUS: i32 = 17;
+const FAILURE_STOP: i32 = 18;
 
 const EVENT_STARTED: u64 = 1;
 const EVENT_INITIAL_PROMPT: u64 = 10;
@@ -263,7 +271,23 @@ fn authorize(operation: u64, source: u64) -> i64 {
 fn orchestrate(source_count: usize) -> i32 {
     match orchestrate_inner(source_count) {
         Ok(_) => 1,
-        Err(status) => -status.abs(),
+        Err(status) => -terminal_failure(status),
+    }
+}
+
+fn terminal_failure(status: i32) -> i32 {
+    match status.abs() {
+        FAILURE_AUTHENTICATION
+        | FAILURE_REQUEST_REJECTED
+        | FAILURE_REMOTE_FAILED
+        | FAILURE_EMPTY_RESPONSE
+        | FAILURE_RESPONSE_LIMIT
+        | FAILURE_PROTOCOL
+        | FAILURE_AMBIGUOUS
+        | FAILURE_STOP => status.abs(),
+        5 => FAILURE_RESPONSE_LIMIT,
+        10 => FAILURE_AMBIGUOUS,
+        _ => FAILURE_PROTOCOL,
     }
 }
 
@@ -273,11 +297,13 @@ fn orchestrate_inner(source_count: usize) -> Result<(), i32> {
     }
     let facts = facts()?;
     validate_external_adjacency(&facts)?;
-    if facts
-        .last()
-        .is_some_and(|fact| matches!(fact.value, EVENT_COMPLETE | EVENT_STOPPED))
-    {
-        return Ok(());
+    if let Some(fact) = facts.last() {
+        if fact.value == EVENT_COMPLETE {
+            return Ok(());
+        }
+        if fact.value == EVENT_STOPPED {
+            return Err(FAILURE_STOP);
+        }
     }
     let admission = match facts.first() {
         None => {

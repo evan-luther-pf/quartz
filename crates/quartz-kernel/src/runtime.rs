@@ -21,6 +21,20 @@ pub struct Runtime {
     pub(crate) defer_journal: bool,
 }
 
+fn terminal_failure_category(status: i32) -> Option<&'static str> {
+    match status {
+        11 => Some("authentication"),
+        12 => Some("request-rejected"),
+        13 => Some("remote-failed"),
+        14 => Some("empty-response"),
+        15 => Some("response-limit"),
+        16 => Some("protocol"),
+        17 => Some("ambiguous"),
+        18 => Some("stop"),
+        _ => None,
+    }
+}
+
 impl Runtime {
     pub fn new(limits: Limits) -> Result<Self> {
         let loader = ModuleLoader::new()?;
@@ -561,7 +575,11 @@ impl Runtime {
                     let outcome = match result {
                         Ok(0) if fiber.activation_steps < max_steps => None,
                         Ok(0) => Some(format!("activation exceeded {max_steps} declared steps")),
-                        Ok(code) if code < 0 => Some(format!("guest returned status {}", -code)),
+                        Ok(code) if code < 0 => Some(
+                            terminal_failure_category(-code)
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| format!("guest returned status {}", -code)),
+                        ),
                         Ok(code) => Some(format!("guest returned invalid step code {code}")),
                         Err(error) => Some(format!("guest trapped: {error}")),
                     };

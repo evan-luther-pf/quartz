@@ -260,31 +260,34 @@ impl ExchangeAdapter for TerminalAdapter {
         max_response_bytes: usize,
     ) -> Result<ExchangeResponse, ExchangeFailure> {
         let value: serde_json::Value =
-            serde_json::from_slice(request).map_err(|_| ExchangeFailure::Rejected)?;
+            serde_json::from_slice(request).map_err(|_| ExchangeFailure::Protocol)?;
         let mut stdout = std::io::stdout().lock();
         if let Some(display) = value
             .get("decision")
             .or_else(|| value.get("diff"))
             .and_then(|value| value.as_str())
         {
-            writeln!(stdout, "{display}").map_err(|_| ExchangeFailure::Rejected)?;
+            writeln!(stdout, "{display}").map_err(|_| ExchangeFailure::RemoteFailed)?;
         } else if value.get("argv").is_some() {
-            writeln!(stdout, "command {}", value).map_err(|_| ExchangeFailure::Rejected)?;
+            writeln!(stdout, "command {}", value).map_err(|_| ExchangeFailure::RemoteFailed)?;
             writeln!(stdout, "Approve with 'approve' or stop with 'stop'.")
-                .map_err(|_| ExchangeFailure::Rejected)?;
+                .map_err(|_| ExchangeFailure::RemoteFailed)?;
         } else {
-            writeln!(stdout, "promotion {}", value).map_err(|_| ExchangeFailure::Rejected)?;
+            writeln!(stdout, "promotion {}", value).map_err(|_| ExchangeFailure::RemoteFailed)?;
             writeln!(stdout, "Approve with 'approve'; any other response stops.")
-                .map_err(|_| ExchangeFailure::Rejected)?;
+                .map_err(|_| ExchangeFailure::RemoteFailed)?;
         }
-        write!(stdout, "> ").map_err(|_| ExchangeFailure::Rejected)?;
-        stdout.flush().map_err(|_| ExchangeFailure::Rejected)?;
+        write!(stdout, "> ").map_err(|_| ExchangeFailure::RemoteFailed)?;
+        stdout.flush().map_err(|_| ExchangeFailure::RemoteFailed)?;
         let mut line = String::new();
         std::io::stdin()
             .read_line(&mut line)
             .map_err(|_| ExchangeFailure::Ambiguous)?;
-        if line.is_empty() || line.len() > max_response_bytes {
-            return Err(ExchangeFailure::Rejected);
+        if line.is_empty() {
+            return Err(ExchangeFailure::EmptyResponse);
+        }
+        if line.len() > max_response_bytes {
+            return Err(ExchangeFailure::ResponseLimit);
         }
         Ok(ExchangeResponse {
             provenance: "terminal:stdin".into(),
@@ -320,9 +323,9 @@ impl ExchangeAdapter for CommandAdapter {
         max_response_bytes: usize,
     ) -> Result<ExchangeResponse, ExchangeFailure> {
         let request: CommandRequest =
-            serde_json::from_slice(request).map_err(|_| ExchangeFailure::Rejected)?;
+            serde_json::from_slice(request).map_err(|_| ExchangeFailure::Protocol)?;
         if request.schema != 1 || request.attempt == 0 || request.argv != self.argv {
-            return Err(ExchangeFailure::Rejected);
+            return Err(ExchangeFailure::RequestRejected);
         }
         let started = commands::CommandStarted::new(
             request.attempt,
@@ -330,18 +333,16 @@ impl ExchangeAdapter for CommandAdapter {
             &self.repository,
             &self.sources,
         )
-        .map_err(|_| ExchangeFailure::Rejected)?;
+        .map_err(|_| ExchangeFailure::RequestRejected)?;
         let execution = commands::execute(&started);
         let repository_after =
             commands::RepositoryIdentity::capture(&self.repository, &self.sources)
                 .map_err(|_| ExchangeFailure::Ambiguous)?;
         let finished = commands::CommandFinished::new(&started, execution, repository_after)
-            .map_err(|_| ExchangeFailure::Ambiguous)?;
-        let bytes = finished
-            .to_bytes()
-            .map_err(|_| ExchangeFailure::Ambiguous)?;
+            .map_err(|_| ExchangeFailure::Protocol)?;
+        let bytes = finished.to_bytes().map_err(|_| ExchangeFailure::Protocol)?;
         if bytes.len() > max_response_bytes {
-            return Err(ExchangeFailure::Rejected);
+            return Err(ExchangeFailure::ResponseLimit);
         }
         Ok(ExchangeResponse {
             provenance: "command:supervised".into(),
@@ -461,8 +462,24 @@ fn run_task(
     } else {
         runtime.apply_tree(desired)?;
     }
+    let outcome = runtime.fiber_state("repository-task");
     runtime.shutdown_persistent()?;
-    Ok(())
+    task_outcome(outcome).map_err(Into::into)
+}
+
+fn task_outcome(state: Option<FiberState>) -> Result<(), String> {
+    match state {
+        Some(FiberState::Active) => Ok(()),
+        Some(FiberState::Failed(category)) => Err(format!(
+            "task failed: {}",
+            match category.as_str() {
+                "authentication" | "request-rejected" | "remote-failed" | "empty-response"
+                | "response-limit" | "protocol" | "ambiguous" | "stop" => category.as_str(),
+                _ => "protocol",
+            }
+        )),
+        _ => Err("task failed: protocol".into()),
+    }
 }
 
 fn task_tree(
@@ -1968,6 +1985,34 @@ mod cli_tests {
         );
         fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn task_outcome_allows_only_complete_active_state() {
+        assert_eq!(task_outcome(Some(FiberState::Active)), Ok(()));
+        for category in [
+            "authentication",
+            "request-rejected",
+            "remote-failed",
+            "empty-response",
+            "response-limit",
+            "protocol",
+            "ambiguous",
+            "stop",
+        ] {
+            assert_eq!(
+                task_outcome(Some(FiberState::Failed(category.into()))),
+                Err(format!("task failed: {category}"))
+            );
+        }
+        assert_eq!(
+            task_outcome(Some(FiberState::Failed("secret-bearing detail".into()))),
+            Err("task failed: protocol".into())
+        );
+        assert_eq!(
+            task_outcome(Some(FiberState::Inactive)),
+            Err("task failed: protocol".into())
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2015,15 +2060,59 @@ mod repository_task_component_tests {
                 .responses
                 .lock()
                 .pop_front()
-                .ok_or(ExchangeFailure::Rejected)?;
+                .ok_or(ExchangeFailure::RequestRejected)?;
             if bytes.len() > max_response_bytes {
-                return Err(ExchangeFailure::Rejected);
+                return Err(ExchangeFailure::ResponseLimit);
             }
             Ok(ExchangeResponse {
                 provenance: format!("scripted:{}", self.identity),
                 bytes,
                 usage: 0,
             })
+        }
+    }
+
+    struct FailingAdapter {
+        failure: Option<ExchangeFailure>,
+        calls: AtomicU64,
+    }
+
+    impl FailingAdapter {
+        fn new(failure: ExchangeFailure) -> Arc<Self> {
+            Arc::new(Self {
+                failure: Some(failure),
+                calls: AtomicU64::new(0),
+            })
+        }
+
+        fn invalid_response() -> Arc<Self> {
+            Arc::new(Self {
+                failure: None,
+                calls: AtomicU64::new(0),
+            })
+        }
+    }
+
+    impl ExchangeAdapter for FailingAdapter {
+        fn identity(&self) -> &str {
+            "openai-responses"
+        }
+
+        fn exchange(
+            &self,
+            _request: &[u8],
+            _timeout: Duration,
+            _max_response_bytes: usize,
+        ) -> Result<ExchangeResponse, ExchangeFailure> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            match self.failure {
+                Some(failure) => Err(failure),
+                None => Ok(ExchangeResponse {
+                    provenance: "scripted:invalid".into(),
+                    bytes: b"not-json".to_vec(),
+                    usage: 0,
+                }),
+            }
         }
     }
 
@@ -2198,6 +2287,10 @@ mod repository_task_component_tests {
         let request: CommandRequest =
             serde_json::from_slice(command.requests.lock().first().unwrap()).unwrap();
         assert_eq!(request.argv, ["/usr/bin/true"]);
+        assert_eq!(
+            task_outcome(restarted.fiber_state("repository-task")),
+            Ok(())
+        );
         restarted.shutdown_persistent().unwrap();
         assert!(restarted.is_observationally_clean());
         fs::remove_dir_all(root).unwrap();
@@ -2351,6 +2444,187 @@ mod repository_task_component_tests {
         assert_eq!(model.calls.load(Ordering::Relaxed), 3);
         assert_eq!(terminal.calls.load(Ordering::Relaxed), 8);
         assert_eq!(command.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            task_outcome(restarted.fiber_state("repository-task")),
+            Ok(())
+        );
+        restarted.shutdown_persistent().unwrap();
+        assert!(restarted.is_observationally_clean());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn terminal_exchange_categories_fail_the_root_and_replay_without_calls() {
+        for (failure, category) in [
+            (Some(ExchangeFailure::Authentication), "authentication"),
+            (Some(ExchangeFailure::RequestRejected), "request-rejected"),
+            (Some(ExchangeFailure::RemoteFailed), "remote-failed"),
+            (Some(ExchangeFailure::EmptyResponse), "empty-response"),
+            (Some(ExchangeFailure::ResponseLimit), "response-limit"),
+            (None, "protocol"),
+            (Some(ExchangeFailure::Ambiguous), "ambiguous"),
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "quartz-repository-outcome-{category}-{}",
+                std::process::id()
+            ));
+            if root.exists() {
+                fs::remove_dir_all(&root).unwrap();
+            }
+            fs::create_dir_all(&root).unwrap();
+            let session = root.join("session");
+            fs::create_dir(&session).unwrap();
+            let input = root.join("task-input.json");
+            let source_a = root.join("a.txt");
+            let source_b = root.join("b.txt");
+            fs::write(&source_a, "a\n").unwrap();
+            fs::write(&source_b, "b\n").unwrap();
+            fs::write(
+                &input,
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "schema": 2,
+                    "task": "replace both files",
+                    "argv": ["/usr/bin/true"],
+                    "sources": ["a.txt", "b.txt"],
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let fixtures = PathBuf::from(env!("QUARTZ_FIXTURE_DIR"));
+            let events = session.join("task.qe");
+            let limits = proposal_limits();
+            let persistence = || {
+                ComponentSpec::new("event-store", artifact(&fixtures, "event-store"))
+                    .with_journal_paths(vec![session.join("composition.qj")])
+                    .with_event_stream_paths(vec![events.clone()])
+            };
+            let model = failure.map_or_else(FailingAdapter::invalid_response, FailingAdapter::new);
+            let adapters = || {
+                vec![
+                    model.clone() as Arc<dyn ExchangeAdapter>,
+                    ScriptedAdapter::new("terminal", Vec::new()) as Arc<dyn ExchangeAdapter>,
+                    ScriptedAdapter::new("command", Vec::new()) as Arc<dyn ExchangeAdapter>,
+                ]
+            };
+            let app = task_tree(
+                &fixtures,
+                &session,
+                &events,
+                &input,
+                &[source_a, source_b],
+                limits,
+                "repository-task-a",
+            )
+            .unwrap();
+
+            let mut runtime =
+                Runtime::open_persistent_with_exchanges(limits, persistence(), adapters()).unwrap();
+            runtime.apply_tree(app).unwrap();
+            let failed = Some(FiberState::Failed(category.into()));
+            assert_eq!(runtime.fiber_state("repository-task"), failed);
+            assert_eq!(
+                task_outcome(runtime.fiber_state("repository-task")),
+                Err(format!("task failed: {category}"))
+            );
+            assert_eq!(model.calls.load(Ordering::Relaxed), 1);
+            drop(runtime);
+
+            let mut restarted =
+                Runtime::open_persistent_with_exchanges(limits, persistence(), adapters()).unwrap();
+            assert_eq!(restarted.fiber_state("repository-task"), failed);
+            assert_eq!(model.calls.load(Ordering::Relaxed), 1);
+            restarted.shutdown_persistent().unwrap();
+            assert!(restarted.is_observationally_clean());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn user_stop_fails_the_root_and_replays_without_calls() {
+        let root = std::env::temp_dir().join(format!(
+            "quartz-repository-outcome-stop-{}",
+            std::process::id()
+        ));
+        if root.exists() {
+            fs::remove_dir_all(&root).unwrap();
+        }
+        fs::create_dir_all(&root).unwrap();
+        let session = root.join("session");
+        fs::create_dir(&session).unwrap();
+        let input = root.join("task-input.json");
+        let source_a = root.join("a.txt");
+        let source_b = root.join("b.txt");
+        fs::write(&source_a, "a\n").unwrap();
+        fs::write(&source_b, "b\n").unwrap();
+        fs::write(
+            &input,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": 2,
+                "task": "replace both files",
+                "argv": ["/usr/bin/true"],
+                "sources": ["a.txt", "b.txt"],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let fixtures = PathBuf::from(env!("QUARTZ_FIXTURE_DIR"));
+        let events = session.join("task.qe");
+        let limits = proposal_limits();
+        let persistence = || {
+            ComponentSpec::new("event-store", artifact(&fixtures, "event-store"))
+                .with_journal_paths(vec![session.join("composition.qj")])
+                .with_event_stream_paths(vec![events.clone()])
+        };
+        let model = ScriptedAdapter::new(
+            "openai-responses",
+            vec![format!(
+                r#"{{"proposals":[{{"path":"a.txt","source_sha256":"{}","byte_start":0,"byte_end":2,"replacement":"alpha\n"}},{{"path":"b.txt","source_sha256":"{}","byte_start":0,"byte_end":2,"replacement":"beta\n"}}]}}"#,
+                digest(b"a\n"),
+                digest(b"b\n")
+            )],
+        );
+        let terminal = ScriptedAdapter::new("terminal", vec!["stop\n".into()]);
+        let adapters = || {
+            vec![
+                model.clone() as Arc<dyn ExchangeAdapter>,
+                terminal.clone() as Arc<dyn ExchangeAdapter>,
+                ScriptedAdapter::new("command", Vec::new()) as Arc<dyn ExchangeAdapter>,
+            ]
+        };
+        let app = task_tree(
+            &fixtures,
+            &session,
+            &events,
+            &input,
+            &[source_a, source_b],
+            limits,
+            "repository-task-a",
+        )
+        .unwrap();
+
+        let mut runtime =
+            Runtime::open_persistent_with_exchanges(limits, persistence(), adapters()).unwrap();
+        runtime.apply_tree(app).unwrap();
+        assert_eq!(
+            runtime.fiber_state("repository-task"),
+            Some(FiberState::Failed("stop".into()))
+        );
+        assert_eq!(
+            task_outcome(runtime.fiber_state("repository-task")),
+            Err("task failed: stop".into())
+        );
+        assert_eq!(model.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(terminal.calls.load(Ordering::Relaxed), 1);
+        drop(runtime);
+
+        let mut restarted =
+            Runtime::open_persistent_with_exchanges(limits, persistence(), adapters()).unwrap();
+        assert_eq!(
+            restarted.fiber_state("repository-task"),
+            Some(FiberState::Failed("stop".into()))
+        );
+        assert_eq!(model.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(terminal.calls.load(Ordering::Relaxed), 1);
         restarted.shutdown_persistent().unwrap();
         assert!(restarted.is_observationally_clean());
         fs::remove_dir_all(root).unwrap();

@@ -47,6 +47,7 @@
   command evidence and exact post-command admitted sources; it yields one
   corrected proposal generation or explicit completion.
 - **Supervised task** — the user-driven repository loop that reviews current candidates, separately approves publication and exact command argv, and reconstructs from durable facts.
+- **Terminal failure category** — one bounded, non-secret generic component outcome reconstructed from durable exchange state and exposed through `FiberState::Failed`; categories describe authority, protocol, limit, remote, stop, or ambiguity without retaining sensitive diagnostics.
 - **Workspace grant** — one exact host-admitted source file, mutation ledger,
   byte bound, and mutable guest buffer exposed by index; publication binds its
   current before/result digests and operation identity atomically.

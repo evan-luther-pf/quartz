@@ -139,6 +139,15 @@ reviewed and promoted before a renewed command approval. Restart derives one
 owed action from facts. Successful, denied, failed, and interrupted external
 operations are never repeated.
 
+Task outcome is truthful at the process boundary. Only explicit `COMPLETE`
+leaves the repository-task root active and returns exit 0. Stop and terminal
+exchange failures produce fixed non-secret categories in generic
+`FiberState::Failed`; `quartz task` inspects only that state, shuts down cleanly,
+and returns exit 2. Exchange ledger schema 2 preserves authentication,
+request-rejected, remote-failed, empty-response, response-limit, protocol, and
+ambiguous outcomes. Replay returns the same category without another adapter
+call; diagnostics expose no exchange body, header, credential, task, or source.
+
 This workflow required no WIT extension. ABI 11's generic snapshot, exchange,
 event, workspace, and callable capabilities carry the repository-task protocol;
 the kernel has no repository-specific state machine or policy switch.
@@ -148,8 +157,9 @@ The executable and component directory form a relocatable bundle;
 
 ## Next boundary
 
-Slice D is closed. No next product slice is committed; further agent or tool
-surface waits for an explicit capability contract and acceptance scenario.
+Slice D, including truthful task outcome semantics, is closed. Slice E remains
+uncommitted until its bounded repository manifest and window contract is
+accepted.
 
 ## Non-goals
 
