@@ -15,7 +15,7 @@ from one append-only event stream. The model never selects or changes argv.
 
 The component:
 
-1. requests strict schema-2 ranged edits;
+1. requests strict schema-3 line-addressed edits;
 2. validates and materializes each generation;
 3. supports repeated rejection and correction;
 4. separately reviews, publishes, and promotes each accepted generation;
@@ -54,25 +54,31 @@ failure shutdown recover every live fiber, capability, and accumulated effect.
 
 ## Proposal protocol
 
-Initial responses contain only `proposals`. Each proposal contains exactly:
+Schema-3 sessions are a clean cutover; retained schema-2 sessions are not
+resumable. Every model prompt renders each admitted UTF-8 source under its
+stable numeric path index with 1-based line numbers. Paths, source digests,
+result digests, and byte offsets remain component-owned and never appear as
+model-authored fields.
 
-- one admitted canonical relative `path`;
-- lowercase `source_sha256` for that admitted source;
-- half-open `byte_start` and `byte_end` UTF-8 byte offsets; and
-- exact UTF-8 `replacement` text.
+Initial responses contain only `proposals`. Each proposal contains exactly
+`path_index`, inclusive `start_line`, inclusive `end_line`, and exact UTF-8
+`replacement`. Revision responses contain only `start_line`, `end_line`, and
+`replacement`; they remain bound to the rejected generation's path index.
+Continuations are exactly
+`PROPOSE <path-index>\n<line-edit JSON>` or
+`COMPLETE\n<bounded summary>`.
 
-Revision responses contain only one `proposal` with the same fields and path as
-the rejected generation. Continuations are exactly
-`PROPOSE <admitted-path-index>\n<strict ranged-edit JSON>` or
-`COMPLETE\n<bounded summary>`; continuation JSON omits `path` because the
-numeric index selects it. Unknown fields and model-authored result digests are
-rejected.
+The component maps the inclusive line range to the exact complete-line byte
+span, including each selected line's existing terminator. Bytes outside that
+span are unchanged. Materialization preserves whether the file ends in a
+newline and does not normalize LF or CRLF bytes. Empty replacement is valid
+only when the resulting file remains non-empty. The component computes full
+source and result SHA-256 identities after materialization.
 
-The component checks source identity, range order and bounds, UTF-8 boundaries,
-result size, non-empty and changed output, unique initial source selection,
-monotonic revision and command identities, and adjacency to the prompting fact.
-It materializes the result and computes the result SHA-256 itself. Stale,
-tampered, out-of-order, and post-completion facts fail closed.
+Admission rejects invalid path indices, zero, reversed, or out-of-range lines,
+duplicate initial path indices, unknown or legacy fields, unchanged results,
+invalid UTF-8, oversized results, source drift, non-monotonic revisions,
+out-of-order facts, and post-completion facts.
 
 ## Boundary
 
@@ -172,6 +178,23 @@ otherwise well-shaped two-proposal response selected README byte range
 5362..5532 against a 4,782-byte admitted source. No review, mutation, promotion,
 or command ran. Reopening the session returned the same failure in 0.59 seconds;
 the provider ledger SHA-256 was unchanged, proving zero repeated model calls.
+
+The first real schema-3 line-edit task produced valid proposals for both
+admitted files, then required five reviewed corrections for exact wording and
+paragraph spacing. Two accepted generations were published and promoted. The
+exact `cargo test --workspace --all-targets` attempt ran once, timed out with
+signal 9 after 223,009 ms, and returned no exit code. Although its captured
+output showed the main binary's 20 tests passing, the complete all-target result
+was not established. The model then returned `COMPLETE` against failed command
+evidence; the component correctly rejected it as `protocol`.
+
+That run lasted 417 seconds after credential entry: seven successful model calls
+used 34,546 tokens; ten terminal exchanges recorded five rejections, two
+candidate approvals, two promotion approvals, and one command approval; one
+command ran. Reopening the failed session returned the same `protocol` result in
+0.62 seconds. Model, terminal, command, and both mutation-ledger SHA-256 values
+were unchanged, proving zero repeated effects. The accurate 21-line
+documentation diff remains uncommitted because validation did not complete.
 
 The credentialed smoke command is:
 

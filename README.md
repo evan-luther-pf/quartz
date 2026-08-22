@@ -82,18 +82,21 @@ OPENAI_API_KEY="$OPENAI_API_KEY" cargo run --release -p quartz -- \
 ```
 
 Quartz admits 2 through 64 canonical UTF-8 source files and runs the task state
-machine in a sandboxed WASM component. The initial model response is strict
-JSON containing at least two digest-bound UTF-8 ranged edits. Each generation
-is reviewed with `approve`, `reject <feedback>`, or `stop`; rejection requests
-one corrected revision of that same proposal. Every accepted generation is
-published before Quartz requests separate approval for the exact CLI-supplied
-command vector.
+machine in a sandboxed WASM component. Schema-3 prompts render each source with
+a stable numeric path index and 1-based line numbers. Model proposals contain
+only `path_index`, inclusive `start_line` and `end_line`, and exact replacement
+text; the component owns paths, byte mapping, and source/result digests.
+
+Each generation is reviewed with `approve`, `reject <feedback>`, or `stop`;
+rejection requests one corrected revision of that same proposal. Every accepted
+generation is published before Quartz requests separate approval for the exact
+CLI-supplied command vector.
 
 Quartz durably records command start and the bounded terminal result, including
-the exact argv and before/after source identities. The continuation model must
-return either `PROPOSE <source-index>` followed by one strict ranged-edit JSON
-object, or `COMPLETE` followed by a summary. Failure always continues through
-`PROPOSE`; `COMPLETE` is accepted only after command success.
+the exact argv and before/after source identities. Continuation is either
+`PROPOSE <path-index>` followed by one strict line-edit JSON object, or
+`COMPLETE` followed by a summary. Failure always continues through `PROPOSE`;
+`COMPLETE` is accepted only after command success.
 
 Only explicit `COMPLETE` returns exit 0. Stop or a terminal model, terminal, or
 command exchange failure recovers live state and returns exit 2. Responses

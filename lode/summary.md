@@ -123,17 +123,18 @@ I/O, exact approved process spawning, durable storage, and host-owned atomic
 publication.
 
 `quartz task` admits a task, 2 through 64 canonical UTF-8 source files, and one
-exact CLI argv. Initial and revised proposals are strict digest-anchored,
-half-open UTF-8 ranged edits. Quartz materializes results and computes their
-digests; model-authored result digests, unknown fields, stale sources, invalid
-ranges, and unchanged results fail closed. Rejection requests another revision
-of the same proposal. Every accepted generation is reviewed, published, and
-promoted before command approval.
+exact CLI argv. Schema-3 model proposals select only numeric path indices,
+inclusive 1-based line ranges, and replacement text. Quartz maps lines to exact
+byte spans and computes source and result digests; model-authored paths,
+digests, byte offsets, unknown fields, stale sources, invalid ranges, and
+unchanged results fail closed. Rejection requests another revision of the same
+proposal. Every accepted generation is reviewed, published, and promoted before
+command approval.
 
 Command start is durable before process spawn. The strict `CommandFinished`
 payload binds the request digest, exact argv, attempt, bounded outputs, terminal
 status, and before/after identities and bytes for every admitted source.
-Continuation is exactly one indexed ranged edit or an explicit bounded
+Continuation is exactly one indexed line edit or an explicit bounded
 completion summary. Failure cannot complete; a corrected generation must be
 reviewed and promoted before a renewed command approval. Restart derives one
 owed action from facts. Successful, denied, failed, and interrupted external
@@ -158,9 +159,10 @@ The executable and component directory form a relocatable bundle;
 
 ## Next boundary
 
-Slice D, including truthful and structured provider outcome semantics, is
-closed. The latest real task reached a successful provider response but failed
-its digest-bound proposal range checks. Slice E remains uncommitted.
+Slice D, including truthful provider outcomes and schema-3 line-addressed
+proposals, is closed. The latest real task reached reviewed and promoted
+candidates; its exact all-target validation timed out, and the model's invalid
+post-failure `COMPLETE` was rejected as `protocol`. Slice E remains uncommitted.
 
 ## Non-goals
 

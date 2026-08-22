@@ -267,25 +267,23 @@ shutdown, and asserts a clean live context.
 
 ### Repository-task verification
 
-`cargo test --workspace` passes 80 contracts across 13 suites. The standalone
-repository-task crate adds four native unit contracts for strict
-initial/revision/continuation grammar, repeated correction, command evidence,
-UTF-8 and digest bounds, unknown fields, and completion gating. The kernel also
-checks that recovery accepts a contiguous chain of promoted correction
-generations while rejecting unrecorded source drift. Host integration contracts
-load the real WASM artifact and cover A-to-B governed replacement, exact argv,
-promotion-before-command, failed-command correction, explicit success
-completion, structured failed/cancelled/incomplete terminal outcomes, safe
-terminal usage and response-ID hashing, invalid-response protocol failure, user
-stop, clean failed-root recovery, identical replay without adapter calls, final
-restart, and no repeated exchange or process call. Slice 6 retains the generic
-started/terminal exchange crash contracts, including durable ambiguity and
-cached-success replay.
+`cargo test --workspace --all-targets` passes 80 contracts across 12 suites; the
+standalone repository-task crate adds five native unit contracts for schema-3
+initial/revision/continuation line grammar, first/middle/final line mapping,
+terminal-newline and CRLF preservation, empty replacement, repeated correction,
+legacy-field rejection, command evidence, source drift, unknown fields, and
+completion gating. The kernel also checks that recovery accepts a contiguous
+chain of promoted correction generations while rejecting unrecorded source
+drift. Host integration contracts load the real WASM artifact and cover A-to-B
+governed replacement, exact argv, promotion-before-command, failed-command
+correction, explicit success completion, structured terminal outcomes, invalid
+response and user stop, clean recovery, identical replay without adapter calls,
+and no repeated exchange or process call.
 
 Release packaging writes 50 manifest-bearing WASM files into `components/`
 beside the executable and deletes stale staged artifacts first. On arm64 macOS,
 the current stripped release executable is 17,837,968 bytes, the component
-directory is 1,489,435 bytes, and each repository-task artifact is 236,259
+directory is 1,507,219 bytes, and each repository-task artifact is 239,223
 bytes. Copying the executable and directory to `/tmp/quartz-relocated-smoke`
 and running `quartz --acceptance` loaded the relocated artifacts, completed the
 full scenario, and reported a clean context without `QUARTZ_COMPONENT_DIR`.

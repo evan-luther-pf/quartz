@@ -6,14 +6,14 @@ Quartz can durably produce a model response and can publish one pre-admitted
 workspace, but sandboxed code cannot read a source path or reconstruct a
 repository edit without host admission. A coding harness needs to preserve
 model-authored intent across restart, keep the repository unchanged during
-review, and apply only an exact digest-anchored ranged edit the host has verified.
+review, and apply only an exact line-addressed edit the component has materialized and verified.
 
 ## Observable behavior
 
-A production response carries a source digest, half-open UTF-8 byte range, exact
-replacement bytes, and expected result digest. The host applies the range to the
-exact admitted source in memory and verifies the result digest before admitting
-the materialized bytes to the existing sandboxed proposal editor. The process
+A production response selects an admitted numeric path index, inclusive 1-based
+line range, and exact replacement text. The component maps the range onto the
+exact admitted source bytes, computes both digests, and admits only the verified
+materialized bytes to the existing sandboxed proposal editor. The process
 may stop with no repository mutation. A fresh runtime reconstructs the response,
 repeats materialization from durable source evidence, and exposes only the
 verified result through one host-admitted snapshot and workspace. Approval binds
@@ -32,11 +32,11 @@ drift, stale source state, or missing authority leaves the source unchanged.
 
 - Durable event payload bytes remain host-owned and bounded by the existing event-stream record, per-payload, total-payload, and read-index limits.
 - Payload reads require explicit manifest capabilities and a committed event-stream provider view. They are available only during activation or callable dispatch, matching scalar event reads.
-- A product proposal is one strict ranged edit. The range is half-open, bounded
-  by the exact source bytes, and begins and ends on UTF-8 boundaries.
-- Host materialization must produce the declared result digest, valid non-empty
-  UTF-8, changed bytes, and a result within the workspace bound before sandboxed
-  code receives it.
+- A product proposal selects one host-admitted source by numeric index and one
+  inclusive 1-based line range. The component maps that range to an exact
+  complete-line byte span, materializes exact replacement bytes, preserves
+  bytes outside the range and final-newline behavior, and computes source and
+  result identities itself.
 - The proposal editor remains admitted for one canonical source and exact
   materialized result digest; it cannot widen the workspace byte bound.
 - Copying materialized bytes mutates only the editor fiber's private workspace
@@ -53,11 +53,11 @@ drift, stale source state, or missing authority leaves the source unchanged.
 
 ## Superseded implementation decision
 
-Slice 8 used a complete-file model payload. Slice C replaced that product
-representation with a digest-anchored ranged edit and deleted the complete-file
-parser. The existing ABI still carries verified full workspace bytes because
-the host materializes and checks the range before admission; this is mechanism,
-not a second candidate representation.
+Slice 8 used a complete-file model payload. Slice C introduced digest-anchored
+byte ranges. The repository-task protocol now exposes only line addresses and a
+numeric admitted-path index to the model; it deletes model-authored paths,
+digests, and byte offsets while retaining the same host-verified byte candidate
+and ABI underneath.
 
 Host-only path selection remains until Slice E admits a canonical path/digest
 manifest selected only by numeric index. Model-authored path strings and ambient

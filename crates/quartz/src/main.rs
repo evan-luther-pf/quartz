@@ -394,7 +394,7 @@ fn run_task(
     }
     commands::validate_argv(argv)?;
     let input = serde_json::to_vec_pretty(&serde_json::json!({
-        "schema": 2,
+        "schema": 3,
         "task": task_text,
         "argv": argv,
         "sources": source_names,
@@ -2186,7 +2186,7 @@ mod repository_task_component_tests {
         fs::write(
             &input,
             serde_json::to_vec_pretty(&serde_json::json!({
-                "schema": 2,
+                "schema": 3,
                 "task": "replace both files",
                 "argv": ["/usr/bin/true"],
                 "sources": ["a.txt", "b.txt"],
@@ -2206,11 +2206,7 @@ mod repository_task_component_tests {
         let model = ScriptedAdapter::new(
             "openai-responses",
             vec![
-                format!(
-                    r#"{{"proposals":[{{"path":"a.txt","source_sha256":"{}","byte_start":0,"byte_end":2,"replacement":"alpha\n"}},{{"path":"b.txt","source_sha256":"{}","byte_start":0,"byte_end":2,"replacement":"beta\n"}}]}}"#,
-                    digest(b"a\n"),
-                    digest(b"b\n")
-                ),
+                r#"{"proposals":[{"path_index":0,"start_line":1,"end_line":1,"replacement":"alpha\n"},{"path_index":1,"start_line":1,"end_line":1,"replacement":"beta\n"}]}"#.into(),
                 "COMPLETE\nAll checks passed.".into(),
             ],
         );
@@ -2353,7 +2349,7 @@ mod repository_task_component_tests {
         fs::write(
             &input,
             serde_json::to_vec_pretty(&serde_json::json!({
-                "schema": 2,
+                "schema": 3,
                 "task": "replace both files and correct the failed command",
                 "argv": command_argv,
                 "sources": ["a.txt", "b.txt"],
@@ -2373,17 +2369,12 @@ mod repository_task_component_tests {
         let model = ScriptedAdapter::new(
             "openai-responses",
             vec![
-                format!(
-                    r#"{{"proposals":[{{"path":"a.txt","source_sha256":"{}","byte_start":0,"byte_end":2,"replacement":"alpha\n"}},{{"path":"b.txt","source_sha256":"{}","byte_start":0,"byte_end":2,"replacement":"beta\n"}}]}}"#,
-                    digest(b"a\n"),
-                    digest(b"b\n")
-                ),
+                r#"{"proposals":[{"path_index":0,"start_line":1,"end_line":1,"replacement":"alpha\n"},{"path_index":1,"start_line":1,"end_line":1,"replacement":"beta\n"}]}"#.into(),
                 format!(
                     "PROPOSE 0\n{}",
                     serde_json::json!({
-                        "source_sha256": digest(b"alpha\n"),
-                        "byte_start": 0,
-                        "byte_end": 6,
+                        "start_line": 1,
+                        "end_line": 1,
                         "replacement": "alpha corrected\n",
                     })
                 ),
@@ -2564,7 +2555,7 @@ mod repository_task_component_tests {
             fs::write(
                 &input,
                 serde_json::to_vec_pretty(&serde_json::json!({
-                    "schema": 2,
+                    "schema": 3,
                     "task": "replace both files",
                     "argv": ["/usr/bin/true"],
                     "sources": ["a.txt", "b.txt"],
@@ -2651,7 +2642,7 @@ mod repository_task_component_tests {
         fs::write(
             &input,
             serde_json::to_vec_pretty(&serde_json::json!({
-                "schema": 2,
+                "schema": 3,
                 "task": "replace both files",
                 "argv": ["/usr/bin/true"],
                 "sources": ["a.txt", "b.txt"],
@@ -2669,11 +2660,7 @@ mod repository_task_component_tests {
         };
         let model = ScriptedAdapter::new(
             "openai-responses",
-            vec![format!(
-                r#"{{"proposals":[{{"path":"a.txt","source_sha256":"{}","byte_start":0,"byte_end":2,"replacement":"alpha\n"}},{{"path":"b.txt","source_sha256":"{}","byte_start":0,"byte_end":2,"replacement":"beta\n"}}]}}"#,
-                digest(b"a\n"),
-                digest(b"b\n")
-            )],
+            vec![r#"{"proposals":[{"path_index":0,"start_line":1,"end_line":1,"replacement":"alpha\n"},{"path_index":1,"start_line":1,"end_line":1,"replacement":"beta\n"}]}"#.into()],
         );
         let terminal = ScriptedAdapter::new("terminal", vec!["stop\n".into()]);
         let adapters = || {
