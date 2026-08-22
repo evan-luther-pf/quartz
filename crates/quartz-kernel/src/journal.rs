@@ -757,6 +757,10 @@ impl MutationLedger {
         self.records.get(&operation)
     }
 
+    pub(crate) fn records(&self) -> impl Iterator<Item = &MutationLedgerRecord> + Clone {
+        self.records.values()
+    }
+
     pub(crate) fn append_promotion_intent(
         &mut self,
         operation: u64,

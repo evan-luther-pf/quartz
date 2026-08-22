@@ -2,7 +2,7 @@ use crate::{
     Error, HostCapability, Result,
     component::{FiberId, TraceEvent},
     fiber::{Core, InternalState, Inverse},
-    journal::{DurablePayload, EventFact, EventRecord, EventStream, JournalSnapshot},
+    journal::{DurablePayload, EventFact, EventRecord, EventStream, JournalSnapshot, sha256_hex},
     runtime::Runtime,
     wasm_host::{
         STATUS_BUSY, STATUS_COLLISION, STATUS_INVALID, STATUS_LIMIT, STATUS_OK, STATUS_UNDECLARED,
@@ -15,10 +15,12 @@ pub(crate) struct PendingEvent {
     pub(crate) index: usize,
     pub(crate) value: u64,
     pub(crate) payload: Option<DurablePayload>,
+    pub(crate) reactivate: bool,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) enum EventPayloadSource {
+    Buffered,
     None,
     Snapshot(u64),
     Exchange,
@@ -122,6 +124,7 @@ impl Runtime {
             .pending_events
             .remove(position)
             .ok_or_else(|| Error::Invariant("eligible event request disappeared".into()))?;
+        let reactivate = request.reactivate;
         let candidate = {
             let core = self.core.borrow();
             let Some(actor) = core.fibers.get(&request.actor) else {
@@ -188,6 +191,15 @@ impl Runtime {
             }
             return Err(failure.error);
         }
+        if reactivate {
+            let mut core = self.core.borrow_mut();
+            if let Some(actor) = core.fibers.get_mut(&request.actor)
+                && actor.state == InternalState::Active
+            {
+                actor.state = InternalState::Activating;
+                actor.activation_steps = 0;
+            }
+        }
         Ok(true)
     }
 }
@@ -250,6 +262,59 @@ impl Core {
         });
         STATUS_OK
     }
+    pub(crate) fn host_event_buffer_set_len(&mut self, fiber: FiberId, length: u64) -> i32 {
+        let Ok(length) = usize::try_from(length) else {
+            return STATUS_LIMIT;
+        };
+        let Some(record) = self.fibers.get_mut(&fiber) else {
+            return STATUS_INVALID;
+        };
+        if record.state != InternalState::Activating
+            || !record
+                .spec
+                .artifact
+                .manifest
+                .requests(HostCapability::EventBufferWrite)
+        {
+            return STATUS_UNDECLARED;
+        }
+        if length > self.limits.max_payload_bytes {
+            return STATUS_LIMIT;
+        }
+        record.event_buffer.resize(length, 0);
+        STATUS_OK
+    }
+
+    pub(crate) fn host_event_buffer_write_byte(
+        &mut self,
+        fiber: FiberId,
+        offset: u64,
+        value: u32,
+    ) -> i32 {
+        let Ok(offset) = usize::try_from(offset) else {
+            return STATUS_INVALID;
+        };
+        let Ok(value) = u8::try_from(value) else {
+            return STATUS_INVALID;
+        };
+        let Some(record) = self.fibers.get_mut(&fiber) else {
+            return STATUS_INVALID;
+        };
+        if record.state != InternalState::Activating
+            || !record
+                .spec
+                .artifact
+                .manifest
+                .requests(HostCapability::EventBufferWrite)
+        {
+            return STATUS_UNDECLARED;
+        }
+        let Some(byte) = record.event_buffer.get_mut(offset) else {
+            return STATUS_INVALID;
+        };
+        *byte = value;
+        STATUS_OK
+    }
 
     pub(crate) fn host_append_event(
         &mut self,
@@ -257,6 +322,7 @@ impl Core {
         index: u64,
         value: u64,
         resumable: bool,
+        reactivate: bool,
         payload_source: EventPayloadSource,
     ) -> i32 {
         if value > i64::MAX as u64 {
@@ -270,8 +336,12 @@ impl Core {
                 return STATUS_INVALID;
             };
             let capability = match payload_source {
+                EventPayloadSource::Exchange if reactivate => HostCapability::ContinueExchange,
+                EventPayloadSource::Buffered if reactivate => HostCapability::ContinueBufferedEvent,
                 EventPayloadSource::None if resumable => HostCapability::ResumeEvent,
                 EventPayloadSource::None => HostCapability::AppendEvent,
+                EventPayloadSource::Buffered if resumable => HostCapability::ResumeBufferedEvent,
+                EventPayloadSource::Buffered => HostCapability::AppendBufferedEvent,
                 EventPayloadSource::Snapshot(_) => HostCapability::ResumeSnapshot,
                 EventPayloadSource::Exchange => HostCapability::ResumeExchange,
             };
@@ -294,6 +364,16 @@ impl Core {
                 return STATUS_UNSATISFIED;
             }
             let payload = match payload_source {
+                EventPayloadSource::Buffered => Some(DurablePayload {
+                    provenance: format!(
+                        "{}@{}#{}",
+                        record.spec.artifact.manifest.module,
+                        record.spec.artifact.manifest.version,
+                        record.spec.artifact.digest
+                    ),
+                    sha256: sha256_hex(&record.event_buffer),
+                    bytes: record.event_buffer.clone(),
+                }),
                 EventPayloadSource::None => None,
                 EventPayloadSource::Snapshot(snapshot_index) => {
                     let Ok(snapshot_index) = usize::try_from(snapshot_index) else {
@@ -364,6 +444,7 @@ impl Core {
             actor: fiber,
             index,
             value,
+            reactivate,
             payload,
         });
         if matches!(payload_source, EventPayloadSource::Exchange)

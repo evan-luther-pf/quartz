@@ -43,8 +43,8 @@ pub(crate) struct Core {
     pub(crate) journal_failure: Option<Error>,
     pub(crate) event_stream: Option<EventStreamRegistration>,
     pub(crate) event_failure: Option<Error>,
-    pub(crate) exchange: Option<ExchangeRegistration>,
-    pub(crate) exchange_adapter: Option<Arc<dyn ExchangeAdapter>>,
+    pub(crate) exchange: BTreeMap<FiberId, ExchangeRegistration>,
+    pub(crate) exchange_adapters: BTreeMap<String, Arc<dyn ExchangeAdapter>>,
     pub(crate) exchange_failure: Option<Error>,
     pub(crate) exchange_workers: Vec<std::thread::JoinHandle<()>>,
     pub(crate) replaying: bool,
@@ -67,6 +67,7 @@ pub(crate) struct Fiber {
     pub(crate) staged_response: Option<DurablePayload>,
     pub(crate) staged_usage: Option<u64>,
     pub(crate) inbound_response: Option<DurablePayload>,
+    pub(crate) event_buffer: Vec<u8>,
     pub(crate) workspace_buffers: Vec<Vec<u8>>,
     pub(crate) workspace_authorization: Option<WorkspaceAuthorization>,
     pub(crate) promotion_authorization: Option<PromotionAuthorization>,
@@ -225,8 +226,8 @@ impl Core {
             journal_failure: None,
             event_stream: None,
             event_failure: None,
-            exchange: None,
-            exchange_adapter: None,
+            exchange: BTreeMap::new(),
+            exchange_adapters: BTreeMap::new(),
             exchange_failure: None,
             exchange_workers: Vec::new(),
             replaying: false,
@@ -371,14 +372,9 @@ impl Core {
                 }
             }
             Inverse::CloseExchange { .. } => {
-                let registration = self.exchange.take().ok_or_else(|| {
+                self.exchange.remove(&fiber_id).ok_or_else(|| {
                     Error::Invariant("exchange inverse found no registered ledger".into())
                 })?;
-                if registration.owner != fiber_id {
-                    return Err(Error::Invariant(
-                        "exchange inverse targeted another provider".into(),
-                    ));
-                }
                 for worker in self.exchange_workers.drain(..) {
                     let _ = worker.join();
                 }
@@ -476,10 +472,7 @@ impl Core {
                 .event_stream
                 .as_ref()
                 .is_some_and(|stream| stream.owner == id)
-            || self
-                .exchange
-                .as_ref()
-                .is_some_and(|exchange| exchange.owner == id)
+            || self.exchange.contains_key(&id)
             || fiber.staged_response.is_some()
             || fiber.staged_usage.is_some()
             || fiber.inbound_response.is_some()
@@ -801,6 +794,7 @@ impl Fiber {
             staged_response: None,
             staged_usage: None,
             inbound_response: None,
+            event_buffer: Vec::new(),
             workspace_buffers,
             workspace_authorization: None,
             promotion_authorization: None,

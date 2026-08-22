@@ -31,6 +31,7 @@ pub struct WorkspaceGrant {
     pub provenance: String,
     pub before_sha256: String,
     pub result_sha256: String,
+    pub dynamic: bool,
     pub max_bytes: usize,
 }
 
@@ -85,6 +86,7 @@ impl WorkspaceGrant {
             provenance,
             before_sha256,
             result_sha256,
+            dynamic: false,
             max_bytes,
         })
     }
@@ -113,6 +115,46 @@ impl WorkspaceGrant {
             result_sha256,
             max_bytes,
         )
+    }
+
+    pub fn dynamic(
+        source_path: impl AsRef<Path>,
+        ledger_path: impl AsRef<Path>,
+        provenance: impl Into<String>,
+        max_bytes: usize,
+    ) -> Result<Self> {
+        let source_path =
+            fs::canonicalize(source_path.as_ref()).map_err(|source| Error::WorkspaceIo {
+                operation: "canonicalize source",
+                path: source_path.as_ref().to_path_buf(),
+                source,
+            })?;
+        let metadata = fs::symlink_metadata(&source_path).map_err(|source| Error::WorkspaceIo {
+            operation: "inspect source",
+            path: source_path.clone(),
+            source,
+        })?;
+        if !metadata.file_type().is_file() || max_bytes == 0 {
+            return Err(Error::Manifest(
+                "dynamic workspace source and byte bound must be valid".into(),
+            ));
+        }
+        let provenance = provenance.into();
+        if provenance.is_empty() {
+            return Err(Error::Manifest(
+                "dynamic workspace provenance must not be empty".into(),
+            ));
+        }
+        Ok(Self {
+            source_path,
+            ledger_path: canonical_output_path(ledger_path.as_ref())?,
+            operation: 0,
+            provenance,
+            before_sha256: String::new(),
+            result_sha256: String::new(),
+            dynamic: true,
+            max_bytes,
+        })
     }
 }
 
@@ -339,12 +381,17 @@ impl Runtime {
         let mut total_bytes = 0_usize;
         let mut workspaces = Vec::with_capacity(grants.len());
         for grant in grants {
-            if grant.operation == 0
-                || grant.provenance.is_empty()
+            if grant.provenance.is_empty()
                 || grant.max_bytes == 0
                 || grant.max_bytes > self.limits.max_workspace_bytes
-                || !valid_sha256(&grant.before_sha256)
-                || !valid_sha256(&grant.result_sha256)
+                || (!grant.dynamic
+                    && (grant.operation == 0
+                        || !valid_sha256(&grant.before_sha256)
+                        || !valid_sha256(&grant.result_sha256)))
+                || (grant.dynamic
+                    && (grant.operation != 0
+                        || !grant.before_sha256.is_empty()
+                        || !grant.result_sha256.is_empty()))
                 || !identities.insert((
                     grant.source_path.clone(),
                     grant.ledger_path.clone(),
@@ -403,6 +450,11 @@ impl Runtime {
         let mut workspaces = self.stage_workspaces(component_path, grants)?;
         for workspace in &mut workspaces {
             let grant = &workspace.grant;
+            if grant.dynamic {
+                workspace.bytes =
+                    Arc::from(read_workspace_source(&grant.source_path, grant.max_bytes)?);
+                continue;
+            }
             let source_bytes = read_workspace_source(&grant.source_path, grant.max_bytes)?;
             let source_sha256 = sha256_hex(&source_bytes);
             let mut ledger = if grant.ledger_path.exists() {
@@ -688,47 +740,64 @@ impl Core {
             )
         };
 
-        let publication = publish_workspace(
-            &grant,
-            &before_bytes,
-            &result_bytes,
-            self.limits.max_mutation_record_bytes,
-        );
-        let status = publication.as_ref().err().map(workspace_status);
-        if let Some(ownership) = publication_ownership(
-            &grant,
-            &before_bytes,
-            &result_bytes,
+        apply_workspace_publication(self, fiber, grant, before_bytes, result_bytes)
+    }
+
+    pub(crate) fn host_publish_dynamic_workspace(
+        &mut self,
+        fiber: FiberId,
+        index: u64,
+        operation: u64,
+    ) -> i32 {
+        let Ok(index) = usize::try_from(index) else {
+            return STATUS_INVALID;
+        };
+        let (template, result_bytes) = {
+            let Some(record) = self.fibers.get_mut(&fiber) else {
+                return STATUS_INVALID;
+            };
+            if record.state != InternalState::Activating
+                || !record
+                    .spec
+                    .artifact
+                    .manifest
+                    .requests(HostCapability::WorkspaceDynamicPublish)
+            {
+                return STATUS_UNDECLARED;
+            }
+            let Some(workspace) = record.spec.workspaces.get(index) else {
+                return STATUS_UNDECLARED;
+            };
+            if !workspace.grant.dynamic || operation == 0 {
+                return STATUS_INVALID;
+            }
+            let Some(authorization) = record.workspace_authorization.take() else {
+                return STATUS_DENIED;
+            };
+            if authorization.index != index
+                || authorization.operation != operation
+                || !record
+                    .committed
+                    .values()
+                    .any(|committed| committed.fiber == authorization.provider)
+            {
+                return STATUS_DENIED;
+            }
+            (
+                workspace.grant.clone(),
+                record.workspace_buffers[index].clone(),
+            )
+        };
+        let (grant, before_bytes, result_bytes) = match resolve_dynamic_workspace(
+            &template,
+            operation,
+            result_bytes,
             self.limits.max_mutation_record_bytes,
         ) {
-            let effect = self.allocate_effect();
-            let inverse = match ownership {
-                PublicationOwnership::Restore => Inverse::RestoreWorkspace {
-                    effect,
-                    grant,
-                    before_bytes,
-                    result_bytes,
-                },
-                PublicationOwnership::Promoted(approver) => Inverse::VerifyPromotedWorkspace {
-                    effect,
-                    grant,
-                    before_bytes,
-                    result_bytes,
-                    approver,
-                },
-            };
-            self.fibers
-                .get_mut(&fiber)
-                .expect("workspace owner checked above")
-                .accumulator
-                .push(inverse);
-            self.trace.push(TraceEvent::EffectApplied {
-                fiber,
-                effect,
-                kind: "workspace-publication".into(),
-            });
-        }
-        status.unwrap_or(STATUS_OK)
+            Ok(workspace) => workspace,
+            Err(error) => return workspace_status(&error),
+        };
+        apply_workspace_publication(self, fiber, grant, before_bytes, result_bytes)
     }
 
     pub(crate) fn host_promote_workspace(&mut self, fiber: FiberId, index: u64) -> i32 {
@@ -817,6 +886,227 @@ impl Core {
         }
         STATUS_OK
     }
+
+    pub(crate) fn host_promote_dynamic_workspace(
+        &mut self,
+        fiber: FiberId,
+        index: u64,
+        operation: u64,
+    ) -> i32 {
+        let Ok(index) = usize::try_from(index) else {
+            return STATUS_INVALID;
+        };
+        let (grant, before_bytes, result_bytes, approver, inverse_index, is_promoted) =
+            {
+                let Some(record) = self.fibers.get_mut(&fiber) else {
+                    return STATUS_INVALID;
+                };
+                if record.state != InternalState::Activating
+                    || !record
+                        .spec
+                        .artifact
+                        .manifest
+                        .requests(HostCapability::WorkspaceDynamicPromote)
+                {
+                    return STATUS_UNDECLARED;
+                }
+                let Some(workspace) = record.spec.workspaces.get(index) else {
+                    return STATUS_UNDECLARED;
+                };
+                if !workspace.grant.dynamic || operation == 0 {
+                    return STATUS_INVALID;
+                }
+                let Some(authorization) = record.promotion_authorization.take() else {
+                    return STATUS_DENIED;
+                };
+                if authorization.index != index
+                    || authorization.operation != operation
+                    || !record
+                        .committed
+                        .values()
+                        .any(|committed| committed.fiber == authorization.provider)
+                {
+                    return STATUS_DENIED;
+                }
+                let Some((inverse_index, is_promoted, grant, before_bytes, result_bytes)) =
+                    record.accumulator.iter().enumerate().rev().find_map(
+                        |(inverse_index, inverse)| match inverse {
+                            Inverse::RestoreWorkspace {
+                                grant,
+                                before_bytes,
+                                result_bytes,
+                                ..
+                            } if grant.source_path == workspace.grant.source_path
+                                && grant.operation == operation =>
+                            {
+                                Some((
+                                    inverse_index,
+                                    false,
+                                    grant.clone(),
+                                    before_bytes.clone(),
+                                    result_bytes.clone(),
+                                ))
+                            }
+                            Inverse::VerifyPromotedWorkspace {
+                                grant,
+                                before_bytes,
+                                result_bytes,
+                                ..
+                            } if grant.source_path == workspace.grant.source_path
+                                && grant.operation == operation =>
+                            {
+                                Some((
+                                    inverse_index,
+                                    true,
+                                    grant.clone(),
+                                    before_bytes.clone(),
+                                    result_bytes.clone(),
+                                ))
+                            }
+                            _ => None,
+                        },
+                    )
+                else {
+                    return STATUS_DENIED;
+                };
+                (
+                    grant,
+                    before_bytes,
+                    result_bytes,
+                    authorization.approver,
+                    inverse_index,
+                    is_promoted,
+                )
+            };
+        if let Err(error) = promote_workspace(
+            &grant,
+            &before_bytes,
+            &result_bytes,
+            &approver,
+            self.replaying,
+            is_promoted,
+            self.limits.max_mutation_record_bytes,
+        ) {
+            return workspace_status(&error);
+        }
+        if !is_promoted {
+            let record = self
+                .fibers
+                .get_mut(&fiber)
+                .expect("workspace owner checked above");
+            let effect = record.accumulator[inverse_index].effect();
+            record.accumulator[inverse_index] = Inverse::VerifyPromotedWorkspace {
+                effect,
+                grant,
+                before_bytes,
+                result_bytes,
+                approver,
+            };
+        }
+        STATUS_OK
+    }
+}
+
+fn resolve_dynamic_workspace(
+    template: &WorkspaceGrant,
+    operation: u64,
+    result_bytes: Vec<u8>,
+    max_record_bytes: usize,
+) -> Result<(WorkspaceGrant, Vec<u8>, Vec<u8>)> {
+    if result_bytes.len() > template.max_bytes {
+        return Err(Error::WorkspaceBytesLimit {
+            limit: template.max_bytes,
+            actual: result_bytes.len(),
+        });
+    }
+    let existing = if template.ledger_path.exists() {
+        MutationLedger::open(&template.ledger_path, max_record_bytes)?
+            .lookup(operation)
+            .cloned()
+    } else {
+        None
+    };
+    let (before_bytes, expected_result) = if let Some(record) = existing {
+        if record.source_path != template.source_path
+            || record.provenance != template.provenance
+            || record.before_bytes.len() > template.max_bytes
+            || record.result_bytes.len() > template.max_bytes
+        {
+            return Err(Error::MutationCorrupt(format!(
+                "operation {operation} was reused with a different dynamic workspace"
+            )));
+        }
+        (record.before_bytes, Some(record.result_bytes))
+    } else {
+        (
+            read_workspace_source(&template.source_path, template.max_bytes)?,
+            None,
+        )
+    };
+    if expected_result
+        .as_ref()
+        .is_some_and(|expected| expected != &result_bytes)
+    {
+        return Err(Error::MutationCorrupt(format!(
+            "operation {operation} was reused with different result bytes"
+        )));
+    }
+    let mut grant = template.clone();
+    grant.operation = operation;
+    grant.before_sha256 = sha256_hex(&before_bytes);
+    grant.result_sha256 = sha256_hex(&result_bytes);
+    grant.dynamic = false;
+    Ok((grant, before_bytes, result_bytes))
+}
+
+fn apply_workspace_publication(
+    core: &mut Core,
+    fiber: FiberId,
+    grant: WorkspaceGrant,
+    before_bytes: Vec<u8>,
+    result_bytes: Vec<u8>,
+) -> i32 {
+    let publication = publish_workspace(
+        &grant,
+        &before_bytes,
+        &result_bytes,
+        core.limits.max_mutation_record_bytes,
+    );
+    let status = publication.as_ref().err().map(workspace_status);
+    if let Some(ownership) = publication_ownership(
+        &grant,
+        &before_bytes,
+        &result_bytes,
+        core.limits.max_mutation_record_bytes,
+    ) {
+        let effect = core.allocate_effect();
+        let inverse = match ownership {
+            PublicationOwnership::Restore => Inverse::RestoreWorkspace {
+                effect,
+                grant,
+                before_bytes,
+                result_bytes,
+            },
+            PublicationOwnership::Promoted(approver) => Inverse::VerifyPromotedWorkspace {
+                effect,
+                grant,
+                before_bytes,
+                result_bytes,
+                approver,
+            },
+        };
+        core.fibers
+            .get_mut(&fiber)
+            .expect("workspace owner checked above")
+            .accumulator
+            .push(inverse);
+        core.trace.push(TraceEvent::EffectApplied {
+            fiber,
+            effect,
+            kind: "workspace-publication".into(),
+        });
+    }
+    status.unwrap_or(STATUS_OK)
 }
 
 fn mutation_ledger_identity<'a>(
@@ -1080,6 +1370,31 @@ pub(crate) fn recover_workspace_publication(
     }
 }
 
+fn promoted_chain_reaches<'a>(
+    records: impl Iterator<Item = &'a MutationLedgerRecord> + Clone,
+    source_path: &Path,
+    first_result: &str,
+    current: &str,
+) -> bool {
+    let mut digest = first_result.to_owned();
+    let mut seen = BTreeSet::from([digest.clone()]);
+    while digest != current {
+        let mut successors = records.clone().filter(|record| {
+            record.source_path == source_path
+                && record.outcome == MutationLedgerOutcome::Promoted
+                && record.before_sha256 == digest
+        });
+        let Some(successor) = successors.next() else {
+            return false;
+        };
+        if successors.next().is_some() || !seen.insert(successor.result_sha256.clone()) {
+            return false;
+        }
+        digest.clone_from(&successor.result_sha256);
+    }
+    true
+}
+
 pub(crate) fn verify_promoted_workspace(
     grant: &WorkspaceGrant,
     before_bytes: &[u8],
@@ -1109,7 +1424,15 @@ pub(crate) fn verify_promoted_workspace(
         ));
     }
     let source_bytes = read_workspace_source(&grant.source_path, grant.max_bytes)?;
-    if sha256_hex(&source_bytes) == grant.result_sha256 {
+    let source_sha256 = sha256_hex(&source_bytes);
+    if source_sha256 == grant.result_sha256
+        || promoted_chain_reaches(
+            ledger.records(),
+            &grant.source_path,
+            &grant.result_sha256,
+            &source_sha256,
+        )
+    {
         return Ok(());
     }
     ledger.append_outcome(grant.operation, MutationLedgerOutcome::Ambiguous)?;
@@ -1207,5 +1530,45 @@ fn workspace_status(error: &Error) -> i32 {
         Error::MutationCorrupt(_) => STATUS_COLLISION,
         Error::MutationAmbiguous(_) => STATUS_AMBIGUOUS,
         _ => STATUS_INVALID,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn promoted(path: &Path, before: &str, result: &str) -> MutationLedgerRecord {
+        MutationLedgerRecord {
+            source_path: path.to_owned(),
+            provenance: "test".into(),
+            before_sha256: before.into(),
+            result_sha256: result.into(),
+            before_bytes: Vec::new(),
+            result_bytes: Vec::new(),
+            approver: Some("approver".into()),
+            outcome: MutationLedgerOutcome::Promoted,
+        }
+    }
+
+    #[test]
+    fn promoted_verification_accepts_only_a_contiguous_committed_chain() {
+        let path = Path::new("/repository/source");
+        let records = [
+            promoted(path, "original", "first"),
+            promoted(path, "first", "corrected"),
+        ];
+
+        assert!(promoted_chain_reaches(
+            records.iter(),
+            path,
+            "first",
+            "corrected"
+        ));
+        assert!(!promoted_chain_reaches(
+            records.iter(),
+            path,
+            "first",
+            "third-party"
+        ));
     }
 }

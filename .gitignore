@@ -1,4 +1,5 @@
 /target/
+/components/*/target/
 /.quartz/
 .DS_Store
 *.swp

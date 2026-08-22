@@ -1,0 +1,14 @@
+{
+  "abi": 11,
+  "module": "quartz.repository-task.command-provider",
+  "version": "0.1.0",
+  "execution_mode": "wasm-component",
+  "requested_host_capabilities": ["event-count", "event-payload-byte", "event-payload-len", "exchange", "open-exchange", "publish-callable", "read-event"],
+  "component": {
+    "id": "repository-command-provider",
+    "config_schema": "u64",
+    "max_activation_steps": 1,
+    "inject": [{"slot": 4, "kind": "callable", "namespace": "quartz.events", "interface": "stream", "min_revision": 1, "max_revision": 1}],
+    "provide": [{"slot": 32, "kind": "callable", "namespace": "quartz.exchange", "interface": "command", "revision": 1}]
+  }
+}

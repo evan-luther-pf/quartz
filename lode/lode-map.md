@@ -22,15 +22,14 @@
 - `capabilities/production-model-call.md` — credential-safe bounded exchange, durable ambiguity, and production Responses API calls.
 - `capabilities/isolated-repository-editing.md` — bounded mutable workspaces,
   callable approval, durable publication identity, and guarded recovery.
-- `capabilities/durable-reviewed-edit.md` — restart-stable model-authored
-  candidates, explicit exact-byte approval, and the current single-source
-  application constraint scheduled for ranged-edit replacement.
+- `capabilities/durable-reviewed-edit.md` — restart-stable digest-anchored
+  ranged candidates, explicit exact-byte approval, and single-source
+  publication recovery.
 - `capabilities/durable-edit-promotion.md` — separate durable retention
   authority, restoration ownership transfer, and restart-safe promoted bytes.
-- `capabilities/dogfood-repository-task.md` — current bounded repository-task
-  loop, authoritative append-only session facts, repeatable correction and
-  validation, superseded candidate/path constraints, and the native-orchestrator
-  violation.
+- `capabilities/dogfood-repository-task.md` — sandboxed repository-task
+  orchestration, strict proposal and command-result protocols, authoritative
+  session facts, correction cycles, and relocatable component deployment.
 
 ## Research
 

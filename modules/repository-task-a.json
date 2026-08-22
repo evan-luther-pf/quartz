@@ -1,0 +1,37 @@
+{
+  "abi": 11,
+  "module": "quartz.repository-task.orchestrator-a",
+  "version": "0.1.0",
+  "execution_mode": "wasm-component",
+  "requested_host_capabilities": [
+    "event-buffer-write",
+    "event-count",
+    "event-payload-byte",
+    "event-payload-len",
+    "invoke",
+    "read-event",
+    "continue-buffered-event",
+    "continue-exchange",
+    "read-snapshot",
+    "workspace-promote",
+    "workspace-publish",
+    "workspace-dynamic-promote",
+    "workspace-dynamic-publish",
+    "workspace-read",
+    "workspace-write"
+  ],
+  "component": {
+    "id": "repository-task",
+    "config_schema": "u64",
+    "max_activation_steps": 1000,
+    "inject": [
+      { "slot": 4, "kind": "callable", "namespace": "quartz.events", "interface": "stream", "min_revision": 1, "max_revision": 1 },
+      { "slot": 30, "kind": "callable", "namespace": "quartz.exchange", "interface": "model", "min_revision": 1, "max_revision": 1 },
+      { "slot": 31, "kind": "callable", "namespace": "quartz.exchange", "interface": "terminal", "min_revision": 1, "max_revision": 1 },
+      { "slot": 32, "kind": "callable", "namespace": "quartz.exchange", "interface": "command", "min_revision": 1, "max_revision": 1 },
+      { "slot": 33, "kind": "callable", "namespace": "quartz.repository", "interface": "mutation-authority", "min_revision": 1, "max_revision": 1 },
+      { "slot": 34, "kind": "callable", "namespace": "quartz.repository", "interface": "promotion-authority", "min_revision": 1, "max_revision": 1 }
+    ],
+    "provide": []
+  }
+}

@@ -2,232 +2,159 @@
 
 ## Problem
 
-Quartz can produce durable model responses, review and promote repository edits,
-run explicitly approved commands, and continue from their exact results. One
-authoritative session log now binds those operations into a reconstructible
-repository-task loop. The remaining architectural debt is product orchestration
-resident in the native executable rather than a component.
+Quartz must coordinate a bounded repository task without placing proposal grammar,
+validation, command policy, continuation policy, or review order in the native
+executable.
 
 ## Observable behavior
 
-`quartz task <model> <task-path> <session-dir> <source> <source> [source ...]
--- <executable> [arg ...]` is the sole public coordinator for this workflow. An
-empty session runs the proposal operation; a retained session reconstructs facts
-without repeating completed or interrupted emissions. The coordinator displays
-current diffs, requests `approve` or `reject` for each unpromoted generation,
-accepts one bounded UTF-8 feedback line for rejection, and invokes revision or
-promotion. Once every current generation is promoted, it displays the exact
-argument vector as JSON and requires a fresh `approve` before invoking the
-command operation. It then invokes continuation and repeats review, promotion,
-command approval, and continuation until `COMPLETE`, whose bounded summary is
-printed. `stop` or terminal EOF exits without adding a fact. Invalid, stale,
-pending, or interrupted state fails closed at the underlying operation boundary.
+`quartz task <model> <task> <session> <source> <source> [source ...] -- <executable> [arg ...]`
+admits one task, 2 through 64 canonical regular source files, and one exact argv.
+The external `repository-task` WASM component reconstructs the unique next action
+from one append-only event stream. The model never selects or changes argv.
 
-Proposal, reconstruction, revision, promotion, approved-command, and
-continuation operations remain internal implementation boundaries used by the
-coordinator; they are not separate CLI routes.
+The component:
 
-## Native residency violation — Slice D
+1. requests strict schema-2 ranged edits;
+2. validates and materializes each generation;
+3. supports repeated rejection and correction;
+4. separately reviews, publishes, and promotes each accepted generation;
+5. requests renewed terminal approval for the same admitted argv before every
+   command attempt;
+6. commits command start before the host spawns the process and validates the
+   exact terminal `CommandFinished` response;
+7. requests a continuation after every terminal command result;
+8. accepts a corrected ranged edit, or accepts `COMPLETE` only after success.
 
-The repository-task orchestrator has no valid native-host residency
-justification under `architecture/component-contract.md`. Today
-`crates/quartz/src/main.rs` and `crates/quartz/src/proposals.rs` own product
-behavior that belongs behind the public component contract:
+A failed command therefore cannot complete the task. A continuation correction
+is reviewed and promoted before the next monotonic command attempt. Started-only
+model, terminal, command, publication, or promotion operations remain terminal
+unknown and are never retried.
 
-- the proposal and continuation session state machine;
-- strict model-response grammar and candidate validation;
-- reconstruction of candidate generations from durable session facts;
-- command and continuation dispatch policy;
-- review presentation and action sequencing.
+## Proposal protocol
 
-Credential custody, canonical filesystem admission, exact host process spawning,
-and terminal input/output may remain resident under the recorded credential,
-privileged-I/O, and terminal-I/O conditions. Slice D must move the state machine
-and policy behind a component boundary, migrate every caller, and delete the
-native implementation. It must first identify any missing ABI primitive exactly;
-adding a broad orchestrator-specific host API is not an acceptable substitute.
+Initial responses contain only `proposals`. Each proposal contains exactly:
 
-## Superseded implementation decision
+- one admitted canonical relative `path`;
+- lowercase `source_sha256` for that admitted source;
+- half-open `byte_start` and `byte_end` UTF-8 byte offsets; and
+- exact UTF-8 `replacement` text.
 
-Host-only source selection remains an implementation constraint, not a product
-invariant. Slice E admits a bounded manifest of canonical paths and digests and
-permits the model to select numeric manifest indices. The host continues to own
-every path identity; model-authored path strings and ambient filesystem discovery
-remain prohibited.
+Revision responses contain only one `proposal` with the same fields and path as
+the rejected generation. Continuations are exactly
+`PROPOSE <admitted-path-index>\n<strict ranged-edit JSON>` or
+`COMPLETE\n<bounded summary>`; continuation JSON omits `path` because the
+numeric index selects it. Unknown fields and model-authored result digests are
+rejected.
 
-Complete-file candidates and the two-or-three-source ceiling were removed by
-the ranged-edit cutover. There is no legacy parser, alias, or translation layer.
-The later manifest change is likewise a clean cutover.
+The component checks source identity, range order and bounds, UTF-8 boundaries,
+result size, non-empty and changed output, unique initial source selection,
+monotonic revision and command identities, and adjacency to the prompting fact.
+It materializes the result and computes the result SHA-256 itself. Stale,
+tampered, out-of-order, and post-completion facts fail closed.
+
+## Boundary
+
+The native executable owns only:
+
+- canonical task, source, session, and argv admission;
+- the credential-bearing OpenAI adapter;
+- terminal byte I/O;
+- exact approved child-process spawning and bounded output capture;
+- durable journals and ledgers; and
+- host-owned atomic workspace publication and promotion.
+
+The command adapter receives the exact CLI argv as authority. It rejects any
+component request whose argv differs, captures admitted source identities and
+bounded UTF-8 bytes before and after execution, and returns one strict
+`CommandFinished` payload. Capturing evidence is privileged I/O; interpreting
+exit status and selecting the next task transition remain component policy.
+
+
+`CommandFinished` contains exactly schema, kind, attempt, argv,
+`command_started_sha256`, duration, exit code, signal, timeout and spawn status,
+bounded stdout/stderr, and before/after repository identities. Each repository
+identity binds the canonical root and every admitted path to status, length,
+SHA-256, and UTF-8 content. Missing, extra, stale, reordered, or inconsistent
+evidence is invalid.
+The WIT ABI does not change: ABI 11 already exposes the bounded snapshot,
+exchange, workspace, event, and callable primitives this workflow needs.
+`CommandFinished` is a strict schema-1 application payload carried through the
+existing exchange bytes; adding a repository-specific host import would move
+policy into the privileged kernel without adding authority or safety.
+
+Rust-produced WASI Preview 2 components receive no arguments, environment,
+preopened filesystem, standard input, output, sockets, ambient credentials, or
+repository authority.
+
+## Durable ordering
+
+Every model, terminal, and command request is first committed as a durable event.
+The exchange ledger then records its stable invocation as started before calling
+the adapter and records one terminal outcome. Replay resumes the same committed
+fiber only after the corresponding response fact is durable. Publication and
+promotion likewise require adjacent component-authored authorization facts and
+host ledgers.
+
+On restart the component validates the entire fact sequence and either derives
+one unique owed action, reports a completed/stopped state, or fails closed. A
+governed A-to-B artifact replacement uses the same facts and cannot repeat an
+external effect.
+
+## Bounds
+
+- Task: 1 through 4 KiB UTF-8.
+- Source and materialized result: 1 through 32 KiB UTF-8 each.
+- Sources: 2 through 64; aggregate workspace authority at most 2 MiB.
+- Model and terminal payloads: bounded by admitted exchange grants.
+- Event payload and record counts: bounded by kernel limits.
+- Argv: 1 through 1024 non-empty arguments, each at most 4 KiB and 32 KiB total.
+- Command: 120-second deadline; stdout and stderr independently capped at 32 KiB.
+- Completion and feedback: independently bounded.
+
+Promoted bytes are honest external emissions. Recovery verifies their exact
+committed result; it does not claim to erase them.
+
+## Artifact deployment
+
+Production resolves components from `components/` beside the Quartz executable.
+`QUARTZ_COMPONENT_DIR` is the sole explicit development/test override. Cargo
+builds and stages artifacts into that binary-adjacent directory but no absolute
+`OUT_DIR` path is compiled into the executable. Copying the executable and that
+directory forms a relocatable bundle.
+
+## Acceptance
+
+Component-focused contracts cover strict initial/revision/continuation grammar,
+repeated corrections, exact argv preservation, failed-command correction through
+successful explicit completion, restart at every external boundary, terminal
+ambiguity, stale and tampered facts, A-to-B orchestrator replacement, and
+relocated component discovery. The release acceptance path and a copied clean
+bundle load real external components.
+
+The credentialed smoke command is:
+
+```sh
+OPENAI_API_KEY="$OPENAI_API_KEY" target/release/quartz task gpt-5.4 \
+  <task> <session> <source-a> <source-b> -- \
+  /usr/bin/grep -q validated source-a.txt
+```
+
+One complete supervised run exercised rejection and corrected revision, two
+initial promotions, an expected failed command, a promoted continuation
+correction, renewed approval, a passing second attempt, explicit completion,
+and a fresh-process final restart. It completed in 101 seconds with four
+successful model exchanges totaling 4,455 tokens, nine terminal exchanges, and
+two command exchanges. The final restart exited in 5.7 seconds; the durable
+ledgers remained at those exact counts, proving no external operation repeated.
+Deterministic fault-injection contracts separately cover process loss at every
+external boundary, including reconstruction from a failed command into the
+continuation correction.
 
 ## Non-goals
 
-- Tool invocation, model-selected executables or arguments, ambient shell
-  authority, autonomous retry, or an open-ended conversation loop.
-- Concurrent commands or continuations, background processes, package-manager
-  authority, or a security-sandbox claim for approved child processes.
-- Atomic multi-file publication, automatic edit approval, merge resolution,
-  formatting, Git operations, or rollback of already promoted siblings.
-- Kernel handover, kernel or WIT replacement, ACP, subagents, or streaming model
-  responses.
-
-## Invariants
-
-- The public component ABI remains version 10. Kernel source and WIT do not gain
-  repository-task policy.
-- Every admitted source is a canonical regular file beneath one canonical
-  repository root. Before bytes, byte length, and SHA-256 identity are exact and
-  bounded.
-- A model-authored ranged edit contains exactly `source_sha256`, `byte_start`,
-  `byte_end`, and `replacement`, plus `path` for initial and revision responses.
-  Supplying `result_sha256` is an unknown-field error.
-- The range endpoints are UTF-8 boundaries in the exact admitted source.
-  Replacement bytes are UTF-8, may be empty, and must produce a changed,
-  non-empty result within the source byte bound.
-- The host materializes `source[..start] + replacement + source[end..]`, validates
-  the result, and computes its SHA-256 before the edit enters proposal state.
-  Review, durable identity, and promotion continue to bind that host-computed
-  digest.
-- Initial responses, revisions, and continuations use strict prompt schema 2.
-  Invalid or ambiguous durable responses remain evidence and never trigger an
-  automatic exchange retry.
-- Candidate review precedes mutation approval. Promotion first requires the live
-  source to retain the ranged edit's admitted source digest, then uses a separate
-  exact authority bound to source and result digests, operation identity,
-  workspace index, and approving provider identity.
-- Command approval binds the executable, every argument, working directory,
-  repository identity, admitted-file identities, and attempt identity. The
-  displayed and executed vectors are identical; no shell-string parsing occurs.
-- The child inherits the user's ordinary environment and operating-system
-  authority. The 120-second deadline bounds host waiting but does not undo child
-  writes or descendants. Retained stdout and stderr are independently capped at
-  32 KiB and truncation is explicit.
-- `CommandStarted` is synchronized before spawn. `CommandFinished` binds that
-  start and records exit code or signal, timeout or spawn failure, bounded
-  output, truncation, duration, and post-command admitted-file identities.
-- Every completed proposal or correction generation has a monotonic per-proposal
-  revision identity. A correction is exactly the rejected current revision plus
-  one. A continuation proposal advances the selected proposal's current revision
-  by one; a newly selected admitted path begins revision zero.
-- Rejection and promotion bind the exact current proposal index, revision, and
-  candidate digest. Superseded, promoted, pending, interrupted, mismatched, and
-  post-completion generations fail closed.
-- A completed or interrupted external operation is never emitted again.
-  Credential-free reconstruction performs no command or model call.
-- Command facts, model facts, promotion commits, and source mutations are honest
-  external emissions. Recovery withdraws live capabilities without claiming to
-  erase committed history or retained promoted bytes.
-
-## Session log contract
-
-One `session.qe` file is the authoritative task history. It uses the existing
-bounded `QUARTZE2` event framing and contains only
-`quartz.session/fact@1` payloads. Monotonic fact IDs and checksummed frames
-establish order. Every payload is strict, versioned, independently bounded, and
-binds the identities and bytes needed to validate its predecessor.
-
-The closed fact set is:
-
-- initial proposal turn started and completed;
-- proposal rejection and revision turn started and completed, repeated in
-  generation order as needed;
-- exact candidate approval, promotion started, and promotion completed;
-- approved command started and finished;
-- continuation started and either completed with one proposal or completed the
-  task with an explicit summary.
-
-The session reducer consumes facts in ID order and is the only source of task
-state. Proposal turns, generations, current selection, rejections, approvals,
-promotions, command attempts, continuation sequences, and completion are never
-inferred from cache filenames, directory contents, composition journals, event
-payload caches, exchange ledgers, promotion journals, or mutation ledgers.
-Those operation-specific ledgers may remain as bounded idempotency and recovery
-evidence at privileged I/O boundaries, but they cannot authorize a task action
-or supply missing session history.
-
-Each external operation has a synchronized started fact before emission and at
-most one exact terminal fact. A model turn, promotion, or command with a started
-fact and no terminal fact derives as interrupted/unknown and is never emitted
-again. Non-external decisions such as rejection and approval may be followed
-only by their uniquely determined next fact. Invalid transitions, identity
-reuse, sequence gaps, duplicate terminal facts, stale generations, and facts
-after completion fail closed.
-
-Prompt, response, feedback, command, result, and completion bytes live in fact
-payloads. Files materialized beside the log are disposable caches: restart may
-rebuild or replace them from facts, and deleting or adding one cannot change
-derived state. Appending one fact synchronizes its complete frame before
-returning. A torn final frame is removed on open; interior corruption fails
-closed.
-
-The cutover deleted task-state readers and writers for parallel proposal,
-revision, command, and continuation journals. Operation journals remain only at
-the model-exchange and repository-mutation boundaries. A child-process crash
-harness aborts after one, two, and three returned session-log appends and proves
-that every returned prefix reopens with its exact monotonic IDs. Reducer
-contracts separately prove interrupted initial, revision, promotion, command,
-and later-continuation operations remain terminal and cannot append later facts.
-
-## Public contract
-
-ABI 10 and WIT remain unchanged. The kernel exposes the existing event framing
-to justified host storage code as `DurableEventLog`: open one admitted path
-under explicit `Limits`, observe committed `EventRecord` values, and append one
-exact event plus optional `DurablePayload`. It is a synchronized wrapper over
-the same event-stream implementation, not another ledger format or product
-state machine.
-
-The repository task uses `quartz.session/fact@1` as its sole task event schema.
-The existing `quartz.agent/repository-turn@2` component protocol and exchange
-ledgers still bound actual model emission; ABI 10 workspace, callable mutation,
-publication, and promotion capabilities still bound actual source mutation.
-Their results enter task state only after an exact session fact commits.
-
-Each command argument is non-empty and capped at 4 KiB; total argument bytes are
-capped at 32 KiB. Each admitted source and materialized result is UTF-8 and
-capped at 32 KiB; prompt size independently bounds the admitted file count.
-Replacement bytes share the response bound and may be empty. Rejection feedback
-and completion summaries are UTF-8 and capped at 4 KiB. Individual session
-facts, the total session log, prompt, response, workspace, and operation-ledger
-records remain independently bounded.
-
-## Acceptance scenario
-
-1. Admit a bounded task and repository sources, complete one credentialed
-   proposal turn, and stop with every source unchanged.
-2. Restart without credentials, reconstruct exact candidates, render their
-   diffs, and separately promote the approved current generations.
-3. Approve one exact command that fails; synchronize its start and terminal
-   evidence and never run that attempt again.
-4. Restart, consume the exact failure in one continuation, and accept one
-   corrected generation for an admitted source.
-5. Separately review and promote that correction, approve a second exact command
-   that succeeds, and synchronize its terminal evidence.
-6. Restart and consume the successful command in an explicit `COMPLETE` turn.
-7. Restart without credentials and reconstruct proposals, revisions, promotions,
-   both command attempts, both model decisions, and completion in causal order
-   without repeating an external operation.
-8. Reject stale promotion, post-completion command, post-completion revision,
-   post-completion continuation, sequence tampering, and identity tampering.
-
-## Verification
-
-Focused contracts cover the shared initial, revision, and continuation ranged
-grammar; host-computed result digest binding; rejection of model-authored result
-digests, incorrect source digests, invalid ranges, UTF-8 splits, unchanged
-results, and oversized results; exact chronological reconstruction, repeated
-correction cycles, every started-only external-operation class, sequence and
-identity tampering, stale promotion, and post-completion closure. The unified
-`task` contract drives reject, correct, approve, promote, failing command,
-continuation, reject, correct, approve, passing command, and `COMPLETE` through
-the same operations while reconstructing session state between actions.
-
-Prompt schema 1 sessions remain retained evidence but are not resumable after
-the clean schema 2 cutover. Quartz does not reinterpret their model-authored
-result digests.
-
-`cargo test -p quartz --bin quartz` passes 39 focused contracts.
-`cargo test --workspace --all-targets` passes 98 tests across 12 suites. Twenty
-release runs measure 3.220 ms p50 cold readiness, 3.000 MiB p50 idle RSS, and a
-14.173 MiB executable: respectively +3.4%, +3.2%, and -6.2% against the Slice 0
-budget. The release profile strips symbols and uses thin LTO. WIT, component ABI
-10, kernel source, and module manifests are unchanged.
+- Autonomous mode, model-selected tools or argv, ambient shell authority, path
+  discovery, or package installation.
+- Concurrent commands, automatic retries, unbounded dialogue, or multi-file
+  atomic promotion.
+- TUI, kernel handover, WIT self-replacement, or Slice E path selection.

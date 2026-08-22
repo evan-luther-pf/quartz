@@ -36,12 +36,31 @@ impl Runtime {
     }
 
     pub fn new_with_exchange(limits: Limits, adapter: Arc<dyn ExchangeAdapter>) -> Result<Self> {
+        Self::new_with_exchanges(limits, vec![adapter])
+    }
+
+    pub fn new_with_exchanges(
+        limits: Limits,
+        adapters: Vec<Arc<dyn ExchangeAdapter>>,
+    ) -> Result<Self> {
         let runtime = Self::new(limits)?;
-        runtime.core.borrow_mut().exchange_adapter = Some(adapter);
+        let mut core = runtime.core.borrow_mut();
+        for adapter in adapters {
+            if core
+                .exchange_adapters
+                .insert(adapter.identity().to_owned(), adapter)
+                .is_some()
+            {
+                return Err(Error::Persistence(
+                    "exchange adapter identities must be unique".into(),
+                ));
+            }
+        }
+        drop(core);
         Ok(runtime)
     }
     pub fn open_persistent(limits: Limits, journal_component: ComponentSpec) -> Result<Self> {
-        Self::open_persistent_inner(limits, journal_component, None)
+        Self::open_persistent_inner(limits, journal_component, Vec::new())
     }
 
     pub fn open_persistent_with_exchange(
@@ -49,13 +68,21 @@ impl Runtime {
         journal_component: ComponentSpec,
         adapter: Arc<dyn ExchangeAdapter>,
     ) -> Result<Self> {
-        Self::open_persistent_inner(limits, journal_component, Some(adapter))
+        Self::open_persistent_inner(limits, journal_component, vec![adapter])
+    }
+
+    pub fn open_persistent_with_exchanges(
+        limits: Limits,
+        journal_component: ComponentSpec,
+        adapters: Vec<Arc<dyn ExchangeAdapter>>,
+    ) -> Result<Self> {
+        Self::open_persistent_inner(limits, journal_component, adapters)
     }
 
     pub(crate) fn open_persistent_inner(
         limits: Limits,
         journal_component: ComponentSpec,
-        adapter: Option<Arc<dyn ExchangeAdapter>>,
+        adapters: Vec<Arc<dyn ExchangeAdapter>>,
     ) -> Result<Self> {
         if journal_component.journal_paths.len() != 1
             || journal_component.event_stream_paths.len() > 1
@@ -71,10 +98,7 @@ impl Runtime {
         }
         let journal_root = journal_component.entry.clone();
         let expects_events = !journal_component.event_stream_paths.is_empty();
-        let mut runtime = match adapter {
-            Some(adapter) => Self::new_with_exchange(limits, adapter)?,
-            None => Self::new(limits)?,
-        };
+        let mut runtime = Self::new_with_exchanges(limits, adapters)?;
         runtime.persistent_root = Some(journal_root.clone());
         let bootstrap = runtime.prepare_tree(ComponentTree {
             roots: vec![journal_component],
@@ -329,7 +353,7 @@ impl Runtime {
             pending_events: core.pending_events.len(),
             staged_events: core.event_outbox.len(),
             event_stream_registrations: usize::from(core.event_stream.is_some()),
-            exchange_registrations: usize::from(core.exchange.is_some()),
+            exchange_registrations: core.exchange.len(),
             exchange_workers: core.exchange_workers.len(),
         }
     }

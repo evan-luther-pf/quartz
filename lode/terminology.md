@@ -26,6 +26,8 @@
 - **Transactional outbox** — event requests synchronized in the composition journal before idempotent event-stream delivery.
 - **Snapshot grant** — one exact canonical regular file, provenance label, byte length, and SHA-256 identity admitted to a component by numeric index.
 - **Durable payload** — bounded evidence bytes with provenance and SHA-256 attached to an irreversible event fact.
+- **Guest payload buffer** — a fiber-private bounded byte buffer copied into a
+  durable event request without granting ambient storage authority.
 - **Turn fact** — one closed agent-protocol event carrying fact kind, turn identity, stable invocation identity, scalar projection value, and optionally bounded durable evidence.
 - **Owed work** — the unique next action derived from committed turn facts when no terminal fact exists.
 - **Stable invocation identity** — a turn-derived provider or tool call identity preserved across process and component generations.
@@ -45,7 +47,9 @@
   command evidence and exact post-command admitted sources; it yields one
   corrected proposal generation or explicit completion.
 - **Supervised task** — the user-driven repository loop that reviews current candidates, separately approves publication and exact command argv, and reconstructs from durable facts.
-- **Workspace grant** — one exact host-admitted source file, mutation identity, byte bound, before/result digests, and durable ledger exposed to guest code by index.
+- **Workspace grant** — one exact host-admitted source file, mutation ledger,
+  byte bound, and mutable guest buffer exposed by index; publication binds its
+  current before/result digests and operation identity atomically.
 - **Mutation authority** — the committed callable provider whose exact approval is required before a workspace publication.
 - **Mutation ledger** — the checksummed append-only record used to prevent duplicate publication and classify incomplete or unsafe repository mutations.
 - **Workspace publication** — an approved, durable, digest-guarded atomic

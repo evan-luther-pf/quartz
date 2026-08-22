@@ -38,9 +38,8 @@ Current justified residents are the production adapter that retains credentials
 and network handles (condition 1); journal, event, exchange, mutation, and
 promotion storage, canonical filesystem admission and publication, and exact
 child-process spawning (condition 2); and CLI argument, rendering, and approval
-I/O (condition 3). The repository-task orchestrator currently resident in
-`crates/quartz/src/main.rs` has no valid condition; its correction boundary is
-recorded in `capabilities/dogfood-repository-task.md`.
+I/O (condition 3). `crates/quartz/src/main.rs` retains only those trust-boundary
+adapters and no repository-task reducer or policy switch.
 
 ## Effect contract
 
@@ -76,13 +75,23 @@ schema, and requested host imports. Admission parses and validates the manifest,
 compiles the component, links only admitted imports, and instantiates its store
 before the active generation is disturbed.
 
+Production artifact lookup is relocatable: Quartz resolves `components/` beside
+the running executable. `QUARTZ_COMPONENT_DIR` is the sole explicit
+development/test override. Cargo may use `OUT_DIR` while building, but no
+absolute build path is compiled into or required by the executable.
+
 Each fiber owns its Wasmtime store and instance. Retraction first recovers every
 host-tracked effect, then drops that store. Artifact caches hold weak references,
 so compiled code is retained only while a desired, staged, or live generation
-owns it. A process remains an optional isolation mode; it is not the composition
-model.
+owns it. A process remains an optional isolation mode; it is not the composition model.
 
-The ABI 10 WIT contract exposes four lifecycle calls and twenty-seven capability
+Rust-produced WASI Preview 2 components receive a default, non-inheriting WASI
+context: no arguments, environment, preopened filesystem, standard input,
+captured output, or permitted network address. Synchronous WASI clocks, random
+state, and resource polling support the managed runtime; Quartz host
+capabilities remain the only repository, credential, and exchange authority.
+
+The ABI 11 WIT contract exposes four lifecycle calls and generic capability
 imports:
 
 - `start(config)`, `step(instance)`, `invoke(instance, operation, arg0, arg1)`,
@@ -97,36 +106,42 @@ imports:
 - `register-child` realizes a declared child entry as a parent-owned effect;
 - `open-journal` registers one host-admitted composition journal path;
 - `open-event-stream` registers one host-admitted durable event path;
-- `append-event` queues one granted typed fact until activation and composition
-  commit;
+- `append-event` and `resume-event` queue granted scalar facts before commit or
+  after replay-aware projection;
+- `event-buffer-set-len` and `event-buffer-write-byte` mutate one fiber-private,
+  bounded payload buffer without crossing the system boundary;
+- `append-buffered-event` and `resume-buffered-event` copy that buffer into one
+  granted durable event request, after which later buffer writes cannot alter
+  the queued fact;
+- `continue-buffered-event` and `continue-exchange` add replay enforcement and
+  resume the same committed fiber after the fact is durable without unloading
+  or recovering its accumulated effects;
 - `event-count` and `read-event` expose bounded committed scalar facts to an
   authorized projection component;
 - `event-payload-len` and `event-payload-byte` expose bounded committed payload
   bytes through the same provider view but separate manifest capabilities;
-- `resume-event` has the same grant, outbox, and commit enforcement as
-  `append-event`, but may append the unique owed fact after historical event
-  projection during restart.
 - `snapshot-len` and `snapshot-byte` expose only immutable bytes admitted to
   that fiber by indexed canonical-file grant during activation;
 - `resume-snapshot` has replay-aware append enforcement and attaches one
-  admitted snapshot as a bounded durable event payload.
-- `open-exchange` registers one host-admitted adapter and durable ledger as a
-  component-owned effect;
-- `exchange` consumes one committed event payload during the invoked
-  provider's callable dispatch and stages a bounded response under a stable invocation identity;
+  admitted snapshot as a bounded durable event payload;
+- `open-exchange` registers one component-owned, host-admitted bounded exchange
+  ledger;
+- `exchange` consumes one committed event payload during the invoked provider's
+  callable dispatch and stages a bounded response under a stable invocation
+  identity;
 - `resume-exchange` attaches the staged callable response to one replay-aware
-  durable event request.
+  durable event request;
 - `workspace-len` and `workspace-byte` expose only a fiber's indexed bounded
   host-owned mutable buffer;
 - `workspace-set-len` and `workspace-write-byte` mutate that buffer without
   touching its admitted source file;
-- `publish-workspace` requires exact committed callable mutation approval,
-  admitted before/result digests, and durable mutation identity before a
+- `publish-workspace(index, operation)` requires exact committed callable
+  mutation approval and captures the current source and buffer digests before a
   digest-guarded same-directory atomic publication;
-- `promote-workspace` requires a separate committed callable approval bound to
-  the exact published mutation and transfers its recovery effect from source
-  restoration to promoted-state verification only after durable commit.
-
+- `promote-workspace(index, operation)` requires separate committed callable
+  approval bound to that exact publication and transfers its recovery effect
+  from source restoration to promoted-state verification only after durable
+  commit.
 Every binding declares `value` or `callable` kind as part of its versioned
 identity. Context-changing imports remain tracked by structural inverses.
 Journal, event, exchange, and mutation-ledger records are external emissions and
@@ -245,6 +260,28 @@ verifying the candidate; and third-party drift ambiguity without overwrite.
 a separate sandboxed callable authority, reconstructs the durable commit in a
 fresh runtime without republishing, preserves the candidate during final
 shutdown, and asserts a clean live context.
+
+### Repository-task verification
+
+`cargo test --workspace` passes 75 contracts across 13 suites. The standalone
+repository-task crate adds four native unit contracts for strict
+initial/revision/continuation grammar, repeated correction, command evidence,
+UTF-8 and digest bounds, unknown fields, and completion gating. The kernel also
+checks that recovery accepts a contiguous chain of promoted correction
+generations while rejecting unrecorded source drift. Two host integration
+contracts load the real WASM artifact, exercise A-to-B governed replacement,
+exact argv, promotion-before-command, failed-command correction, explicit
+success completion, final restart, and no repeated exchange or process call.
+Slice 6 remains the generic started/terminal exchange crash contract, including
+terminal ambiguity and cached-success replay.
+
+Release packaging writes 50 manifest-bearing WASM files into `components/`
+beside the executable and deletes stale staged artifacts first. On arm64 macOS,
+the current stripped release executable is 17,804,800 bytes, the component
+directory is 1,489,501 bytes, and each repository-task artifact is 236,273
+bytes. Copying the executable and directory to `/tmp/quartz-relocated-smoke`
+and running `quartz --acceptance` loaded the relocated artifacts, completed the
+full scenario, and reported a clean context without `QUARTZ_COMPONENT_DIR`.
 
 ### Decision evidence
 

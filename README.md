@@ -2,16 +2,14 @@
 
 A small native coding harness designed for runtime self-modification through reversible effects and reactive coeffects.
 
-Slices 0 through 9 implement the spatiotemporal composition kernel, governed
-component-authored patches, crash-safe desired-composition recovery, a
-transactional durable event stream, restart-safe deterministic agent turns,
-host-admitted immutable repository inspection, credential-safe production
-model exchange, authority-approved isolated repository editing, durable
-reviewed application, separately approved retention of model-authored
-candidates, and resumable multi-proposal repository turns in Rust. All acceptance
-components run as sandboxed Wasmtime components through
-`wit/quartz-component.wit`. Product knowledge and measured tradeoffs live in
-`lode/`; the primary architecture paper is vendored at
+Quartz implements the spatiotemporal composition kernel, governed
+component-authored patches, crash-safe composition and event recovery,
+host-admitted repository mutation and promotion, bounded exchange adapters, and
+an external WASM repository-task orchestrator. Components run through
+`wit/quartz-component.wit`; Rust-produced WASI Preview 2 components receive no
+ambient filesystem, environment, network, terminal, or credential authority.
+Product contracts and measured tradeoffs live in `lode/`; the primary
+architecture paper is vendored at
 `research/spatiotemporal-composability.pdf`.
 
 Release CLI help: `cargo run --release -p quartz -- --help`
@@ -75,21 +73,34 @@ fresh runtime state, recovers live authority, and leaves the `.qj`, `.qe`, and
 `.qx` durable records for inspection. OpenAI temporarily stores background
 response data for asynchronous execution and polling.
 
-Supervised repository task:
+External repository task:
 
 ```sh
 OPENAI_API_KEY="$OPENAI_API_KEY" cargo run --release -p quartz -- \
   task gpt-5.4 /path/to/task.txt /path/to/session \
-  path/to/source-a path/to/source-b -- cargo test --workspace --all-targets
+  path/to/source-a path/to/source-b -- executable exact args
 ```
 
-Quartz reviews current candidate diffs interactively. Proposal publication and
-the exact command argument vector require separate `approve` decisions; `reject`
-accepts one feedback line and requests a corrected candidate. Stop at any
-approval boundary and run the same command again to reconstruct the session from
-`session.qe` without repeating completed or interrupted external operations.
-The loop ends only when a post-command model turn returns explicit `COMPLETE`.
+Quartz admits 2 through 64 canonical UTF-8 source files and runs the task state
+machine in a sandboxed WASM component. The initial model response is strict
+JSON containing at least two digest-bound UTF-8 ranged edits. Each generation
+is reviewed with `approve`, `reject <feedback>`, or `stop`; rejection requests
+one corrected revision of that same proposal. Every accepted generation is
+published before Quartz requests separate approval for the exact CLI-supplied
+command vector.
 
-Neighboring prompt, response, exchange, promotion, and mutation files are
-operation evidence or disposable render caches; they cannot supply missing
-session history or authorize an action.
+Quartz durably records command start and the bounded terminal result, including
+the exact argv and before/after source identities. The continuation model must
+return either `PROPOSE <source-index>` followed by one strict ranged-edit JSON
+object, or `COMPLETE` followed by a summary. Failure always continues through
+`PROPOSE`; `COMPLETE` is accepted only after command success.
+
+The authoritative `session/task.qe` event stream reconstructs every transition.
+Re-running a completed session performs no model, terminal, command, mutation,
+or promotion again. Exchange, mutation, promotion, and composition journals are
+bounded idempotency and recovery evidence, not parallel task state.
+
+Release builds place loadable modules in `components/` beside the `quartz`
+executable. The executable and that directory may be relocated together.
+Development launches may set `QUARTZ_COMPONENT_DIR`; production does not use a
+compile-time Cargo output path.

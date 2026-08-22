@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
@@ -14,7 +15,7 @@ pub(crate) const COMMAND_TIMEOUT_MS: u64 = 120_000;
 pub(crate) const MAX_OUTPUT_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_ARG_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_ARGV_BYTES: usize = 32 * 1024;
-const MAX_FACT_BYTES: usize = 256 * 1024;
+const MAX_FACT_BYTES: usize = 3 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -29,6 +30,7 @@ pub(crate) struct RepositoryIdentity {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RepositoryFileIdentity {
     pub(crate) byte_len: Option<u64>,
+    pub(crate) content: Option<String>,
     pub(crate) path: String,
     pub(crate) sha256: Option<String>,
     pub(crate) status: String,
@@ -111,6 +113,7 @@ impl RepositoryIdentity {
                 Ok(canonical) if canonical.starts_with(&root) && canonical.is_file() => {
                     match fs::read(&canonical) {
                         Ok(bytes) => {
+                            let content = String::from_utf8(bytes.clone()).ok();
                             RepositoryFileIdentity {
                                 path: path.clone(),
                                 status: "regular".into(),
@@ -118,6 +121,7 @@ impl RepositoryIdentity {
                                     format!("repository file `{path}` is too large")
                                 })?),
                                 sha256: Some(sha256(&bytes)),
+                                content,
                             }
                         }
                         Err(error) => RepositoryFileIdentity {
@@ -125,6 +129,7 @@ impl RepositoryIdentity {
                             status: format!("unreadable:{error}"),
                             byte_len: None,
                             sha256: None,
+                            content: None,
                         },
                     }
                 }
@@ -133,18 +138,21 @@ impl RepositoryIdentity {
                     status: "outside-or-not-regular".into(),
                     byte_len: None,
                     sha256: None,
+                    content: None,
                 },
                 Err(error) if error.kind() == io::ErrorKind::NotFound => RepositoryFileIdentity {
                     path: path.clone(),
                     status: "missing".into(),
                     byte_len: None,
                     sha256: None,
+                    content: None,
                 },
                 Err(error) => RepositoryFileIdentity {
                     path: path.clone(),
                     status: format!("unreadable:{error}"),
                     byte_len: None,
                     sha256: None,
+                    content: None,
                 },
             };
             files.push(identity);
@@ -205,6 +213,7 @@ impl CommandStarted {
         Ok(bytes)
     }
 
+    #[cfg(test)]
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         if bytes.is_empty() || bytes.len() > MAX_FACT_BYTES {
             return Err(format!(
@@ -221,6 +230,7 @@ impl CommandStarted {
         Ok(sha256(&self.to_bytes()?))
     }
 
+    #[cfg(test)]
     fn validate(&self) -> Result<(), String> {
         if self.schema != 1 || self.kind != "CommandStarted" {
             return Err("unsupported CommandStarted fact".into());
@@ -277,6 +287,7 @@ impl CommandFinished {
         Ok(bytes)
     }
 
+    #[cfg(test)]
     pub(crate) fn from_bytes(bytes: &[u8], started: &CommandStarted) -> Result<Self, String> {
         if bytes.is_empty() || bytes.len() > MAX_FACT_BYTES {
             return Err(format!(
@@ -289,10 +300,7 @@ impl CommandFinished {
         Ok(finished)
     }
 
-    pub(crate) fn to_value(&self) -> Value {
-        serde_json::to_value(self).expect("validated command fact must serialize")
-    }
-
+    #[cfg(test)]
     pub(crate) fn succeeded(&self) -> bool {
         self.exit_code == Some(0)
             && self.signal.is_none()
@@ -478,13 +486,13 @@ fn capture(mut reader: impl Read) -> CapturedBytes {
     }
 }
 
-fn validate_argv(argv: &[String]) -> Result<(), String> {
+pub(crate) fn validate_argv(argv: &[String]) -> Result<(), String> {
     if argv.first().is_none_or(String::is_empty) {
         return Err("approved command requires a non-empty executable argument".into());
     }
     let mut total = 0_usize;
     for argument in argv {
-        if argument.as_bytes().len() > MAX_ARG_BYTES {
+        if argument.len() > MAX_ARG_BYTES {
             return Err(format!(
                 "approved command argument exceeds {MAX_ARG_BYTES} bytes"
             ));
@@ -551,7 +559,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn decode_hex(input: &str) -> Result<Vec<u8>, String> {
-    if input.len() % 2 != 0 {
+    if !input.len().is_multiple_of(2) {
         return Err("hex command output has odd length".into());
     }
     input
@@ -660,6 +668,7 @@ mod tests {
                 canonical_root_sha256: sha256(b"/fixed/repository"),
                 files: vec![RepositoryFileIdentity {
                     byte_len: Some(7),
+                    content: Some("content".into()),
                     path: "source.txt".into(),
                     sha256: Some(
                         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
@@ -672,7 +681,7 @@ mod tests {
             stdout_limit_bytes: MAX_OUTPUT_BYTES,
             timeout_ms: COMMAND_TIMEOUT_MS,
         };
-        let expected = b"{\n  \"approval\": \"explicit-cli-invocation\",\n  \"argv\": [\n    \"/bin/echo\",\n    \"hello\"\n  ],\n  \"attempt\": 1,\n  \"cwd\": \"/fixed/repository\",\n  \"kind\": \"CommandStarted\",\n  \"repository\": {\n    \"canonical_root\": \"/fixed/repository\",\n    \"canonical_root_sha256\": \"15250920c2ea0f032234df7baf7a6737a6f3587be102adb71b08e0d56ae47af8\",\n    \"files\": [\n      {\n        \"byte_len\": 7,\n        \"path\": \"source.txt\",\n        \"sha256\": \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\n        \"status\": \"regular\"\n      }\n    ]\n  },\n  \"schema\": 1,\n  \"stderr_limit_bytes\": 32768,\n  \"stdout_limit_bytes\": 32768,\n  \"timeout_ms\": 120000\n}";
+        let expected = b"{\n  \"approval\": \"explicit-cli-invocation\",\n  \"argv\": [\n    \"/bin/echo\",\n    \"hello\"\n  ],\n  \"attempt\": 1,\n  \"cwd\": \"/fixed/repository\",\n  \"kind\": \"CommandStarted\",\n  \"repository\": {\n    \"canonical_root\": \"/fixed/repository\",\n    \"canonical_root_sha256\": \"15250920c2ea0f032234df7baf7a6737a6f3587be102adb71b08e0d56ae47af8\",\n    \"files\": [\n      {\n        \"byte_len\": 7,\n        \"content\": \"content\",\n        \"path\": \"source.txt\",\n        \"sha256\": \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\n        \"status\": \"regular\"\n      }\n    ]\n  },\n  \"schema\": 1,\n  \"stderr_limit_bytes\": 32768,\n  \"stdout_limit_bytes\": 32768,\n  \"timeout_ms\": 120000\n}";
         assert_eq!(started.to_bytes().unwrap(), expected);
     }
 

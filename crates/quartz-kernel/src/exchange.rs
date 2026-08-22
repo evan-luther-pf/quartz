@@ -67,7 +67,6 @@ pub trait ExchangeAdapter: Send + Sync {
 }
 
 pub(crate) struct ExchangeRegistration {
-    pub(crate) owner: FiberId,
     pub(crate) grant: ExchangeGrant,
     pub(crate) ledger: ExchangeLedger,
 }
@@ -95,13 +94,10 @@ impl Core {
             };
             grant.clone()
         };
-        let Some(adapter) = self.exchange_adapter.as_ref() else {
-            return STATUS_DENIED;
-        };
-        if adapter.identity() != grant.adapter {
+        if !self.exchange_adapters.contains_key(&grant.adapter) {
             return STATUS_DENIED;
         }
-        if self.exchange.is_some() {
+        if self.exchange.contains_key(&fiber) {
             return STATUS_COLLISION;
         }
         let ledger =
@@ -113,11 +109,8 @@ impl Core {
                 }
             };
         let effect = self.allocate_effect();
-        self.exchange = Some(ExchangeRegistration {
-            owner: fiber,
-            grant,
-            ledger,
-        });
+        self.exchange
+            .insert(fiber, ExchangeRegistration { grant, ledger });
         self.fibers
             .get_mut(&fiber)
             .expect("exchange fiber checked above")
@@ -159,12 +152,9 @@ impl Core {
             {
                 return -(STATUS_UNDECLARED as i64);
             }
-            let Some(registration) = self.exchange.as_ref() else {
+            let Some(registration) = self.exchange.get(&fiber) else {
                 return -(STATUS_UNSATISFIED as i64);
             };
-            if registration.owner != fiber {
-                return -(STATUS_DENIED as i64);
-            }
             let Some(stream) = self.event_stream.as_ref() else {
                 return -(STATUS_UNSATISFIED as i64);
             };
@@ -189,7 +179,11 @@ impl Core {
             {
                 return -(STATUS_LIMIT as i64);
             }
-            let Some(adapter) = self.exchange_adapter.clone() else {
+            let Some(adapter) = self
+                .exchange_adapters
+                .get(&registration.grant.adapter)
+                .cloned()
+            else {
                 return -(STATUS_DENIED as i64);
             };
             (
@@ -203,7 +197,7 @@ impl Core {
         let recovered = {
             let registration = self
                 .exchange
-                .as_ref()
+                .get(&fiber)
                 .expect("exchange registration checked above");
             match registration.ledger.outcome(invocation, &request_sha256) {
                 Ok(outcome) => outcome.cloned(),
@@ -230,7 +224,7 @@ impl Core {
         }
         if let Err(error) = self
             .exchange
-            .as_mut()
+            .get_mut(&fiber)
             .expect("exchange registration checked above")
             .ledger
             .append_started(invocation, request_sha256.clone())
@@ -285,7 +279,7 @@ impl Core {
         };
         if let Err(error) = self
             .exchange
-            .as_mut()
+            .get_mut(&fiber)
             .expect("exchange registration checked above")
             .ledger
             .append_terminal(invocation, request_sha256, outcome.clone())

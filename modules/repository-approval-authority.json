@@ -1,0 +1,17 @@
+{
+  "abi": 11,
+  "module": "quartz.repository-task.approval-authority",
+  "version": "0.1.0",
+  "execution_mode": "wasm-component",
+  "requested_host_capabilities": ["event-count", "event-payload-byte", "event-payload-len", "publish-callable", "read-event"],
+  "component": {
+    "id": "repository-approval-authority",
+    "config_schema": "u64",
+    "max_activation_steps": 1,
+    "inject": [{"slot": 4, "kind": "callable", "namespace": "quartz.events", "interface": "stream", "min_revision": 1, "max_revision": 1}],
+    "provide": [
+      {"slot": 33, "kind": "callable", "namespace": "quartz.repository", "interface": "mutation-authority", "revision": 1},
+      {"slot": 34, "kind": "callable", "namespace": "quartz.repository", "interface": "promotion-authority", "revision": 1}
+    ]
+  }
+}

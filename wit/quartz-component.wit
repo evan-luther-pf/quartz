@@ -1,4 +1,4 @@
-package quartz:component@0.9.0;
+package quartz:component@0.10.0;
 
 world module {
   /// Set a fiber-owned context cell. Returns zero or a Quartz status code.
@@ -35,6 +35,21 @@ world module {
   /// Queue one host-admitted typed value after replay-aware event projection.
   import resume-event: func(index: u64, value: u64) -> s32;
 
+  /// Resize the fiber-private bounded guest event payload buffer.
+  import event-buffer-set-len: func(length: u64) -> s32;
+
+  /// Replace one byte in the fiber-private guest event payload buffer.
+  import event-buffer-write-byte: func(offset: u64, value: u32) -> s32;
+
+  /// Queue one ordinary event with a copy of the current guest payload buffer.
+  import append-buffered-event: func(index: u64, value: u64) -> s32;
+
+  /// Queue one replay-aware event with a copy of the current guest payload buffer.
+  import resume-buffered-event: func(index: u64, value: u64) -> s32;
+
+  /// Queue one replay-aware buffered fact and continue the same committed activation.
+  import continue-buffered-event: func(index: u64, value: u64) -> s32;
+
   /// Return one admitted immutable snapshot length, or a negative Quartz status.
   import snapshot-len: func(index: u64) -> s64;
 
@@ -54,6 +69,9 @@ world module {
   /// Queue the staged callable response as a replay-aware durable payload.
   import resume-exchange: func(event-index: u64, value: u64) -> s32;
 
+  /// Queue the staged exchange response and continue the same committed activation.
+  import continue-exchange: func(event-index: u64, value: u64) -> s32;
+
   /// Return one private mutable workspace length, or a negative Quartz status.
   import workspace-len: func(index: u64) -> s64;
 
@@ -66,11 +84,17 @@ world module {
   /// Replace one existing byte in a private mutable workspace.
   import workspace-write-byte: func(index: u64, offset: u64, value: u32) -> s32;
 
-  /// Publish one exactly approved workspace to its admitted source file.
+  /// Publish the current bounded workspace under its declared operation.
   import publish-workspace: func(index: u64) -> s32;
 
-  /// Durably retain one separately approved published workspace.
+  /// Publish the current bounded workspace under a guest-selected operation.
+  import publish-dynamic-workspace: func(index: u64, operation: u64) -> s32;
+
+  /// Durably retain the current separately approved publication.
   import promote-workspace: func(index: u64) -> s32;
+
+  /// Durably retain a guest-selected separately approved publication.
+  import promote-dynamic-workspace: func(index: u64, operation: u64) -> s32;
   /// Return the bounded committed event count, or a negative Quartz status.
   import event-count: func() -> s64;
 

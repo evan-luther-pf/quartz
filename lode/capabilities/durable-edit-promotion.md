@@ -25,11 +25,11 @@ A fresh runtime reconstructs the mutation ledger. An applied publication without
 - The durable promotion identity includes the canonical source path, provenance, before and candidate SHA-256 digests, exact before and candidate bytes, operation identity, and stable approver artifact identity.
 - The mutation ledger synchronizes `promotion-intent` before `promoted`. The restoration inverse remains armed until the `promoted` record is durable. Failure between those records therefore retains restoration ownership.
 - A recovered `started`, `applied`, or `promotion-intent` publication is reversible. Recovery restores only from the exact candidate digest and records `reverted`.
-- A recovered `promoted` publication never restores the source. It installs a non-mutating verification inverse so authority withdrawal still checks that the source is either the approved candidate or honest third-party drift.
+- A recovered `promoted` publication never restores the source. Its non-mutating verification inverse accepts its exact candidate or a current digest reached through a contiguous chain of later `promoted` records for the same canonical source. This permits reviewed correction generations while still rejecting unrecorded drift.
 - Promotion is idempotent only for the exact recorded approver and mutation identity. Reuse with another operation, path, provenance, digest, byte sequence, or approver fails closed.
 - During persistent replay, an already committed promotion may reconstruct. A not-yet-committed promotion cannot be advanced by replay; activation fails and ordinary recovery restores the original.
-- If the source differs from both admitted digests, Quartz records `ambiguous`, returns failure, and does not write it. This rule applies before promotion, during restoration, during promoted verification, and on restart.
-- Successful shutdown removes fibers, bindings, workspace buffers, staged approvals, and publication effects. A promoted source remains byte-for-byte equal to the approved candidate; durable mutation records remain external.
+- If the source differs from both admitted digests and is not the end of a contiguous later promoted chain, Quartz records `ambiguous`, returns failure, and does not write it. This rule applies before promotion, during restoration, during promoted verification, and on restart.
+- Successful shutdown removes fibers, bindings, workspace buffers, staged approvals, and publication effects. A promoted source remains byte-for-byte equal to the latest contiguous approved candidate; durable mutation records remain external.
 
 ## Public contract
 

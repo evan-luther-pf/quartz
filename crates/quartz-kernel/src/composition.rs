@@ -676,12 +676,21 @@ impl Runtime {
                 "event stream paths are reserved for the persistence bootstrap root".into(),
             ));
         }
-        let requests_append = artifact.manifest.requests(HostCapability::AppendEvent);
-        let requests_resume = artifact.manifest.requests(HostCapability::ResumeEvent);
+        let requests_append = artifact.manifest.requests(HostCapability::AppendEvent)
+            || artifact
+                .manifest
+                .requests(HostCapability::AppendBufferedEvent);
         let requests_resume_snapshot = artifact.manifest.requests(HostCapability::ResumeSnapshot);
-        let requests_resume_exchange = artifact.manifest.requests(HostCapability::ResumeExchange);
-        let requests_replay_append =
-            requests_resume || requests_resume_snapshot || requests_resume_exchange;
+        let requests_replay_append = artifact.manifest.requests(HostCapability::ResumeEvent)
+            || artifact
+                .manifest
+                .requests(HostCapability::ResumeBufferedEvent)
+            || requests_resume_snapshot
+            || artifact.manifest.requests(HostCapability::ResumeExchange)
+            || artifact
+                .manifest
+                .requests(HostCapability::ContinueBufferedEvent)
+            || artifact.manifest.requests(HostCapability::ContinueExchange);
         if requests_append && requests_replay_append {
             return Err(Error::Manifest(format!(
                 "component `{path}` cannot mix ordinary and replay-aware event append authority"

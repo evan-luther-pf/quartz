@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{Error, Result};
 
-pub const ABI_VERSION: u32 = 10;
+pub const ABI_VERSION: u32 = 11;
 pub const MANIFEST_SECTION: &str = "quartz:manifest";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -58,8 +58,12 @@ pub enum BindingKind {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HostCapability {
+    AppendBufferedEvent,
     AppendEvent,
     ApplyPatch,
+    ContinueBufferedEvent,
+    ContinueExchange,
+    EventBufferWrite,
     EventCount,
     EventPayloadByte,
     EventPayloadLen,
@@ -74,6 +78,7 @@ pub enum HostCapability {
     ReadSnapshot,
     RegisterChild,
     Resolve,
+    ResumeBufferedEvent,
     ResumeEvent,
     ResumeExchange,
     ResumeSnapshot,
@@ -82,6 +87,8 @@ pub enum HostCapability {
     WorkspaceWrite,
     WorkspacePublish,
     WorkspacePromote,
+    WorkspaceDynamicPublish,
+    WorkspaceDynamicPromote,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

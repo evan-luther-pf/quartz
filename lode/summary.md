@@ -113,59 +113,50 @@ workspace buffers or approvals, restoration or promoted-verification effects,
 or live payload-read authority or module artifacts. Durable journal, event,
 candidate, exchange, and mutation-ledger records remain honestly external.
 
-The production CLI composes the credentialed exchange, durable event,
-workspace, mutation, promotion, and approved-command capabilities into one
-bounded repository task. One `session.qe` event stream is its authoritative
-history. A strict reducer derives proposal generations, decisions, promotions,
-command attempts, continuations, and completion only from ordered checksummed
-facts. Every external operation commits a bound start before emission; a
-started-only operation remains interrupted/unknown and blocks later facts.
-Credential-free restart rebuilds disposable render caches and reconstructs
-repeated correction and validation cycles without rerunning a command or model
-exchange.
+The production CLI composes credentialed exchange, durable events, workspaces,
+mutation, promotion, and approved command execution into one bounded repository
+task. `session/task.qe` is authoritative. The sandboxed `repository-task` WASM
+component owns proposal grammar, validation, generation resolution, review and
+promotion order, command continuation, and completion. The native executable
+retains only canonical admission, credential-bearing network access, terminal
+I/O, exact approved process spawning, durable storage, and host-owned atomic
+publication.
 
-The current implementation uses digest-anchored ranged edits. Each model edit
-binds an admitted source digest, half-open UTF-8 byte range, and exact
-replacement. Prompt schema 2 rejects a model-authored result digest; the host
-materializes the candidate, validates its bounds and UTF-8, and computes the
-result digest used by durable state and promotion. Prompt-size bounds continue
-to bound the admitted file count. Host-only path selection remains an
-constraint; Slice E replaces it with a host-admitted canonical path/digest
-manifest selected only by numeric index.
+`quartz task` admits a task, 2 through 64 canonical UTF-8 source files, and one
+exact CLI argv. Initial and revised proposals are strict digest-anchored,
+half-open UTF-8 ranged edits. Quartz materializes results and computes their
+digests; model-authored result digests, unknown fields, stale sources, invalid
+ranges, and unchanged results fail closed. Rejection requests another revision
+of the same proposal. Every accepted generation is reviewed, published, and
+promoted before command approval.
 
-The repository-task state machine, response grammar, candidate reconstruction,
-dispatch policy, and review sequencing are currently native executable code.
-They violate the host-residency rule in
-`architecture/component-contract.md`; credential custody, privileged
-filesystem/process operations, and terminal I/O are the only justified native
-parts of that path. The orchestrator must move behind the public component
-contract before the product surface expands.
+Command start is durable before process spawn. The strict `CommandFinished`
+payload binds the request digest, exact argv, attempt, bounded outputs, terminal
+status, and before/after identities and bytes for every admitted source.
+Continuation is exactly one indexed ranged edit or an explicit bounded
+completion summary. Failure cannot complete; a corrected generation must be
+reviewed and promoted before a renewed command approval. Restart derives one
+owed action from facts. Successful, denied, failed, and interrupted external
+operations are never repeated.
 
-Focused repository-loop contracts pass 34 tests, and the workspace passes 93
-tests across 12 suites. The latest credentialed dogfood scenario admitted four
-files, rejected one wrong result digest, then materialized four 6-or-7-byte
-ranges into exact candidates while leaving every source unchanged.
-Credential-free restart reconstructed all four ranges and diffs. WIT, component
-ABI 10, kernel source, and module manifests remain unchanged.
+This workflow required no WIT extension. ABI 11's generic snapshot, exchange,
+event, workspace, and callable capabilities carry the repository-task protocol;
+the kernel has no repository-specific state machine or policy switch.
+Production components are resolved from `components/` beside the executable.
+The executable and component directory form a relocatable bundle;
+`QUARTZ_COMPONENT_DIR` is the explicit development override.
 
 ## Next boundary
 
-The next boundary is Slice D: move the repository-task state machine, response
-validation, generation resolution, dispatch policy, and promotion gating behind
-the public component contract. The native host retains only justified credential
-custody, privileged OS operations, and terminal I/O.
-
-Component-owned orchestration, an admitted path/digest manifest, and terminal
-diff review follow. Tool invocation remains closed:
-no model-selected tool, executable, argument vector, ambient shell authority,
-automatic retry, or general conversation loop is committed.
+Slice D is closed. No next product slice is committed; further agent or tool
+surface waits for an explicit capability contract and acceptance scenario.
 
 ## Non-goals
 
 - Streaming production responses, automatic model retries, model-selected
   tools, or unbounded conversation/session payloads.
-- Model-authored path strings, ambient repository discovery, directory
-  mutation, or multi-file transactions.
+- Model-authored unadmitted paths, ambient repository discovery, directory
+  mutation, or atomic multi-file promotion.
 - Automatic edit approval, diff parsing, merge resolution, formatting, or Git
   operations.
 - TUI.

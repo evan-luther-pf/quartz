@@ -69,6 +69,12 @@ A component declares `inject`, `provide`, and `apply`.
 - The provider recovers its effects only after affected dependents are inactive.
 - A changed provider identity reloads the consumer even when the provided value compares equal.
 - Parent-owned component registrations are effects, so unloading a parent recursively withdraws its subtree.
+- A `continue-buffered-event` or `continue-exchange` request becomes eligible
+  only after its acting activation commits. It then resumes that same fiber by
+  returning `Active` to `Activating` with a reset step counter, the same
+  committed provider view, and the same effect accumulator. Failure,
+  cancellation, target change, and replacement still enter ordinary unloading
+  and recover the accumulator.
 
 ## Composition kernel public contract
 

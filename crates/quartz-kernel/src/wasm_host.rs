@@ -4,8 +4,9 @@ use std::{
 };
 use wasmtime::{
     Store, StoreContextMut,
-    component::{Instance, Linker, TypedFunc},
+    component::{Instance, Linker, ResourceTable, TypedFunc},
 };
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::{
     BindingKind, Error, HostCapability, Result,
@@ -31,6 +32,20 @@ pub(crate) const STATUS_AMBIGUOUS: i32 = 10;
 pub(crate) struct HostState {
     pub(crate) core: Weak<RefCell<Core>>,
     pub(crate) fiber: FiberId,
+    wasi_ctx: WasiCtx,
+    wasi_table: ResourceTable,
+}
+// The store is owned by Runtime's Rc-confined fiber graph and is never moved
+// to an exchange worker; WASI's synchronous host traits nevertheless require Send.
+unsafe impl Send for HostState {}
+
+impl WasiView for HostState {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi_ctx,
+            table: &mut self.wasi_table,
+        }
+    }
 }
 
 pub(crate) struct GuestInstance {
@@ -46,11 +61,15 @@ impl Runtime {
     pub(crate) fn instantiate(&self, fiber: FiberId, spec: &PreparedSpec) -> Result<GuestInstance> {
         let mut linker = Linker::new(self.loader.engine());
         link_host(&mut linker)?;
+        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
+            .map_err(|error| Error::Link(error.to_string()))?;
         let mut store = Store::new(
             self.loader.engine(),
             HostState {
                 core: Rc::downgrade(&self.core),
                 fiber,
+                wasi_ctx: WasiCtxBuilder::new().build(),
+                wasi_table: ResourceTable::new(),
             },
         );
         let instance = linker
@@ -207,10 +226,93 @@ fn link_host(linker: &mut Linker<HostState>) -> Result<()> {
     linker
         .root()
         .func_wrap(
+            "event-buffer-set-len",
+            |store: StoreContextMut<'_, HostState>, (length,): (u64,)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_event_buffer_set_len(fiber, length)
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
+            "event-buffer-write-byte",
+            |store: StoreContextMut<'_, HostState>, (offset, value): (u64, u32)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_event_buffer_write_byte(fiber, offset, value)
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
+            "append-buffered-event",
+            |store: StoreContextMut<'_, HostState>, (index, value): (u64, u64)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_append_event(
+                        fiber,
+                        index,
+                        value,
+                        false,
+                        false,
+                        EventPayloadSource::Buffered,
+                    )
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
+            "resume-buffered-event",
+            |store: StoreContextMut<'_, HostState>, (index, value): (u64, u64)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_append_event(
+                        fiber,
+                        index,
+                        value,
+                        true,
+                        false,
+                        EventPayloadSource::Buffered,
+                    )
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
+            "continue-buffered-event",
+            |store: StoreContextMut<'_, HostState>, (index, value): (u64, u64)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_append_event(
+                        fiber,
+                        index,
+                        value,
+                        true,
+                        true,
+                        EventPayloadSource::Buffered,
+                    )
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
             "append-event",
             |store: StoreContextMut<'_, HostState>, (index, value): (u64, u64)| {
                 Ok((with_core(store, |core, fiber| {
-                    core.host_append_event(fiber, index, value, false, EventPayloadSource::None)
+                    core.host_append_event(
+                        fiber,
+                        index,
+                        value,
+                        false,
+                        false,
+                        EventPayloadSource::None,
+                    )
                 }),))
             },
         )
@@ -221,7 +323,14 @@ fn link_host(linker: &mut Linker<HostState>) -> Result<()> {
             "resume-event",
             |store: StoreContextMut<'_, HostState>, (index, value): (u64, u64)| {
                 Ok((with_core(store, |core, fiber| {
-                    core.host_append_event(fiber, index, value, true, EventPayloadSource::None)
+                    core.host_append_event(
+                        fiber,
+                        index,
+                        value,
+                        true,
+                        false,
+                        EventPayloadSource::None,
+                    )
                 }),))
             },
         )
@@ -260,6 +369,7 @@ fn link_host(linker: &mut Linker<HostState>) -> Result<()> {
                         event_index,
                         value,
                         true,
+                        false,
                         EventPayloadSource::Snapshot(snapshot_index),
                     )
                 }),))
@@ -276,6 +386,25 @@ fn link_host(linker: &mut Linker<HostState>) -> Result<()> {
                         fiber,
                         event_index,
                         value,
+                        true,
+                        false,
+                        EventPayloadSource::Exchange,
+                    )
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
+            "continue-exchange",
+            |store: StoreContextMut<'_, HostState>, (event_index, value): (u64, u64)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_append_event(
+                        fiber,
+                        event_index,
+                        value,
+                        true,
                         true,
                         EventPayloadSource::Exchange,
                     )
@@ -341,10 +470,32 @@ fn link_host(linker: &mut Linker<HostState>) -> Result<()> {
     linker
         .root()
         .func_wrap(
+            "publish-dynamic-workspace",
+            |store: StoreContextMut<'_, HostState>, (index, operation): (u64, u64)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_publish_dynamic_workspace(fiber, index, operation)
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
             "promote-workspace",
             |store: StoreContextMut<'_, HostState>, (index,): (u64,)| {
                 Ok((with_core(store, |core, fiber| {
                     core.host_promote_workspace(fiber, index)
+                }),))
+            },
+        )
+        .map_err(|error| Error::Link(error.to_string()))?;
+    linker
+        .root()
+        .func_wrap(
+            "promote-dynamic-workspace",
+            |store: StoreContextMut<'_, HostState>, (index, operation): (u64, u64)| {
+                Ok((with_core(store, |core, fiber| {
+                    core.host_promote_dynamic_workspace(fiber, index, operation)
                 }),))
             },
         )
@@ -519,12 +670,10 @@ fn host_invoke(
         let Some(record) = core.fibers.get_mut(&caller) else {
             return -(STATUS_INVALID as i64);
         };
-        if record
-            .spec
-            .workspaces
-            .get(index)
-            .is_none_or(|workspace| workspace.grant.operation != arg0)
-        {
+        let Some(workspace) = record.spec.workspaces.get(index) else {
+            return -(STATUS_INVALID as i64);
+        };
+        if arg0 == 0 || (!workspace.grant.dynamic && workspace.grant.operation != arg0) {
             return -(STATUS_INVALID as i64);
         }
         record.workspace_authorization = Some(WorkspaceAuthorization {
@@ -557,10 +706,17 @@ fn host_invoke(
         let Some(workspace) = record.spec.workspaces.get(index) else {
             return -(STATUS_INVALID as i64);
         };
-        if workspace.grant.operation != arg0
+        if arg0 == 0
+            || (!workspace.grant.dynamic && workspace.grant.operation != arg0)
             || !record.accumulator.iter().any(|inverse| match inverse {
                 Inverse::RestoreWorkspace { grant, .. }
-                | Inverse::VerifyPromotedWorkspace { grant, .. } => grant == &workspace.grant,
+                | Inverse::VerifyPromotedWorkspace { grant, .. } => {
+                    if workspace.grant.dynamic {
+                        grant.source_path == workspace.grant.source_path && grant.operation == arg0
+                    } else {
+                        grant == &workspace.grant
+                    }
+                }
                 _ => false,
             })
         {
