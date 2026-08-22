@@ -6,17 +6,22 @@ use std::{
     fs,
     io::{self, Read},
     path::{Component, Path},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
 
-pub(crate) const COMMAND_TIMEOUT_MS: u64 = 120_000;
+pub(crate) const COMMAND_TIMEOUT_MS: u64 = 300_000;
 pub(crate) const MAX_OUTPUT_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_ARG_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_ARGV_BYTES: usize = 32 * 1024;
 const MAX_FACT_BYTES: usize = 3 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 4 * 1024;
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn kill(pid: i32, signal: i32) -> i32;
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -382,6 +387,11 @@ pub(crate) fn execute(started: &CommandStarted) -> ExecutionResult {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -406,7 +416,7 @@ pub(crate) fn execute(started: &CommandStarted) -> ExecutionResult {
             Ok(Some(status)) => break (Some(status), false),
             Ok(None) if began.elapsed() < deadline => thread::sleep(Duration::from_millis(10)),
             Ok(None) => {
-                let _ = child.kill();
+                terminate_command_group(&mut child);
                 break (child.wait().ok(), true);
             }
             Err(_) => break (child.wait().ok(), false),
@@ -435,6 +445,20 @@ pub(crate) fn execute(started: &CommandStarted) -> ExecutionResult {
         stderr,
         duration_ms: elapsed_millis(began),
     }
+}
+
+fn terminate_command_group(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        if let Ok(group) = i32::try_from(child.id()) {
+            // SAFETY: the child was created as process-group leader; a negative
+            // PID addresses only that group, and SIGKILL requires no shared memory.
+            if unsafe { kill(-group, 9) } == 0 {
+                return;
+            }
+        }
+    }
+    let _ = child.kill();
 }
 
 impl CapturedBytes {
@@ -613,6 +637,52 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kills_pipe_holding_process_group_before_joining_readers() {
+        let root = temporary_repository("process-group-timeout");
+        let mut started = CommandStarted::new(
+            1,
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "sleep 30 & echo $! > child.pid; wait".into(),
+            ],
+            &root,
+            &["source.txt".into()],
+        )
+        .unwrap();
+        started.timeout_ms = 100;
+
+        let execution = execute(&started);
+        assert!(execution.timed_out);
+        assert_eq!(execution.signal, Some(9));
+        assert!(execution.duration_ms >= 80, "{execution:?}");
+        assert!(execution.duration_ms < 2_000, "{execution:?}");
+
+        let descendant: i32 = fs::read_to_string(root.join("child.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        for _ in 0..100 {
+            // SAFETY: signal 0 performs existence/permission checking only.
+            if unsafe { kill(descendant, 0) } != 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        // SAFETY: signal 0 performs existence/permission checking only.
+        assert_ne!(unsafe { kill(descendant, 0) }, 0);
+
+        let after = RepositoryIdentity::capture(&root, &["source.txt".into()]).unwrap();
+        let finished = CommandFinished::new(&started, execution, after).unwrap();
+        assert!(finished.timed_out);
+        assert_eq!(finished.signal, Some(9));
+        assert_eq!(finished.exit_code, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn failed_command_is_terminal_and_not_successful() {
         let root = temporary_repository("failure");
@@ -656,7 +726,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn serialization_matches_legacy_bytes() {
+    fn serialization_changes_only_the_fixed_timeout() {
         let started = CommandStarted {
             approval: "explicit-cli-invocation".into(),
             argv: vec!["/bin/echo".into(), "hello".into()],
@@ -682,7 +752,10 @@ mod tests {
             timeout_ms: COMMAND_TIMEOUT_MS,
         };
         let expected = b"{\n  \"approval\": \"explicit-cli-invocation\",\n  \"argv\": [\n    \"/bin/echo\",\n    \"hello\"\n  ],\n  \"attempt\": 1,\n  \"cwd\": \"/fixed/repository\",\n  \"kind\": \"CommandStarted\",\n  \"repository\": {\n    \"canonical_root\": \"/fixed/repository\",\n    \"canonical_root_sha256\": \"15250920c2ea0f032234df7baf7a6737a6f3587be102adb71b08e0d56ae47af8\",\n    \"files\": [\n      {\n        \"byte_len\": 7,\n        \"content\": \"content\",\n        \"path\": \"source.txt\",\n        \"sha256\": \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\n        \"status\": \"regular\"\n      }\n    ]\n  },\n  \"schema\": 1,\n  \"stderr_limit_bytes\": 32768,\n  \"stdout_limit_bytes\": 32768,\n  \"timeout_ms\": 120000\n}";
-        assert_eq!(started.to_bytes().unwrap(), expected);
+        let expected = String::from_utf8(expected.to_vec())
+            .unwrap()
+            .replace("\"timeout_ms\": 120000", "\"timeout_ms\": 300000");
+        assert_eq!(started.to_bytes().unwrap(), expected.as_bytes());
     }
 
     fn temporary_repository(label: &str) -> std::path::PathBuf {

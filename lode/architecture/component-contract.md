@@ -267,18 +267,15 @@ shutdown, and asserts a clean live context.
 
 ### Repository-task verification
 
-`cargo test --workspace --all-targets` passes 80 contracts across 12 suites; the
+`cargo test --workspace --all-targets` passes 81 contracts across 12 suites; the
 standalone repository-task crate adds five native unit contracts for schema-3
-initial/revision/continuation line grammar, first/middle/final line mapping,
-terminal-newline and CRLF preservation, empty replacement, repeated correction,
-legacy-field rejection, command evidence, source drift, unknown fields, and
-completion gating. The kernel also checks that recovery accepts a contiguous
-chain of promoted correction generations while rejecting unrecorded source
-drift. Host integration contracts load the real WASM artifact and cover A-to-B
-governed replacement, exact argv, promotion-before-command, failed-command
-correction, explicit success completion, structured terminal outcomes, invalid
-response and user stop, clean recovery, identical replay without adapter calls,
-and no repeated exchange or process call.
+line proposals and command evidence. The native command adapter contract now
+includes a Unix pipe-holding descendant: a test-only 100 ms deadline returns
+near that bound, records timeout and signal 9, and observes the descendant gone
+before cleanup. Existing host integration contracts retain A-to-B governed
+replacement, exact argv, promotion-before-command, failed-command correction,
+explicit success completion, structured terminal outcomes, clean recovery,
+identical replay without adapter or process calls, and source-drift rejection.
 
 Release packaging writes 50 manifest-bearing WASM files into `components/`
 beside the executable and deletes stale staged artifacts first. On arm64 macOS,

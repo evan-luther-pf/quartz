@@ -94,8 +94,11 @@ The native executable owns only:
 The command adapter receives the exact CLI argv as authority. It rejects any
 component request whose argv differs, captures admitted source identities and
 bounded UTF-8 bytes before and after execution, and returns one strict
-`CommandFinished` payload. Capturing evidence is privileged I/O; interpreting
-exit status and selecting the next task transition remain component policy.
+`CommandFinished` payload. On Unix it starts the command as a new process-group
+leader. At the fixed deadline it kills the entire group before waiting for the
+root and joining stdout/stderr readers, so descendants cannot retain capture
+pipes. Capturing evidence is privileged I/O; interpreting exit status and
+selecting the next task transition remain component policy.
 
 
 `CommandFinished` contains exactly schema, kind, attempt, argv,
@@ -136,7 +139,7 @@ external effect.
 - Model and terminal payloads: bounded by admitted exchange grants.
 - Event payload and record counts: bounded by kernel limits.
 - Argv: 1 through 1024 non-empty arguments, each at most 4 KiB and 32 KiB total.
-- Command: 120-second deadline; stdout and stderr independently capped at 32 KiB.
+- Command: fixed 300-second deadline; stdout and stderr independently capped at 32 KiB. The deadline is not configurable until measured tasks prove it insufficient.
 - Completion and feedback: independently bounded.
 
 Promoted bytes are honest external emissions. Recovery verifies their exact
@@ -195,6 +198,23 @@ command ran. Reopening the failed session returned the same `protocol` result in
 0.62 seconds. Model, terminal, command, and both mutation-ledger SHA-256 values
 were unchanged, proving zero repeated effects. The accurate 21-line
 documentation diff remains uncommitted because validation did not complete.
+
+The command boundary then moved to a fixed 300-second deadline. Unix commands
+run in a new process group; timeout kills that group before the root wait and
+output-reader joins. A deterministic pipe-holding descendant test returns near
+its 100 ms test deadline, records timeout plus signal 9, and verifies the child
+is gone. Exact argv, output bounds, command schema, attempt identity, and replay
+behavior are unchanged.
+
+The one fresh post-fix documentation run did not reach command execution. It
+lasted 152 seconds, used seven successful model calls and 21,074 tokens, and
+recorded eight terminal review exchanges. Multiline rejection feedback was
+accepted by the line-oriented terminal adapter as its first line while remaining
+lines stayed queued as later review decisions; the final queued blank line
+caused `protocol`. No command or promotion ran, recovery restored the one
+applied candidate, and the worktree remained unchanged. Replay returned the same
+failure in 0.62 seconds with unchanged model, terminal, command, and mutation
+ledger hashes.
 
 The credentialed smoke command is:
 

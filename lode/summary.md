@@ -159,10 +159,12 @@ The executable and component directory form a relocatable bundle;
 
 ## Next boundary
 
-Slice D, including truthful provider outcomes and schema-3 line-addressed
-proposals, is closed. The latest real task reached reviewed and promoted
-candidates; its exact all-target validation timed out, and the model's invalid
-post-failure `COMPLETE` was rejected as `protocol`. Slice E remains uncommitted.
+Slice D includes truthful provider outcomes, schema-3 line proposals, and a
+fixed 300-second process-group-owned command boundary. The latest real task did
+not reach validation: multiline rejection feedback leaked later lines into
+subsequent line-oriented review decisions and ended `protocol`. Slice E remains
+uncommitted until one real task completes and the measured model loop is then
+optimized.
 
 ## Non-goals
 
